@@ -99,18 +99,18 @@ Three failure modes are baked in:
 flowchart LR
     subgraph N["Naive class-based path"]
         direction TB
-        N1[new Particle per spawn<br/>allocates object + properties]
-        N2[Array#push / splice<br/>polymorphic shape access]
-        N3[GC pressure<br/>~MB/s of garbage]
-        N4[ICs degrade<br/>polymorphic deopts]
+        N1["new Particle per spawn<br/>allocates object + properties"]
+        N2["Array#push / splice<br/>polymorphic shape access"]
+        N3["GC pressure<br/>~MB/s of garbage"]
+        N4["ICs degrade<br/>polymorphic deopts"]
         N1 --> N2 --> N3 --> N4 -.-> N1
     end
     subgraph A["lite-arena path"]
         direction TB
-        A0[Pre-allocate at startup<br/>one TypedArray per field]
-        A1[spawn -> O(1) free-list pop]
-        A2[Iterate data.x[0..count)<br/>monomorphic TypedArray reads]
-        A3[Despawn -> O(1) swap-and-pop<br/>dense stays contiguous]
+        A0["Pre-allocate at startup<br/>one TypedArray per field"]
+        A1["spawn -> O(1) free-list pop"]
+        A2["Iterate data.x[0..count)<br/>monomorphic TypedArray reads"]
+        A3["Despawn -> O(1) swap-and-pop<br/>dense stays contiguous"]
         A0 --> A1 --> A2 --> A3 -.->|no garbage| A1
     end
 ```
