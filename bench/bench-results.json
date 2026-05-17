@@ -1,0 +1,69 @@
+{
+  "n": 10000,
+  "frames": 200,
+  "gc": true,
+  "timestamp": "2026-05-17T04:09:58.728Z",
+  "results": {
+    "churn": [
+      {
+        "label": "lite-arena (sparse-set)",
+        "ms": 0.5423669999999987,
+        "heap": 48
+      },
+      {
+        "label": "Map<id, object>",
+        "ms": 1.9947579999999903,
+        "heap": 80
+      },
+      {
+        "label": "Array<Object>",
+        "ms": 0.15359399999999823,
+        "heap": 48
+      },
+      {
+        "label": "Manual SoA + free list",
+        "ms": 0.1527810000000045,
+        "heap": 6408
+      }
+    ],
+    "iter": [
+      {
+        "label": "lite-arena (SoA)",
+        "ms": 10.303769000000102,
+        "heap": 48
+      },
+      {
+        "label": "Map<id, object>",
+        "ms": 40.434123,
+        "heap": 16
+      },
+      {
+        "label": "Array<Object>",
+        "ms": 30.95952000000011,
+        "heap": 16
+      },
+      {
+        "label": "Manual SoA (no ECS)",
+        "ms": 10.83432700000003,
+        "heap": 48
+      }
+    ],
+    "randomRemove": [
+      {
+        "label": "lite-arena (swap-and-pop)",
+        "ms": 0.6412089999998898,
+        "heap": 80
+      },
+      {
+        "label": "Array<Object> + splice",
+        "ms": 2.7343590000000404,
+        "heap": 48
+      },
+      {
+        "label": "Map<id, object>",
+        "ms": 1.2624229999996714,
+        "heap": 48
+      }
+    ]
+  }
+}

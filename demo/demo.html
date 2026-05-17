@@ -1,0 +1,436 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>@zakkster/lite-arena — 50,000 particles</title>
+    <style>
+        :root {
+            --bg: #0a0e14;
+            --fg: #d8dee9;
+            --dim: #4c566a;
+            --accent: #88c0d0;
+            --accent2: #ebcb8b;
+            --bad: #bf616a;
+            --good: #a3be8c;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        html, body {
+            width: 100%;
+            height: 100%;
+            background: var(--bg);
+            color: var(--fg);
+            font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+            overflow: hidden;
+        }
+
+        canvas {
+            display: block;
+            cursor: crosshair;
+        }
+
+        #ui {
+            position: fixed;
+            top: 16px;
+            left: 16px;
+            background: rgba(10, 14, 20, 0.85);
+            border: 1px solid var(--dim);
+            padding: 16px 18px;
+            min-width: 280px;
+            backdrop-filter: blur(8px);
+        }
+
+        #ui h1 {
+            font-size: 11px;
+            letter-spacing: 2px;
+            text-transform: uppercase;
+            color: var(--accent);
+            margin-bottom: 14px;
+            font-weight: normal;
+        }
+
+        #stats {
+            font-size: 12px;
+        }
+
+        #stats .row {
+            display: flex;
+            justify-content: space-between;
+            padding: 2px 0;
+        }
+
+        #stats .label {
+            color: var(--dim);
+        }
+
+        #stats .val {
+            color: var(--accent2);
+            font-variant-numeric: tabular-nums;
+        }
+
+        #controls {
+            margin-top: 14px;
+            padding-top: 14px;
+            border-top: 1px dashed var(--dim);
+        }
+
+        #controls button {
+            background: transparent;
+            color: var(--fg);
+            border: 1px solid var(--dim);
+            padding: 6px 10px;
+            font: inherit;
+            cursor: pointer;
+            margin-right: 4px;
+            margin-bottom: 4px;
+        }
+
+        #controls button:hover {
+            border-color: var(--accent);
+            color: var(--accent);
+        }
+
+        #controls button.active {
+            border-color: var(--accent);
+            background: var(--accent);
+            color: var(--bg);
+        }
+
+        #controls .group {
+            margin-bottom: 8px;
+        }
+
+        #controls .label {
+            color: var(--dim);
+            display: block;
+            margin-bottom: 4px;
+            font-size: 11px;
+        }
+
+        #info {
+            margin-top: 14px;
+            padding-top: 14px;
+            border-top: 1px dashed var(--dim);
+            font-size: 11px;
+            color: var(--dim);
+        }
+    </style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<div id="ui">
+    <h1>lite-arena · 50k particle test</h1>
+    <div id="stats">
+        <div class="row"><span class="label">Backend</span><span class="val" id="s-backend">lite-arena</span></div>
+        <div class="row"><span class="label">Particles</span><span class="val" id="s-count">0</span></div>
+        <div class="row"><span class="label">FPS</span><span class="val" id="s-fps">—</span></div>
+        <div class="row"><span class="label">Frame budget</span><span class="val" id="s-budget">—</span></div>
+        <div class="row"><span class="label">JS heap (MB)</span><span class="val" id="s-heap">—</span></div>
+    </div>
+    <div id="controls">
+        <div class="group">
+            <span class="label">Backend</span>
+            <button id="b-arena" class="active">lite-arena</button>
+            <button id="b-array">Array&lt;Object&gt;</button>
+            <button id="b-map">Map&lt;id, Object&gt;</button>
+        </div>
+        <div class="group">
+            <span class="label">Particles</span>
+            <button id="b-1k">+1k</button>
+            <button id="b-10k">+10k</button>
+            <button id="b-clear">clear</button>
+        </div>
+    </div>
+    <div id="info">Drag mouse to move gravity. Scroll to adjust strength.</div>
+</div>
+
+<script type="module">
+    import {Arena} from '../Arena.d.ts';
+
+    // ─────────────────────────────────────────────────────────────────
+    // Three backends with identical semantics: spawn, update, count.
+    // ─────────────────────────────────────────────────────────────────
+
+    const MAX = 100_000;
+
+    function makeArenaBackend() {
+        const arena = new Arena(MAX);
+        const Pos = arena.registerComponent({x: Float32Array, y: Float32Array});
+        const Vel = arena.registerComponent({vx: Float32Array, vy: Float32Array});
+        const Life = arena.registerComponent({t: Float32Array});
+        return {
+            name: 'lite-arena',
+            spawn(x, y, vx, vy) {
+                try {
+                    const e = arena.spawn();
+                    Pos.add(e);
+                    Vel.add(e);
+                    Life.add(e);
+                    const pi = Pos.idx(e), vi = Vel.idx(e), li = Life.idx(e);
+                    Pos.data.x[pi] = x;
+                    Pos.data.y[pi] = y;
+                    Vel.data.vx[vi] = vx;
+                    Vel.data.vy[vi] = vy;
+                    Life.data.t[li] = 0;
+                    return e;
+                } catch {
+                    return -1;
+                }
+            },
+            update(dt, gx, gy, gstr) {
+                const n = Pos.count;
+                const px = Pos.data.x, py = Pos.data.y;
+                const vx = Vel.data.vx, vy = Vel.data.vy;
+                const lt = Life.data.t;
+                // collect dead-list inline; we walk backward in a second pass to despawn.
+                // Pass 1: physics + lifetime advance.
+                for (let i = 0; i < n; i++) {
+                    const dx = gx - px[i], dy = gy - py[i];
+                    const d2 = dx * dx + dy * dy + 100;
+                    const f = gstr / d2;
+                    vx[i] += dx * f;
+                    vy[i] += dy * f;
+                    vx[i] *= 0.995;
+                    vy[i] *= 0.995;
+                    px[i] += vx[i] * dt;
+                    py[i] += vy[i] * dt;
+                    lt[i] += dt;
+                }
+                // Pass 2: despawn aged-out particles. Walk backward; swap-and-pop
+                // moves the tail in, but tail is already processed for this frame.
+                for (let i = n - 1; i >= 0; i--) {
+                    if (lt[i] > 8.0) arena.despawn(Pos.dense[i]);
+                }
+            },
+            draw(ctx) {
+                const n = Pos.count;
+                const px = Pos.data.x, py = Pos.data.y;
+                const lt = Life.data.t;
+                ctx.fillStyle = '#88c0d0';
+                for (let i = 0; i < n; i++) {
+                    const a = 1 - lt[i] / 8.0;
+                    ctx.globalAlpha = a > 0 ? a : 0;
+                    ctx.fillRect(px[i] | 0, py[i] | 0, 2, 2);
+                }
+                ctx.globalAlpha = 1;
+            },
+            get count() {
+                return Pos.count;
+            },
+        };
+    }
+
+    function makeArrayBackend() {
+        const arr = [];
+        return {
+            name: 'Array<Object>',
+            spawn(x, y, vx, vy) {
+                if (arr.length >= MAX) return -1;
+                arr.push({x, y, vx, vy, t: 0});
+                return arr.length - 1;
+            },
+            update(dt, gx, gy, gstr) {
+                for (let i = 0; i < arr.length; i++) {
+                    const p = arr[i];
+                    const dx = gx - p.x, dy = gy - p.y;
+                    const d2 = dx * dx + dy * dy + 100;
+                    const f = gstr / d2;
+                    p.vx += dx * f;
+                    p.vy += dy * f;
+                    p.vx *= 0.995;
+                    p.vy *= 0.995;
+                    p.x += p.vx * dt;
+                    p.y += p.vy * dt;
+                    p.t += dt;
+                }
+                // .splice removal — the textbook way.
+                for (let i = arr.length - 1; i >= 0; i--) {
+                    if (arr[i].t > 8.0) arr.splice(i, 1);
+                }
+            },
+            draw(ctx) {
+                ctx.fillStyle = '#ebcb8b';
+                for (let i = 0; i < arr.length; i++) {
+                    const p = arr[i];
+                    const a = 1 - p.t / 8.0;
+                    ctx.globalAlpha = a > 0 ? a : 0;
+                    ctx.fillRect(p.x | 0, p.y | 0, 2, 2);
+                }
+                ctx.globalAlpha = 1;
+            },
+            get count() {
+                return arr.length;
+            },
+        };
+    }
+
+    function makeMapBackend() {
+        const m = new Map();
+        let next = 0;
+        return {
+            name: 'Map<id, Object>',
+            spawn(x, y, vx, vy) {
+                if (m.size >= MAX) return -1;
+                const id = next++;
+                m.set(id, {x, y, vx, vy, t: 0});
+                return id;
+            },
+            update(dt, gx, gy, gstr) {
+                const dead = [];
+                for (const [id, p] of m) {
+                    const dx = gx - p.x, dy = gy - p.y;
+                    const d2 = dx * dx + dy * dy + 100;
+                    const f = gstr / d2;
+                    p.vx += dx * f;
+                    p.vy += dy * f;
+                    p.vx *= 0.995;
+                    p.vy *= 0.995;
+                    p.x += p.vx * dt;
+                    p.y += p.vy * dt;
+                    p.t += dt;
+                    if (p.t > 8.0) dead.push(id);
+                }
+                for (const id of dead) m.delete(id);
+            },
+            draw(ctx) {
+                ctx.fillStyle = '#bf616a';
+                for (const p of m.values()) {
+                    const a = 1 - p.t / 8.0;
+                    ctx.globalAlpha = a > 0 ? a : 0;
+                    ctx.fillRect(p.x | 0, p.y | 0, 2, 2);
+                }
+                ctx.globalAlpha = 1;
+            },
+            get count() {
+                return m.size;
+            },
+        };
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Render / interaction loop
+    // ─────────────────────────────────────────────────────────────────
+
+    const cv = document.getElementById('cv');
+    const ctx = cv.getContext('2d', {alpha: false});
+
+    function resize() {
+        cv.width = innerWidth;
+        cv.height = innerHeight;
+    }
+
+    resize();
+    addEventListener('resize', resize);
+
+    let backend = makeArenaBackend();
+    let gravityX = innerWidth / 2, gravityY = innerHeight / 2;
+    let gravityStr = 8000;
+
+    cv.addEventListener('mousemove', (e) => {
+        if (e.buttons === 1) {
+            gravityX = e.clientX;
+            gravityY = e.clientY;
+        }
+    });
+    cv.addEventListener('wheel', (e) => {
+        gravityStr = Math.max(500, Math.min(40_000, gravityStr - e.deltaY * 20));
+        e.preventDefault();
+    }, {passive: false});
+
+    function setBackend(b, btn) {
+        backend = b;
+        document.querySelectorAll('#controls button').forEach(x => x.classList.remove('active'));
+        if (btn) btn.classList.add('active');
+        document.getElementById('s-backend').textContent = backend.name;
+    }
+
+    document.getElementById('b-arena').onclick = (e) => setBackend(makeArenaBackend(), e.target);
+    document.getElementById('b-array').onclick = (e) => setBackend(makeArrayBackend(), e.target);
+    document.getElementById('b-map').onclick = (e) => setBackend(makeMapBackend(), e.target);
+
+    function burst(count) {
+        for (let i = 0; i < count; i++) {
+            const a = Math.random() * Math.PI * 2;
+            const r = Math.random() * 200;
+            backend.spawn(
+                gravityX + Math.cos(a) * r,
+                gravityY + Math.sin(a) * r,
+                (Math.random() - 0.5) * 100,
+                (Math.random() - 0.5) * 100,
+            );
+        }
+    }
+
+    document.getElementById('b-1k').onclick = () => burst(1000);
+    document.getElementById('b-10k').onclick = () => burst(10000);
+    document.getElementById('b-clear').onclick = () => setBackend(
+        backend.name === 'lite-arena' ? makeArenaBackend()
+            : backend.name === 'Array<Object>' ? makeArrayBackend()
+            : makeMapBackend(),
+        document.querySelector('#controls button.active')
+    );
+
+    // Continuous fountain from the gravity well.
+    burst(5000);
+
+    let lastT = performance.now();
+    let frames = 0, fpsTime = lastT, fps = 0, frameBudget = 0;
+    const sFps = document.getElementById('s-fps');
+    const sCount = document.getElementById('s-count');
+    const sBudget = document.getElementById('s-budget');
+    const sHeap = document.getElementById('s-heap');
+
+    function loop(now) {
+        const dt = Math.min(0.05, (now - lastT) / 1000);
+        lastT = now;
+
+        // Continuous spawn at low rate to show steady-state perf.
+        if (backend.count < MAX - 100) {
+            for (let i = 0; i < 50; i++) {
+                const a = Math.random() * Math.PI * 2;
+                const r = Math.random() * 50;
+                backend.spawn(gravityX + Math.cos(a) * r, gravityY + Math.sin(a) * r,
+                    (Math.random() - 0.5) * 200, (Math.random() - 0.5) * 200);
+            }
+        }
+
+        ctx.fillStyle = 'rgba(10, 14, 20, 0.18)';
+        ctx.fillRect(0, 0, cv.width, cv.height);
+
+        const t0 = performance.now();
+        backend.update(dt, gravityX, gravityY, gravityStr);
+        backend.draw(ctx);
+        const t1 = performance.now();
+
+        // Gravity-well marker.
+        ctx.strokeStyle = '#a3be8c';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.arc(gravityX, gravityY, 8, 0, Math.PI * 2);
+        ctx.stroke();
+
+        frameBudget = frameBudget * 0.9 + (t1 - t0) * 0.1;
+        frames++;
+        if (now - fpsTime > 500) {
+            fps = (frames * 1000) / (now - fpsTime);
+            fpsTime = now;
+            frames = 0;
+            sFps.textContent = fps.toFixed(1);
+            sBudget.textContent = frameBudget.toFixed(2) + ' ms / 16.67';
+            sBudget.style.color = frameBudget < 4 ? 'var(--good)' : frameBudget < 10 ? 'var(--accent2)' : 'var(--bad)';
+            if (performance.memory) sHeap.textContent = (performance.memory.usedJSHeapSize / 1048576).toFixed(1);
+        }
+        sCount.textContent = backend.count.toLocaleString();
+
+        requestAnimationFrame(loop);
+    }
+
+    requestAnimationFrame(loop);
+</script>
+</body>
+</html>

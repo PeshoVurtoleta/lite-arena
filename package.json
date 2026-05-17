@@ -1,0 +1,62 @@
+{
+  "name": "@zakkster/lite-arena",
+  "version": "1.0.0",
+  "description": "Zero-GC Entity-Component-System (ECS) memory allocator. Generational handles, SoA sparse sets, swap-and-pop. ~190 lines, no dependencies.",
+  "type": "module",
+  "main": "./Arena.js",
+  "module": "Arena.js",
+  "types": "./Arena.d.ts",
+  "exports": {
+    ".": {
+      "types": "./Arena.d.ts",
+      "import": "./Arena.js",
+      "default": "./Arena.js"
+    }
+  },
+  "files": [
+    "Arena.js",
+    "Arena.d.ts",
+    "README.md",
+    "llms.txt",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "NODE_OPTIONS=--expose-gc vitest run",
+    "test:watch": "NODE_OPTIONS=--expose-gc vitest",
+    "bench": "node --expose-gc bench/bench.js",
+    "verify": "npm test && npm run bench"
+  },
+  "keywords": [
+    "ecs",
+    "entity-component-system",
+    "zero-gc",
+    "zero-allocation",
+    "sparse-set",
+    "soa",
+    "structure-of-arrays",
+    "game-engine",
+    "performance",
+    "typed-arrays",
+    "generational-handles",
+    "swap-and-pop",
+    "data-oriented-design"
+  ],
+  "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
+  "homepage": "https://github.com/PeshoVurtoleta/lite-scheduler#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PeshoVurtoleta/lite-scheduler.git"
+  },
+  "bugs": {
+    "url": "https://github.com/PeshoVurtoleta/lite-scheduler/issues",
+    "email": "shinikchiev@yahoo.com"
+  },
+  "sideEffects": false,
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "vitest": "^2.1.0"
+  }
+}
