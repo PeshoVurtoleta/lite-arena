@@ -397,7 +397,7 @@ Three levels of verification, depending on how deep you want to go.
 npm test
 ```
 
-Runs **41 deterministic assertions** under vitest, covering:
+Runs **41 deterministic assertions** under `node --test`, covering:
 
 | Group | What's tested |
 |---|---|

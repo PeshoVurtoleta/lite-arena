@@ -1,6 +1,6 @@
 {
   "name": "@zakkster/lite-arena",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Zero-GC Entity-Component-System (ECS) memory allocator. Generational handles, SoA sparse sets, swap-and-pop. ~190 lines, no dependencies.",
   "type": "module",
   "main": "./Arena.js",
@@ -22,8 +22,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "NODE_OPTIONS=--expose-gc vitest run",
-    "test:watch": "NODE_OPTIONS=--expose-gc vitest",
+    "test": "node --test",
+    "test:watch": "node --test --watch",
     "bench": "node --expose-gc bench/bench.js",
     "verify": "npm test && npm run bench"
   },
@@ -60,8 +60,5 @@
   "license": "MIT",
   "engines": {
     "node": ">=18"
-  },
-  "devDependencies": {
-    "vitest": "^2.1.0"
   }
 }

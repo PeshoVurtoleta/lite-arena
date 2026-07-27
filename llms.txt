@@ -64,7 +64,7 @@ for (let i = 0; i < n; i++) {
 - [./Arena.js](./Arena.js): The implementation (~190 lines, MIT, ESM).
 - [./Arena.d.ts](./Arena.d.ts): TypeScript definitions, fully typed including
   `ComponentData<T>` generic for typed `data` field access.
-- [test/Arena.test.js](test/Arena.test.js): 41 vitest assertions including a
+- [test/Arena.test.js](test/Arena.test.js): 41 node:test assertions including a
   randomized churn oracle and zero-allocation guarantee under `--expose-gc`.
 - [bench/bench.js](bench/bench.js): Benchmark harness comparing against
   `Map<id, object>`, `Array<Object>`, and a no-ECS manual SoA.
