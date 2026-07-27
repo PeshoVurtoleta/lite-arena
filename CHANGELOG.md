@@ -5,6 +5,47 @@ All notable changes to `@zakkster/lite-arena` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-07-27
+
+Generational-rollover decision session. Full rationale and the rejected
+alternatives (LEAVE, WIDEN) are recorded in
+[`decisions/0001-generational-rollover.md`](decisions/0001-generational-rollover.md).
+
+### Changed
+
+- **Generational rollover is now fail-closed.** The 12-bit generation counter
+  issues 4095 live generations per slot. Previously, the counter wrapped after
+  4096 despawn cycles on a single slot and a stale handle from cycle 0 would
+  alias as valid again -- a fail-**open** hole on the safe (`isAlive` / `has`)
+  path. Now, on the despawn that would exhaust a slot's generations, the slot is
+  **permanently retired**: poisoned to a generation one bit above the handle
+  range and withdrawn from the free list, so it is never recycled and no handle
+  can ever alias. The change lives entirely on the `despawn` **cold** path;
+  `isAlive()` and `idx()` hot bodies are byte-for-byte unchanged, and the handle
+  stays a 32-bit SMI with the same 20-bit index / 12-bit generation split (max
+  1,048,575 entities is unchanged).
+
+### Added
+
+- `arena.retiredCount` (read-only): number of slots retired by generation
+  exhaustion. `0` on any realistic workload; a non-zero value signals the
+  adversarial-churn regime and bounded, documented capacity attrition.
+- `decisions/0001-generational-rollover.md`: the decision record (context, the
+  three options with exact bit/perf costs, the call, and the trade).
+- Named boundary test
+  `Arena: generational handles > retires a slot at generation exhaustion (no ABA alias)`
+  asserting the exact documented outcome (slot retires, `retiredCount === 1`,
+  no alias of the first handle, `spawn()` throws at exhaustion).
+
+### Migration
+
+- Behaviour change under adversarial churn only: a slot spawned/despawned 4095
+  times now retires instead of aliasing. On such a slot, `spawn()` surfaces the
+  withdrawal as the usual "out of memory" throw one cycle earlier than the old
+  aliasing behaviour. Realistic workloads (entities living >= 1 frame) are
+  unaffected -- retirement never fires, and the two behaviours are otherwise
+  identical.
+
 ## [1.1.0] - 2026-07-27
 
 ### Added

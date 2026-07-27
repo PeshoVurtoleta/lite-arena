@@ -314,6 +314,7 @@ Throws if `maxEntities` is out of range or non-integer.
 |---|---|---|
 | `capacity` | `number` | As passed. |
 | `activeCount` | `number` | Current number of living entities. Read-only. |
+| `retiredCount` | `number` | Slots permanently retired by generation exhaustion (fail-closed rollover). `0` on any realistic workload. Read-only. |
 
 ### `Arena` methods
 
@@ -403,7 +404,7 @@ Runs **41 deterministic assertions** under `node --test`, covering:
 |---|---|
 | Construction & validation | bounds, integer check, NaN/Infinity rejection, type coercion |
 | Lifecycle | spawn / despawn / isAlive, free-list exhaustion, slot reuse |
-| Generational handles | stale-handle rejection, 4096-cycle ABA limit, sign-bit handles |
+| Generational handles | stale-handle rejection, 4095-cycle slot retirement (fail-closed rollover), sign-bit handles |
 | Component registration | all nine TypedArray types, parallel arrays sized to capacity |
 | SparseSet ops | add / has / remove, idempotency, dead-handle rejection |
 | Swap-and-pop correctness | middle/last/single-element removal, SoA data integrity |
@@ -486,7 +487,7 @@ Components' typed arrays own their backing `ArrayBuffer`. If you need cross-thre
 ## Edge cases & guarantees
 
 - **Stale handles are detected, not just suspected.** A handle stores its slot's generation at the moment it was issued; despawn bumps the generation. `isAlive(staleHandle)` returns false, full stop — even after the slot has been reused by a different entity.
-- **Generational rollover happens at exactly 4096 cycles per slot.** If a single slot is spawned-and-despawned more than 4095 times *while a stored handle from cycle 0 is still in memory*, that stored handle will alias as valid. For any realistic workload (entities live for ≥ 1 frame) this is unreachable; for adversarial or extremely long-lived handles, retire them when the entity dies.
+- **Generational rollover is fail-closed: the slot retires, it never aliases.** The 12-bit generation counter issues 4095 live generations per slot. On the despawn that would exhaust them, the slot is **permanently retired** — withdrawn from the free list so it is never recycled — instead of wrapping and re-issuing an old generation. A stale handle therefore *never* aliases as valid, on any code path. The cost is bounded, documented capacity attrition: one slot lost per slot that cycles 4095 times, which for any realistic workload (entities live for ≥ 1 frame) never happens. `arena.retiredCount` reports how many slots have retired; a non-zero value means you have entered the adversarial-churn regime. See [decisions/0001-generational-rollover.md](decisions/0001-generational-rollover.md) for the full tradeoff. (Retirement lives entirely on the `despawn` cold path — `isAlive()` and the hot loop are untouched.)
 - **Synthesizing handle `0` is safe.** Generations are initialised to 1, so the all-zero bit pattern is reliably rejected. A common pattern: store `0` as your "no entity" sentinel in custom data structures; `arena.isAlive(0)` is guaranteed false on a fresh arena.
 - **`despawn()` cascades to every registered component.** You never need to manually `pos.remove(e); vel.remove(e); sprite.remove(e); arena.despawn(e)` — just `arena.despawn(e)`.
 - **`remove()` does not zero the SoA tail.** After swap-and-pop, indices `[count, capacity)` contain stale data. Iterate `[0, count)` and you're fine. Don't read past `count` — there's no defined value there.

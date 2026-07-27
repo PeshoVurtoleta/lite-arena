@@ -4,11 +4,12 @@
  * Architecture:
  *   - Generational Handles: 32-bit integers (20 bits index, 12 bits generation).
  *     Prevents the ABA problem (modifying a recycled entity slot via a stale handle).
- *     Note: 12 bits = 4096 generations. If a slot is rapidly spawned/despawned
- *     more than 4095 times before a stored handle is discarded, that stale handle
- *     will alias as valid. For most workloads this is effectively unreachable;
- *     for adversarial or extremely long-lived handles, prefer to retire them
- *     when the entity dies.
+ *     The 12-bit counter issues 4095 live generations per slot. When a slot has
+ *     issued its last generation it is RETIRED on despawn -- never recycled -- so
+ *     a stale handle can never alias as valid. This is fail-closed: instead of
+ *     silently reusing a wrapped generation, the slot is permanently withdrawn
+ *     (see `retiredCount` and decisions/0001-generational-rollover.md). Retirement
+ *     is a cold-path event; `isAlive()` and the hot loop are unaffected.
  *   - SoA Sparse Sets: Component data is strictly parallel typed arrays.
  *   - Swap-and-Pop: O(1) component removal keeps dense arrays contiguous
  *     without shifting.
@@ -36,6 +37,10 @@ export class Arena {
 
         this.capacity = maxEntities | 0;
         this.activeCount = 0 | 0;
+
+        // Slots withdrawn by generation exhaustion (fail-closed rollover guard).
+        // Bumped only in the despawn cold path; never read on any hot path.
+        this.retiredCount = 0 | 0;
 
         // Generational anti-stale tracking. Initialized to 1 (not 0) so that
         // the synthesized handle `0` — and any handle whose generation bits
@@ -106,13 +111,28 @@ export class Arena {
             this.components[i].remove(entity);
         }
 
-        // 2. Bump generation to invalidate stale handles sitting in closures.
-        this.generations[index] = (this.generations[index] + 1) & GEN_MASK;
+        this.activeCount = (this.activeCount - 1) | 0;
+
+        // 2. Advance the generation to invalidate stale handles in closures.
+        //    A slot issues live generations 1..GEN_MASK. If this despawn returns
+        //    the last one (GEN_MASK), the next bump would wrap and re-issue a
+        //    previously-handed-out generation -- reopening the ABA hole. Fail
+        //    closed instead: RETIRE the slot. Poison its generation to
+        //    GEN_MASK + 1 (one bit above the 12-bit handle range, so isAlive
+        //    rejects every handle, synthesized gen-0 included) and do NOT relink
+        //    it into the free list, so spawn can never reuse it. Cold path only:
+        //    isAlive() and idx() are untouched.
+        if (this.generations[index] === GEN_MASK) {
+            this.generations[index] = GEN_MASK + 1;
+            this.retiredCount = (this.retiredCount + 1) | 0;
+            return true;
+        }
+
+        this.generations[index] = this.generations[index] + 1;
 
         // 3. Return slot to the head of the free list.
         this.freeList[index] = this.freeHead;
         this.freeHead = index;
-        this.activeCount = (this.activeCount - 1) | 0;
 
         return true;
     }

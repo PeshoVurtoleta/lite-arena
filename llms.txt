@@ -54,6 +54,10 @@ for (let i = 0; i < n; i++) {
 - Handle layout is opaque. Never decompose entity handles by hand.
 - `Generation = 0` is reserved as "never alive"; synthesizing handle `0` is
   guaranteed to be rejected on a fresh arena.
+- Generational rollover is fail-closed: a slot that exhausts its 4095 live
+  generations is permanently retired on despawn (never recycled), so a stale
+  handle can never alias as valid. `arena.retiredCount` counts retired slots;
+  it stays `0` on realistic workloads. See decisions/0001-generational-rollover.md.
 - `idx()` skips validation; only call inside loops where validity is guaranteed.
 - `despawn()` automatically removes the entity from every registered component.
 

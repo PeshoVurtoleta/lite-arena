@@ -13,6 +13,10 @@
  * High-generation handles will appear negative when printed in decimal
  * (the high bit is set). This is the intended bit pattern; equality and
  * `isAlive()` comparisons remain correct.
+ *
+ * The 12-bit generation field issues 4095 live values per slot. A slot that
+ * exhausts them is retired on despawn (see {@link Arena.retiredCount}) rather
+ * than wrapping, so a stale handle can never alias as valid.
  */
 export type Entity = number;
 
@@ -49,6 +53,19 @@ export class Arena {
 
     /** Current number of living entities. Read-only from user code. */
     readonly activeCount: number;
+
+    /**
+     * Number of slots permanently retired by generation exhaustion.
+     *
+     * A slot is retired when it has issued all 4095 of its live generations;
+     * it is never recycled, so a stale handle can never alias as valid
+     * (fail-closed rollover; see the docs on {@link Entity}). Retirement is a
+     * cold-path event and never fires on realistic workloads -- entities that
+     * live for >= 1 frame never cycle a single slot 4095 times. Non-zero here
+     * means you have entered the adversarial-churn regime and are losing a slot
+     * of capacity per exhausted slot. Read-only.
+     */
+    readonly retiredCount: number;
 
     /**
      * Pre-allocates the ECS universe.

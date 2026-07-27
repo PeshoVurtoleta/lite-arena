@@ -127,6 +127,10 @@ test('Arena: lifecycle > isAlive never throws on arbitrary input', () => {
     assert.doesNotThrow(() => arena.isAlive(-1));
     assert.doesNotThrow(() => arena.isAlive(0xFFFFFFFF | 0));
     assert.doesNotThrow(() => arena.isAlive(0));
+    // Synthesized handle 0 (generation bits 0) is rejected on a fresh arena:
+    // slots initialise to generation 1, so 0 never matches. This invariant
+    // survives the 1.2.0 rollover change (retired slots poison to GEN_MASK+1).
+    assert.equal(arena.isAlive(0), false);
 });
 
 // -----------------------------------------------------------------
@@ -146,21 +150,44 @@ test('Arena: generational handles > invalidates stale handles after slot reuse',
     assert.notEqual(old, fresh);
 });
 
-test('Arena: generational handles > generation wraps after 4096 cycles (ABA limit)', () => {
+test('Arena: generational handles > retires a slot at generation exhaustion (no ABA alias)', () => {
+    // DECISION 0001 (see decisions/0001-generational-rollover.md): the 12-bit
+    // generation counter issues 4095 live generations per slot. Rather than let
+    // the counter wrap and re-issue a previously-handed-out generation -- which
+    // would alias a stale handle as valid on the SAFE path -- the slot is
+    // RETIRED on the despawn that returns its last generation. This test pins
+    // the exact documented boundary behaviour; it is intended, not accidental.
     const arena = new Arena(1);
-    let h = arena.spawn();
-    arena.despawn(h);
 
-    // With generations init'd to 1, the first spawn has gen=1 and the
-    // first despawn bumps to gen=2. 4095 more spawn/despawn cycles
-    // brings the stored gen back around to 1 -> collision.
-    for (let i = 0; i < 4095; i++) {
-        const nh = arena.spawn();
-        arena.despawn(nh);
+    // The very first handle. If the counter ever wrapped, a later spawn on this
+    // single slot would re-mint exactly this bit pattern.
+    const first = arena.spawn();      // gen 1
+    assert.equal(arena.isAlive(first), true);
+    arena.despawn(first);             // slot gen 1 -> 2  (despawn #1)
+
+    // Drive the slot to its last live generation (gen 4095). despawn #k sees
+    // gen k and advances to k+1; we need the slot sitting at gen 4095 so the
+    // next despawn is the one that would wrap.
+    for (let i = 0; i < 4093; i++) {  // despawns #2..#4094: gen 2 -> 4095
+        const h = arena.spawn();
+        arena.despawn(h);
     }
-    const after = arena.spawn();
-    // The wrap means `after` collides with `h`'s bit pattern.
-    assert.equal(after, h);
+
+    const nearLast = arena.spawn();   // gen 4095 -- the last live generation
+    assert.equal(arena.isAlive(nearLast), true);
+    assert.equal(arena.retiredCount, 0);
+
+    arena.despawn(nearLast);          // despawn #4095: gen == GEN_MASK -> RETIRE
+
+    // Fail-closed outcome, asserted exactly:
+    assert.equal(arena.retiredCount, 1);          // the slot was withdrawn
+    assert.equal(arena.activeCount, 0);           // and it is not alive
+    assert.equal(arena.isAlive(first), false);    // no alias: the first handle stays dead
+    assert.equal(arena.isAlive(nearLast), false); // the retired handle is dead
+    assert.equal(arena.isAlive(0), false);        // synthesized gen-0 rejected on a retired slot
+    // The slot is gone for good -- capacity is now effectively 0, so spawn
+    // surfaces the withdrawal as the library's normal exhaustion throw.
+    assert.throws(() => arena.spawn(), /out of memory/);
 });
 
 test('Arena: generational handles > high-generation handles work correctly even when their bit pattern is negative', () => {
