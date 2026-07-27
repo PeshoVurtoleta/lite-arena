@@ -1,0 +1,109 @@
+# @zakkster/lite-arena
+
+> Zero-GC Entity-Component-System (ECS) memory allocator in ~190 lines.
+> Generational handles defeat ABA; SoA sparse sets give cache-friendly
+> iteration; swap-and-pop keeps removal O(1) without array shifts.
+
+Use this library when you need to manage 1,000-100,000 game entities with
+multiple components per entity, at 60 fps, without GC pauses. It's a primitive,
+not a framework: no query language, no scene graph, no rendering. Drop it
+into a custom game loop, particle system, simulation, or canvas overlay.
+
+The library exports two classes: `Arena` (the universe) and `SparseSet` (one
+per component). All memory is pre-allocated at construction.
+
+## API surface
+
+```ts
+import { Arena, SparseSet, Entity } from '@zakkster/lite-arena';
+
+// Construction (once, at startup):
+const arena = new Arena(maxEntities: number);   // [1, 1_048_575]
+
+// Components: SoA schemas mapped to parallel TypedArrays.
+const Pos = arena.registerComponent({
+  x: Float32Array,
+  y: Float32Array,
+});
+
+// Entity lifecycle:
+const e: Entity = arena.spawn();        // O(1), throws when full
+arena.isAlive(e): boolean;              // O(1), safe on arbitrary input
+arena.despawn(e): boolean;              // O(1), cascades to every component
+
+// Component ops on SparseSet<T>:
+Pos.add(e): number;        // returns dense index, or -1 if dead
+Pos.has(e): boolean;       // O(1), validates liveness + membership
+Pos.remove(e): boolean;    // O(1) swap-and-pop
+Pos.idx(e): number;        // UNSAFE fast-path — no checks; use only after has()
+
+// Hot loop (the canonical pattern):
+const n = Pos.count;
+const x = Pos.data.x;       // hoist the typed-array ref
+const y = Pos.data.y;
+for (let i = 0; i < n; i++) {
+  x[i] += vx[i] * dt;
+  y[i] += vy[i] * dt;
+}
+```
+
+## Key invariants
+
+- `dense[0..count)` is always contiguous and packed. Iterate it directly.
+- Indices `[count, capacity)` in `dense` and `data.*` are stale; don't read them.
+- Handle layout is opaque. Never decompose entity handles by hand.
+- `Generation = 0` is reserved as "never alive"; synthesizing handle `0` is
+  guaranteed to be rejected on a fresh arena.
+- `idx()` skips validation; only call inside loops where validity is guaranteed.
+- `despawn()` automatically removes the entity from every registered component.
+
+## Files
+
+- [README.md](README.md): Full documentation, benchmarks, mermaid diagrams,
+  FAQ, edge cases. Start here.
+- [./Arena.js](./Arena.js): The implementation (~190 lines, MIT, ESM).
+- [./Arena.d.ts](./Arena.d.ts): TypeScript definitions, fully typed including
+  `ComponentData<T>` generic for typed `data` field access.
+- [test/Arena.test.js](test/Arena.test.js): 41 vitest assertions including a
+  randomized churn oracle and zero-allocation guarantee under `--expose-gc`.
+- [bench/bench.js](bench/bench.js): Benchmark harness comparing against
+  `Map<id, object>`, `Array<Object>`, and a no-ECS manual SoA.
+- [example/demo.html](example/demo.html): 50,000-particle gravity-well demo,
+  toggleable backend, live FPS / heap stats.
+
+## Headline performance
+
+On a 2022 laptop, iteration of 10,000 entities × 200 frames:
+
+| Strategy | ms | vs lite-arena |
+|---|---:|---:|
+| **lite-arena**     | **8.5 ms** | **1.00×** |
+| Manual SoA (no ECS) | 9.2 ms | 1.09× |
+| Array<Object>       | 28.6 ms | 3.38× |
+| Map<id, object>     | 39.2 ms | 4.63× |
+
+Heap delta across all backends: < 100 bytes. The headline win is **iteration
+speed**, not spawn throughput; if your bottleneck is per-frame spawn churn,
+benchmark first — a bare TypedArray pool may suffice.
+
+## When NOT to use this
+
+- You have <500 entities. The JIT already inlines your class-based code fine.
+- You need complex archetype queries ("entities with A and B but not C, sorted
+  by D"). Use [bitecs](https://github.com/NateTheGreatt/bitECS) or similar.
+- Your components store arbitrary JS objects, not numbers. SoA is for
+  primitive numeric fields; if you need a `name: string` field, store the
+  string in a parallel `string[]` outside the ECS and use the entity index
+  as a key.
+
+## Sibling packages
+
+Part of the `@zakkster/*` zero-GC ecosystem:
+
+- `@zakkster/lite-signal` — reactive graph (873 lines, 78 tests)
+- `@zakkster/lite-scheduler` — frame budget manager with priority lanes
+- `@zakkster/lite-batch-buffer` — pre-allocated WebGL vertex buffer
+
+All three are designed to compose: the scheduler drives the frame, lite-arena
+manages entity state, lite-batch-buffer streams vertices to the GPU. Together
+they fit comfortably in Twitch's 1 MB / 3 s extension budget.
