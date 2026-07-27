@@ -47,6 +47,20 @@ export type ComponentData<T extends Record<string, TypedArrayConstructor>> = {
     [K in keyof T]: InstanceType<T[K]>;
 };
 
+/**
+ * The scratch object returned by {@link Arena.join}. `driver` is the component
+ * with the smaller `count` (iterate its `dense[0..count)`), `other` is the one
+ * to `has()`-check inside the loop, and `count` mirrors `driver.count`.
+ *
+ * This object is reused across `join()` calls on the same arena -- read it (or
+ * start your loop) before the next `join()`; never retain it across calls.
+ */
+export interface JoinPlan {
+    driver: SparseSet<any>;
+    other: SparseSet<any>;
+    count: number;
+}
+
 export class Arena {
     /** Hard cap on total entities, as passed to the constructor. */
     readonly capacity: number;
@@ -108,6 +122,25 @@ export class Arena {
     registerComponent<T extends Record<string, TypedArrayConstructor>>(
         schema: T
     ): SparseSet<T>;
+
+    /**
+     * Registers a zero-size TAG component: membership tracking with no payload.
+     * Equivalent to `registerComponent({})`; the returned set has `data === {}`.
+     * Use `add`/`has`/`remove` and iterate `dense[0..count)`.
+     */
+    registerTag(): SparseSet<{}>;
+
+    /**
+     * Cold-path planner for a two-component join. Returns references (not an
+     * iterator) so the caller writes the tight loop; picks the component with
+     * the smaller `count` as `driver`. Allocates nothing -- the returned object
+     * is a scratch reused across calls; consume it before the next `join()`.
+     *
+     * @param a One component.
+     * @param b The other component.
+     * @returns The reused {@link JoinPlan}: `{ driver, other, count }`.
+     */
+    join(a: SparseSet<any>, b: SparseSet<any>): JoinPlan;
 }
 
 export class SparseSet<T extends Record<string, TypedArrayConstructor>> {

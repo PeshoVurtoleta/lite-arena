@@ -37,6 +37,19 @@ Pos.has(e): boolean;       // O(1), validates liveness + membership
 Pos.remove(e): boolean;    // O(1) swap-and-pop
 Pos.idx(e): number;        // UNSAFE fast-path — no checks; use only after has()
 
+// Tag components (zero-size membership markers):
+const Frozen = arena.registerTag();     // SparseSet with data === {}
+Frozen.add(e); Frozen.has(e); Frozen.remove(e);   // dense/count as usual
+
+// Two-component join (rarest-first). Cold planner; caller writes the loop.
+const j = arena.join(Pos, Frozen);      // driver = the smaller-count set
+const drv = j.driver, oth = j.other, n = j.count;   // hoist, then loop:
+for (let i = 0; i < n; i++) {
+  const e = drv.dense[i];
+  if (!oth.has(e)) continue;            // e has BOTH components
+  // ...
+}
+
 // Hot loop (the canonical pattern):
 const n = Pos.count;
 const x = Pos.data.x;       // hoist the typed-array ref
@@ -60,6 +73,11 @@ for (let i = 0; i < n; i++) {
   it stays `0` on realistic workloads. See decisions/0001-generational-rollover.md.
 - `idx()` skips validation; only call inside loops where validity is guaranteed.
 - `despawn()` automatically removes the entity from every registered component.
+- `registerTag()` is `registerComponent({})`: membership only, `data === {}`.
+- `join(a, b)` returns a REUSED scratch `{driver, other, count}` (driver = the
+  smaller-count set); it allocates nothing and is called once per system, cold.
+  It is a planner, not an iterator -- there is deliberately no `query()` or
+  `forEach()`. Consume the result before the next `join()` on the same arena.
 
 ## Files
 
@@ -68,8 +86,9 @@ for (let i = 0; i < n; i++) {
 - [./Arena.js](./Arena.js): The implementation (~190 lines, MIT, ESM).
 - [./Arena.d.ts](./Arena.d.ts): TypeScript definitions, fully typed including
   `ComponentData<T>` generic for typed `data` field access.
-- [test/Arena.test.js](test/Arena.test.js): 41 node:test assertions including a
-  randomized churn oracle and zero-allocation guarantee under `--expose-gc`.
+- [test/Arena.test.js](test/Arena.test.js): 52 node:test cases including a
+  randomized churn oracle, tag/join stress, and a zero-allocation guarantee
+  under `--expose-gc`.
 - [bench/bench.js](bench/bench.js): Benchmark harness comparing against
   `Map<id, object>`, `Array<Object>`, and a no-ECS manual SoA.
 - [example/demo.html](example/demo.html): 50,000-particle gravity-well demo,

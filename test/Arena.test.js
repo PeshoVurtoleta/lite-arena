@@ -462,6 +462,194 @@ test('SparseSet: iteration > idx() matches has() for valid entities', () => {
 });
 
 // -----------------------------------------------------------------
+// Arena: registerTag -- zero-size membership components (1.3.0)
+// -----------------------------------------------------------------
+
+test('Arena: registerTag > data is an empty object with no keys', () => {
+    const arena = new Arena(8);
+    const tag = arena.registerTag();
+    assert.deepEqual(tag.data, {});
+    assert.equal(Object.keys(tag.data).length, 0);
+});
+
+test('Arena: registerTag > add / has / remove / count / dense all work', () => {
+    const arena = new Arena(8);
+    const Frozen = arena.registerTag();
+    const e = arena.spawn();
+
+    assert.equal(Frozen.has(e), false);       // not tagged yet
+    const i = Frozen.add(e);
+    assert.equal(i, 0);                        // add returns the dense index
+    assert.equal(Frozen.has(e), true);
+    assert.equal(Frozen.count, 1);
+    assert.equal(Frozen.dense[0], e);          // walkable via dense[0..count)
+
+    assert.equal(Frozen.remove(e), true);
+    assert.equal(Frozen.has(e), false);
+    assert.equal(Frozen.count, 0);
+});
+
+test('Arena: registerTag > add is idempotent and rejects dead handles', () => {
+    const arena = new Arena(8);
+    const Tag = arena.registerTag();
+    const e = arena.spawn();
+    assert.equal(Tag.add(e), Tag.add(e));      // idempotent -> same index
+    assert.equal(Tag.count, 1);
+
+    const dead = arena.spawn();
+    arena.despawn(dead);
+    assert.equal(Tag.add(dead), -1);           // dead handle rejected
+    assert.equal(Tag.count, 1);
+});
+
+test('Arena: registerTag > despawn auto-clears the tag', () => {
+    const arena = new Arena(8);
+    const Tag = arena.registerTag();
+    const e = arena.spawn();
+    Tag.add(e);
+    assert.equal(Tag.has(e), true);
+    arena.despawn(e);
+    assert.equal(Tag.has(e), false);           // cascaded like any component
+    assert.equal(Tag.count, 0);
+});
+
+test('Arena: registerTag > many tags iterate as a packed dense set under churn', () => {
+    const arena = new Arena(64);
+    const Tag = arena.registerTag();
+    const alive = [];
+    for (let i = 0; i < 40; i++) {
+        const e = arena.spawn();
+        alive.push(e);
+        if (i % 2 === 0) Tag.add(e);           // tag the evens
+    }
+    // Untag a scattered subset to force swap-and-pop churn.
+    Tag.remove(alive[0]);
+    Tag.remove(alive[10]);
+    Tag.remove(alive[20]);
+
+    // dense[0..count) must be exactly the still-tagged evens, each once.
+    const seen = new Set();
+    for (let i = 0; i < Tag.count; i++) {
+        const e = Tag.dense[i];
+        assert.equal(Tag.has(e), true);
+        assert.equal(seen.has(e), false);      // no duplicates
+        seen.add(e);
+    }
+    assert.equal(seen.size, Tag.count);
+    assert.equal(Tag.count, 20 - 3);
+});
+
+// -----------------------------------------------------------------
+// Arena: join -- rarest-first two-component planner (1.3.0)
+// -----------------------------------------------------------------
+
+test('Arena: join > drives the component with the smaller count', () => {
+    const arena = new Arena(32);
+    const A = arena.registerComponent({ v: Float32Array });
+    const B = arena.registerTag();
+
+    const ents = [];
+    for (let i = 0; i < 10; i++) ents.push(arena.spawn());
+    for (let i = 0; i < 10; i++) A.add(ents[i]);   // A: 10
+    for (let i = 0; i < 3; i++) B.add(ents[i]);    // B: 3  (rarer)
+
+    let j = arena.join(A, B);
+    assert.equal(j.driver, B);                 // smaller count wins as driver
+    assert.equal(j.other, A);
+    assert.equal(j.count, 3);
+
+    // Order of arguments must not change which one drives.
+    j = arena.join(B, A);
+    assert.equal(j.driver, B);
+    assert.equal(j.other, A);
+    assert.equal(j.count, 3);
+});
+
+test('Arena: join > ties favour the first argument deterministically', () => {
+    const arena = new Arena(16);
+    const A = arena.registerComponent({ v: Uint8Array });
+    const B = arena.registerComponent({ w: Uint8Array });
+    const e = arena.spawn(), f = arena.spawn();
+    A.add(e); A.add(f);                        // A: 2
+    B.add(e); B.add(f);                        // B: 2  (tie)
+
+    assert.equal(arena.join(A, B).driver, A);  // a.count <= b.count -> a
+    assert.equal(arena.join(B, A).driver, B);
+});
+
+test('Arena: join > returned object is a reused scratch, not a fresh allocation', () => {
+    const arena = new Arena(8);
+    const A = arena.registerComponent({ v: Float32Array });
+    const B = arena.registerTag();
+    const r1 = arena.join(A, B);
+    const r2 = arena.join(A, B);
+    assert.equal(r1, r2);                      // same object identity every call
+});
+
+test('Arena: join > the intersection loop the caller writes yields exactly A-and-B', () => {
+    const arena = new Arena(64);
+    const Pos = arena.registerComponent({ x: Float32Array });
+    const Poisoned = arena.registerTag();
+
+    const ents = [];
+    for (let i = 0; i < 30; i++) {
+        const e = arena.spawn();
+        ents.push(e);
+        Pos.add(e);
+        Pos.data.x[Pos.idx(e)] = i;
+        if (i % 5 === 0) Poisoned.add(e);      // 0,5,10,15,20,25 -> 6 poisoned
+    }
+
+    // Oracle: entities in BOTH sets.
+    const expected = new Set(ents.filter((e, i) => i % 5 === 0));
+
+    const j = arena.join(Pos, Poisoned);
+    assert.equal(j.driver, Poisoned);          // rarer set drives
+    const drv = j.driver, oth = j.other, n = j.count;
+    const got = new Set();
+    for (let i = 0; i < n; i++) {
+        const e = drv.dense[i];
+        if (!oth.has(e)) continue;
+        got.add(e);
+    }
+    assert.equal(got.size, expected.size);
+    for (const e of expected) assert.equal(got.has(e), true);
+});
+
+test('Arena: join > handles empty and equal components without special-casing', () => {
+    const arena = new Arena(8);
+    const A = arena.registerComponent({ v: Float32Array });
+    const B = arena.registerTag();
+    // Both empty.
+    let j = arena.join(A, B);
+    assert.equal(j.count, 0);
+    // Same component on both sides.
+    const e = arena.spawn();
+    A.add(e);
+    j = arena.join(A, A);
+    assert.equal(j.driver, A);
+    assert.equal(j.other, A);
+    assert.equal(j.count, 1);
+});
+
+// -----------------------------------------------------------------
+// Arena: NON-GOALS -- no query language, no callback iteration (1.3.0)
+// -----------------------------------------------------------------
+
+test('Arena: non-goals > no query() / forEach() / each() iteration API exists', () => {
+    const arena = new Arena(4);
+    const c = arena.registerComponent({ v: Float32Array });
+    const tag = arena.registerTag();
+    // The BRIEF forbids a query language and callback iteration. Assert absence
+    // so a future accidental addition trips this test.
+    assert.equal(typeof arena.query, 'undefined');
+    assert.equal(typeof c.forEach, 'undefined');
+    assert.equal(typeof c.each, 'undefined');
+    assert.equal(typeof tag.forEach, 'undefined');
+    assert.equal(typeof tag.each, 'undefined');
+});
+
+// -----------------------------------------------------------------
 // Arena: randomized churn (1000 ops) — pure correctness under churn
 // -----------------------------------------------------------------
 

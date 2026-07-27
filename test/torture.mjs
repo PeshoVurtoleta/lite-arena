@@ -20,6 +20,12 @@
  *     maxPauseMs:4. The summary is read only after an awaited settle tick, so
  *     the gate never passes on an empty observation window.
  *
+ *   Phase C (join zero-alloc) -- call arena.join(a, b) HOT_OPS_MIN times in a
+ *     loop and prove it allocates nothing. join() is a cold-path planner that
+ *     hands back a reused scratch object (not an iterator, not a fresh object),
+ *     so a tight loop over it must show zero major GC under the same rules. If
+ *     join() ever regressed to allocating per call, this window would light up.
+ *
  * A pass means something only if the gate can fail. Run
  *
  *     ARENA_TORTURE_LEAK=1 node --expose-gc test/torture.mjs
@@ -172,6 +178,51 @@ async function phaseB() {
     return { report: checkNoGc(summary, RULES), summary, ticks, count };
 }
 
+// --- Phase C: join zero-alloc ------------------------------------------------
+
+async function phaseC() {
+    const arena = new Arena(CAP);
+    const big = arena.registerComponent({ x: Float32Array }); // larger count
+    const rare = arena.registerTag();                         // smaller count
+
+    // Pre-populate OUTSIDE the measured loop: big gets every entity, rare a
+    // sparse subset, so join() must consistently pick `rare` as the driver.
+    for (let i = 0; i < CAP; i++) {
+        const e = arena.spawn();
+        big.add(e);
+        if ((i & 63) === 0) rare.add(e);
+    }
+
+    globalThis.gc();
+    globalThis.gc();
+
+    const gc = new GcProfiler(256, { heap: true }).start();
+    gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
+
+    // HOT-ish loop: call the cold planner HOT_OPS_MIN times. It hands back a
+    // reused scratch, so this must allocate nothing. Read fields into `acc` so
+    // V8 cannot dead-code the calls, and assert the driver is always the rarer.
+    let acc = 0;
+    let driverAlwaysRare = true;
+    for (let i = 0; i < HOT_OPS_MIN; i++) {
+        const j = arena.join(big, rare);
+        if (j.driver !== rare) driverAlwaysRare = false;
+        acc = acc + j.count;
+    }
+
+    const mu = process.memoryUsage();
+    gc.sampleHeap(performance.now(), mu.heapUsed, mu);
+
+    await gc.settle();
+    const summary = gc.summary();
+    gc.stop();
+
+    if (acc !== HOT_OPS_MIN * rare.count) die('join loop miscounted (acc=' + acc + ')');
+    if (!driverAlwaysRare) die('join picked the larger component as driver');
+
+    return { report: checkNoGc(summary, RULES), summary };
+}
+
 // --- gate --------------------------------------------------------------------
 
 async function main() {
@@ -181,11 +232,13 @@ async function main() {
 
     const a = phaseA();
     const b = await phaseB();
+    const c = await phaseC();
 
     const retentionOk = a.activeCount === 0 && a.trackerSize === 0;
     const budgetOk = b.report.ok;
+    const joinOk = c.report.ok;
 
-    if (retentionOk && budgetOk) {
+    if (retentionOk && budgetOk && joinOk) {
         process.stdout.write('ok\n');
         process.exit(0);
     }
@@ -201,6 +254,14 @@ async function main() {
         process.stderr.write(
             'torture: budget -- verdict=' + b.report.verdict +
             ' source=' + b.summary.source +
+            ' major=' + g.major + ' maxMs=' + g.maxMs.toFixed(3) +
+            ' (rules ' + JSON.stringify(RULES) + ')\n');
+    }
+    if (!joinOk) {
+        const g = c.summary.gc;
+        process.stderr.write(
+            'torture: join -- verdict=' + c.report.verdict +
+            ' source=' + c.summary.source +
             ' major=' + g.major + ' maxMs=' + g.maxMs.toFixed(3) +
             ' (rules ' + JSON.stringify(RULES) + ')\n');
     }

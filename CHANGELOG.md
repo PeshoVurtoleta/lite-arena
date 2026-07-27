@@ -5,6 +5,44 @@ All notable changes to `@zakkster/lite-arena` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-07-27
+
+First-class tag components and a rarest-first join planner. Both formalize
+patterns the README already recommended, WITHOUT adding a query API, a callback
+iterator, or any per-iteration allocation. The hot loop stays the caller's.
+
+### Added
+
+- **`arena.registerTag()`** -- registers a zero-size tag component: a
+  `SparseSet` whose `data` is an empty object, tracking membership only. Exactly
+  `registerComponent({})` given a name so the intent reads at the call site. Use
+  `add` / `has` / `remove` and iterate `dense[0..count)`; tags clear
+  automatically on `despawn`.
+- **`arena.join(a, b)`** -- a cold-path planner for a two-component join. Reads
+  both counts and returns `{ driver, other, count }` with the smaller-count
+  component as `driver`, so the caller iterates the rarer set and `has()`-checks
+  the other. It is NOT a query API and does NOT iterate -- it hands back
+  references so the caller writes the tight loop. It allocates nothing: the
+  returned object is a scratch reused across calls, owned by the arena (consume
+  it, or start your loop, before the next `join()` on the same arena).
+- `JoinPlan` type in `Arena.d.ts`; `registerTag()` / `join()` fully typed.
+- Torture Phase C: `arena.join()` called 200k times in a loop is gated at
+  `maxMajor: 0` to prove the join path allocates zero bytes.
+- Tag and join stress tests, plus a guard test asserting no `query()` /
+  `forEach()` / `each()` API exists (NON-GOAL enforcement).
+
+### Changed
+
+- `demo/demo.html`: a ~3% subset of particles now carries a `registerTag()`
+  marker, highlighted each frame via `arena.join()` (rarest-first). Also fixed
+  the module import to point at `../Arena.js` (was `../Arena.d.ts`).
+
+### Notes
+
+- Hot paths are untouched: `isAlive()` and `idx()` bodies are byte-for-byte
+  identical to 1.2.0. `join()` is called once per system (cold); the loop it
+  enables is the caller's and stays allocation-free.
+
 ## [1.2.0] - 2026-07-27
 
 Generational-rollover decision session. Full rationale and the rejected

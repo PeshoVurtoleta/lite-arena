@@ -324,6 +324,8 @@ Throws if `maxEntities` is out of range or non-integer.
 | `isAlive(e)` | `boolean` | O(1). Safe on any 32-bit integer; never throws. |
 | `despawn(e)` | `boolean` | O(1). Removes from every component; returns false if already dead. |
 | `registerComponent(schema)` | `SparseSet` | Mounts a new SoA component. Schema: `{ key: TypedArrayConstructor }`. |
+| `registerTag()` | `SparseSet` | Zero-size tag component (membership only). `registerComponent({})` with intent. `data === {}`. |
+| `join(a, b)` | `{ driver, other, count }` | Cold-path join planner. Returns a **reused** scratch with the smaller-count set as `driver`; allocates nothing. Not an iterator — you write the loop. |
 
 ### `SparseSet<T>` instance members
 
@@ -509,7 +511,19 @@ At a typical 4-component schema (position, velocity, sprite, lifetime) using `Fl
 Yes. `comp.add(existingEntity)` is O(1). The new entry lands at `comp.count - 1`, so the next iteration will see it.
 
 **What if I want to query "all entities with Position AND Velocity"?**
-Pick the rarer component, iterate its dense array, and inside the loop check `Velocity.has(e)`. This is what every ECS does under the hood; baking it into a `query()` API would only add overhead. For deeply heterogeneous queries, archetype-based ECSes (bitecs, etc.) win — but they're an order of magnitude more code.
+Pick the rarer component, iterate its dense array, and inside the loop check `Velocity.has(e)`. `arena.join(a, b)` does the "pick the rarer" part for you — it returns `{ driver, other, count }` with the smaller-count component as `driver`, and *you* write the loop:
+
+```js
+const j = arena.join(Position, Velocity); // driver = whichever is rarer
+const drv = j.driver, oth = j.other, n = j.count;
+for (let i = 0; i < n; i++) {
+  const e = drv.dense[i];
+  if (!oth.has(e)) continue;
+  // e has BOTH components — read via drv.idx(e) / oth.idx(e)
+}
+```
+
+`join()` is a **cold-path planner**, called once per system per frame: it returns a *reused* scratch object (so it allocates nothing) and it does **not** iterate — that keeps your loop hot and allocation-free. This is what every ECS does under the hood; a full `query()` API would only add overhead. For deeply heterogeneous queries, archetype-based ECSes (bitecs, etc.) win — but they're an order of magnitude more code. Note: consume the returned object (or start your loop) before the next `join()` call on the same arena; it is reused, not fresh.
 
 **Does it work with SharedArrayBuffer for Web Workers?**
 The current constructor allocates its own buffers. You can copy data into shared buffers manually; first-class SAB support is a v2 candidate. File an issue if you need it.
@@ -521,7 +535,7 @@ Iterators allocate. The hot-loop pattern is `for (let i = 0; i < comp.count; i++
 `add()` returns the newly-allocated index for the spawn moment. `idx()` is for later: when a system has an entity handle in hand and needs its current dense slot. They're semantically different.
 
 **What about a tagged-component pattern (zero-size markers)?**
-Pass an empty schema: `arena.registerComponent({})`. `data` is an empty object; only `dense` and `count` track membership. Use `has()` to test, and iterate `dense[0..count)` to walk the set.
+Use `arena.registerTag()` — a named shortcut for `arena.registerComponent({})`. `data` is an empty object; only `dense` and `count` track membership. `add()` to tag, `has()` to test, `remove()` to untag, and iterate `dense[0..count)` to walk the set. Like any component, tags clear automatically on `despawn()`. Pair it with `join()` to iterate "all entities tagged X that also have component Y" without a query API.
 
 ---
 

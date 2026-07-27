@@ -59,6 +59,11 @@ export class Arena {
 
         /** @type {SparseSet[]} Components registered to this arena. */
         this.components = [];
+
+        // Reused scratch for join(). Allocated ONCE here so join() -- a cold
+        // per-system planner -- hands back references without allocating on any
+        // call. Mutated in place and returned; see join() for the reuse contract.
+        this._joinResult = { driver: null, other: null, count: 0 };
     }
 
     /**
@@ -147,6 +152,59 @@ export class Arena {
         const set = new SparseSet(this.capacity, schema, this);
         this.components.push(set);
         return set;
+    }
+
+    /**
+     * Registers a zero-size TAG component: a SparseSet that tracks membership
+     * only, with no payload arrays. Exactly `registerComponent({})` -- `data`
+     * is an empty object -- given a name so the intent reads at the call site.
+     *
+     * Use `add(e)` to tag, `has(e)` to test, `remove(e)` to untag, and iterate
+     * `dense[0..count)` to walk every tagged entity. Like any component, tags
+     * are cleared automatically on `despawn(e)`.
+     *
+     * @returns {SparseSet} A membership-only set (`data === {}`).
+     */
+    registerTag() {
+        return this.registerComponent({});
+    }
+
+    /**
+     * Cold-path planner for a two-component join ("entities with A AND B").
+     * Reads both counts and hands back the component with the SMALLER count as
+     * the `driver`, so the caller iterates the rarer set and `has()`-checks the
+     * other -- the cheapest way to intersect two sparse sets.
+     *
+     * This is NOT a query API and it does NOT iterate: it returns references so
+     * the caller writes the tight loop themselves. It allocates nothing -- the
+     * returned object is a scratch reused across calls, owned by the arena.
+     * Read `driver` / `other` / `count` (or start your loop) BEFORE the next
+     * `join()` call on this arena; do not retain the object across calls.
+     *
+     * @param {SparseSet} a
+     * @param {SparseSet} b
+     * @returns {{ driver: SparseSet, other: SparseSet, count: number }}
+     *   `driver` is whichever of `a`/`b` has the smaller `count` (ties favour
+     *   `a`); `other` is the remaining component; `count` is `driver.count`.
+     *
+     * @example
+     *   // Iterate the rarer of Poisoned / Position, once per system (cold):
+     *   const j = arena.join(Poisoned, Position);
+     *   const drv = j.driver, oth = j.other, n = j.count;   // hoist, then loop
+     *   for (let i = 0; i < n; i++) {
+     *       const e = drv.dense[i];
+     *       if (!oth.has(e)) continue;
+     *       // ... e has BOTH components ...
+     *   }
+     */
+    join(a, b) {
+        const r = this._joinResult;
+        if (a.count <= b.count) {
+            r.driver = a; r.other = b; r.count = a.count;
+        } else {
+            r.driver = b; r.other = a; r.count = b.count;
+        }
+        return r;
     }
 }
 
