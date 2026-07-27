@@ -84,8 +84,13 @@ export class Arena {
         const gen = this.generations[index];
         this.activeCount = (this.activeCount + 1) | 0;
 
-        // Note: bitwise OR treats operands as signed 32-bit. High generations
-        // will result in a negative integer. This is perfectly safe as a bit pattern.
+        // Note: bitwise OR treats operands as signed 32-bit, so a generation of
+        // 2048 or more sets the sign bit and the handle is NEGATIVE. That is fine
+        // -- but only because `dense` is an Int32Array (same signedness), so a
+        // stored handle round-trips through `dense[i] === entity`. Returning
+        // `(...) >>> 0` here would push high handles above 2^31, out of the SMI
+        // range and into heap-boxed doubles -- an allocation on the spawn path.
+        // The signed handle is correct; the container carries the signedness.
         return (gen << 20) | index;
     }
 
@@ -295,7 +300,14 @@ export class SparseSet {
         this.sparse = new Uint32Array(maxEntities);
 
         // Contiguous array of living entity handles. Indices [0, count) are valid.
-        this.dense = new Uint32Array(maxEntities);
+        // MUST be Int32Array, not Uint32Array: a handle is `(gen << 20) | index`,
+        // a SIGNED 32-bit int that goes NEGATIVE once a slot reaches generation
+        // 2048 (the sign bit lands in the generation field). `dense` stores whole
+        // handles and `has()`/`add()` compare `dense[i] === entity` -- so the
+        // stored form and the compared form must share signedness. A Uint32Array
+        // stored the unsigned bit pattern and every such comparison went silently
+        // false for gen >= 2048, corrupting has/add/remove and the despawn cascade.
+        this.dense = new Int32Array(maxEntities);
 
         /** @type {Object<string, ArrayBufferView>} Parallel SoA payload arrays. */
         this.data = {};
@@ -408,7 +420,8 @@ export class SparseSet {
         newSparse.set(this.sparse);
         this.sparse = newSparse;
 
-        const newDense = new Uint32Array(newCapacity);
+        // Int32Array, matching the constructor: `dense` holds signed handles.
+        const newDense = new Int32Array(newCapacity);
         newDense.set(this.dense);
         this.dense = newDense;
 

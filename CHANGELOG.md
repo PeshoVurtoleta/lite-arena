@@ -5,6 +5,73 @@ All notable changes to `@zakkster/lite-arena` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.1] - 2026-07-28
+
+A silent-corruption fix. Every `SparseSet` operation broke once a slot reached
+generation 2048, on a package shipped to npm. If you run `@zakkster/lite-arena`
+in a system that recycles entities steadily -- particles, bullets, anything with
+per-frame churn -- upgrade.
+
+### Fixed
+
+- **Sign-bit corruption across half of every slot's generation range.** An
+  entity handle is `(gen << 20) | index`, a SIGNED 32-bit int that goes NEGATIVE
+  at generation 2048. `SparseSet.dense` was a `Uint32Array`, which stored the
+  unsigned bit pattern while the caller held the negative handle, so the
+  membership compare `dense[i] === entity` was ALWAYS false for `gen >= 2048`.
+  Consequences, all silent: `has()` returned false for a live attached entity,
+  `add()` appended a duplicate on every call, `remove()` could not detach, and
+  `despawn()` returned `true` while its cascade removed nothing -- leaving the
+  documented hot loop `dense[0..count)` full of dead and duplicated entities. A
+  slot recycled once per frame at 60 fps hits generation 2048 in ~34 seconds,
+  and the LIFO free list recycles hot slots first, so steady spawn/despawn
+  workloads reach it routinely. The fix is one type: `dense` is now an
+  `Int32Array` (in the constructor and in the `reserve()` grow path), so the
+  stored and compared forms share signedness across the full range 1..4095. See
+  [`decisions/0002-signed-handle-container.md`](decisions/0002-signed-handle-container.md),
+  which also records why the `spawn()`-returns-`>>> 0` alternative was rejected
+  (it boxes high handles as heap doubles, adding an allocation to the spawn
+  path).
+- **A false-confidence regression test.** The test named
+  `high-generation handles work correctly even when their bit pattern is
+  negative` asserted only `isAlive`/`despawn` on an arena with ZERO components
+  registered, so the cascade was a no-op and it passed green while the entire
+  SparseSet layer was broken. It now registers three components and exercises
+  `add` (stable + idempotent), `has`, `idx`, `remove`, and the `despawn` cascade
+  over a sign-bit-set handle. It fails against a `Uint32Array` `dense` and passes
+  against `Int32Array`, with a comment forbidding a trim back to the old shape.
+- **`package.json` metadata pointed at the wrong project.** `homepage`,
+  `repository`, and `bugs` all resolved to `lite-scheduler`, so the npm page,
+  `npm repo`, and `npm bugs` sent users -- and any filed issue -- to another
+  package. All three now point at `lite-arena`.
+- **Two dead demo links.** README (two spots) and `llms.txt` linked
+  `example/demo.html`; the file lives at `demo/demo.html`. Corrected.
+
+### Changed
+
+- `SparseSet.dense` is a documented public member, and its TypeScript type in
+  `Arena.d.ts` changes from `Uint32Array` to `Int32Array`. Migration: reading a
+  handle out of `dense` and passing it straight back to the API is unaffected;
+  do NOT copy `dense` into a `Uint32Array` view or apply `>>> 0` to a value read
+  from it -- the handle is signed.
+
+### Added
+
+- Torture **Phase E (handle-space sweep)**: for generations bracketing the sign
+  bit -- {1, 2047, 2048, 2049, 4094, 4095} -- drives a slot to that exact
+  generation and asserts the full SparseSet contract (add stable/idempotent,
+  has, idx, remove, count-to-zero, and a despawn cascade across three
+  components), swept over many slot indices. It exits non-zero if `dense` is ever
+  reverted to `Uint32Array`, so it is its own control. (Named E, not D: Phase D
+  is the pre-existing 1.4.0 reserve gate; renaming it would falsify that entry.)
+
+### Notes
+
+- Hot paths are untouched. `Int32Array` and `Uint32Array` have identical
+  load/store cost; the `spawn` / `despawn` / `isAlive` / `idx` bodies are
+  otherwise byte-for-byte unchanged, and the Phase B iteration budget still
+  passes at `maxMajor: 0`.
+
 ## [1.4.0] - 2026-07-27
 
 An explicit, opt-in capacity escape hatch. The arena still never auto-grows --

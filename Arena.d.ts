@@ -170,8 +170,13 @@ export class SparseSet<T extends Record<string, TypedArrayConstructor>> {
     /**
      * The packed, contiguous array of living entity handles.
      * Valid range: `[0, count)`. Indices >= count contain stale data.
+     *
+     * Int32Array, not Uint32Array: an entity handle is a SIGNED 32-bit int
+     * (negative once a slot reaches generation 2048), and `dense` stores whole
+     * handles. Read a handle out of `dense[i]` and pass it straight back to the
+     * API; do not `>>> 0` it or store it in an unsigned view.
      */
-    readonly dense: Uint32Array;
+    readonly dense: Int32Array;
 
     /**
      * The parallel SoA payload data. Each key is a TypedArray of the

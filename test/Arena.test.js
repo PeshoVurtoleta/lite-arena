@@ -191,19 +191,68 @@ test('Arena: generational handles > retires a slot at generation exhaustion (no 
 });
 
 test('Arena: generational handles > high-generation handles work correctly even when their bit pattern is negative', () => {
+    // REGRESSION GUARD for AR-01 / AR-02. Do NOT trim this test back to
+    // isAlive/despawn on a component-free arena: that shape passes green while
+    // the entire SparseSet layer is silently broken (which is exactly how the
+    // pre-1.4.1 version of this test hid the bug for three minor releases).
+    //
+    // AR-01: a handle is `(gen << 20) | index`, a SIGNED int that goes NEGATIVE
+    // at generation 2048. `dense` must be an Int32Array so the stored form and
+    // the compared form (`dense[i] === entity`) share signedness. When `dense`
+    // was a Uint32Array, EVERY SparseSet op silently failed for gen >= 2048:
+    // has() false for a live member, add() duplicated, remove()/despawn cascade
+    // detached nothing. This test therefore MUST register components and drive
+    // has/add/idx/remove and the despawn cascade over a sign-bit-set handle --
+    // it fails against a Uint32Array `dense` and passes against Int32Array.
     const arena = new Arena(1);
+    const pos = arena.registerComponent({ x: Float32Array, y: Float32Array });
+    const vel = arena.registerComponent({ vx: Float32Array });
+    const frozen = arena.registerTag();
+
     let h = arena.spawn();
     arena.despawn(h);
 
-    // Get to a generation where the sign bit is set.
+    // Drive slot 0 to a generation where the sign bit is set (>= 2048).
     for (let i = 0; i < 2048; i++) {
         h = arena.spawn();
         arena.despawn(h);
     }
     const negHandle = arena.spawn();
-    assert.equal(negHandle < 0, true); // sign bit set
+    assert.equal(negHandle < 0, true);                 // sign bit set
     assert.equal(arena.isAlive(negHandle), true);
+
+    // --- the SparseSet contract, over a NEGATIVE handle -------------------
+    const di = pos.add(negHandle);
+    assert.equal(di >= 0, true);                        // add attaches, not -1
+    assert.equal(pos.has(negHandle), true);             // <-- the AR-01 assertion
+    assert.equal(pos.idx(negHandle), di);               // fast-path index matches
+    assert.equal(pos.add(negHandle), di);               // idempotent: same index
+    assert.equal(pos.count, 1);                         // no duplicate appended
+
+    // Write and read back through the dense index to prove the row is real.
+    pos.data.x[di] = 3.5; pos.data.y[di] = -1.25;
+    assert.equal(pos.data.x[di], 3.5);
+    assert.equal(pos.data.y[di], -1.25);
+
+    // Attach the other two components (a second data set + a tag).
+    vel.add(negHandle); frozen.add(negHandle);
+    assert.equal(vel.has(negHandle), true);
+    assert.equal(frozen.has(negHandle), true);
+
+    // remove() must be able to detach a negative handle.
+    assert.equal(pos.remove(negHandle), true);
+    assert.equal(pos.count, 0);
+    assert.equal(pos.has(negHandle), false);
+
+    // despawn() must cascade across EVERY registered component. Re-attach pos
+    // first so the cascade has all three to clear.
+    pos.add(negHandle);
     assert.equal(arena.despawn(negHandle), true);
+    assert.equal(pos.count, 0);                         // cascade cleared pos
+    assert.equal(vel.count, 0);                         // ...and vel
+    assert.equal(frozen.count, 0);                      // ...and the tag
+    assert.equal(arena.activeCount, 0);
+    assert.equal(arena.isAlive(negHandle), false);
 });
 
 // -----------------------------------------------------------------

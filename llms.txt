@@ -102,7 +102,7 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
   zero-allocation guarantee under `--expose-gc`.
 - [bench/bench.js](bench/bench.js): Benchmark harness comparing against
   `Map<id, object>`, `Array<Object>`, and a no-ECS manual SoA.
-- [example/demo.html](example/demo.html): 50,000-particle gravity-well demo,
+- [demo/demo.html](demo/demo.html): 50,000-particle gravity-well demo,
   toggleable backend, live FPS / heap stats.
 
 ## Headline performance

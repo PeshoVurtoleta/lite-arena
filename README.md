@@ -433,7 +433,7 @@ Reproduces the [headline numbers](#headline-result). On any 2020+ machine you sh
 
 ```bash
 # Just open the file; no build step.
-open example/demo.html
+open demo/demo.html
 ```
 
 A 50,000-particle gravity simulation. Drag to move the gravity well; observe constant-time frame stats in the corner. If you toggle the mode buttons to "Array<Object>" or "Map" you'll see the framerate halve and GC stutter appear in the stats graph.
@@ -452,7 +452,7 @@ A 50,000-particle gravity simulation. Drag to move the gravity well; observe con
 ## Running the demo
 
 ```
-example/demo.html
+demo/demo.html
 ```
 
 No build step. No server needed if you open over `file://` — it uses a relative ESM import from `../Arena.js`.

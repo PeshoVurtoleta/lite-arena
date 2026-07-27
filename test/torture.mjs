@@ -33,6 +33,19 @@
  *     path still allocates nothing: the measured window opens AFTER the grow, so
  *     a pass proves growth is a one-time cold cost and never leaks into the loop.
  *
+ *   Phase E (handle-space sweep) -- the AR-01 corruption gate. A handle is
+ *     `(gen << 20) | index`, a SIGNED int that goes NEGATIVE at generation 2048,
+ *     so `dense` must be an Int32Array or every SparseSet compare (`dense[i] ===
+ *     entity`) silently goes false past that boundary. For generations bracketing
+ *     the sign bit -- {1, 2047, 2048, 2049, 4094, 4095} -- drive a slot to that
+ *     exact generation and assert the FULL SparseSet contract (add is stable and
+ *     idempotent, has is true, idx matches, remove detaches, count returns to 0,
+ *     and despawn cascades across three registered components). Swept over many
+ *     slot indices, not just slot 0. This phase FAILS (exits non-zero) if `dense`
+ *     is ever reverted to Uint32Array -- it is its own control, no env flag
+ *     needed. (Named Phase E, not D: Phase D is the pre-existing reserve gate
+ *     shipped in 1.4.0; renaming it would falsify that CHANGELOG entry.)
+ *
  * A pass means something only if the gate can fail. Run
  *
  *     ARENA_TORTURE_LEAK=1 node --expose-gc test/torture.mjs
@@ -291,6 +304,88 @@ async function phaseD() {
     return { report: checkNoGc(summary, RULES), summary };
 }
 
+// --- Phase E: handle-space sweep (the AR-01 corruption gate) ------------------
+
+// Drive `slot` to exactly `targetGen` on a fresh arena, then prove the full
+// SparseSet contract holds over the resulting handle -- which is NEGATIVE for
+// gen >= 2048. Fails (via die) the instant a compare over a signed handle goes
+// wrong, i.e. the instant `dense` is not an Int32Array.
+function sweepSlotAtGen(slot, targetGen, slots) {
+    const arena = new Arena(slots + 2);
+    const a = arena.registerComponent({ x: Float32Array });
+    const b = arena.registerComponent({ y: Float32Array });
+    const tag = arena.registerTag();
+
+    // Occupy slots 0..slot-1 so the next spawn lands on `slot`. The free list is
+    // LIFO, so once `slot` is in play, despawn+spawn churns THAT slot in place
+    // (the held slots stay put), advancing only its generation.
+    for (let j = 0; j < slot; j++) arena.spawn();
+
+    let h = arena.spawn(); // `slot`, generation 1
+    if ((h & INDEX_MASK) !== slot) {
+        die('phaseE: expected slot ' + slot + ', got ' + (h & INDEX_MASK));
+    }
+    for (let gen = 1; gen < targetGen; gen++) {
+        arena.despawn(h);  // returns `slot` to the free head, bumps its generation
+        h = arena.spawn(); // pops `slot` again (LIFO)
+    }
+
+    // Sign-bit expectation: the handle is negative iff generation >= 2048.
+    const shouldBeNeg = targetGen >= 2048;
+    if ((h < 0) !== shouldBeNeg) {
+        die('phaseE: slot ' + slot + ' gen ' + targetGen + ' sign wrong (handle=' + h + ')');
+    }
+    if (!arena.isAlive(h)) {
+        die('phaseE: slot ' + slot + ' gen ' + targetGen + ' not alive');
+    }
+
+    // The full SparseSet contract over this (possibly negative) handle.
+    const di = a.add(h);
+    if (di < 0)           die('phaseE: add() returned -1 at slot ' + slot + ' gen ' + targetGen);
+    if (!a.has(h))        die('phaseE: has() false for a live member at slot ' + slot + ' gen ' + targetGen);
+    if (a.idx(h) !== di)  die('phaseE: idx() mismatch at slot ' + slot + ' gen ' + targetGen);
+    if (a.add(h) !== di)  die('phaseE: add() not idempotent at slot ' + slot + ' gen ' + targetGen);
+    if (a.count !== 1)    die('phaseE: duplicate appended at slot ' + slot + ' gen ' + targetGen);
+
+    b.add(h); tag.add(h);
+    if (!b.has(h) || !tag.has(h)) {
+        die('phaseE: multi-component attach failed at slot ' + slot + ' gen ' + targetGen);
+    }
+
+    // join() over sets built from a high-gen (negative) handle: counts drive the
+    // planner, and a broken has/add would have corrupted them. driver.dense[0]
+    // must round-trip the signed handle.
+    const jr = arena.join(a, b);
+    if (jr.count !== 1 || jr.driver.dense[0] !== h) {
+        die('phaseE: join() wrong over a high-gen handle at slot ' + slot + ' gen ' + targetGen);
+    }
+
+    if (!a.remove(h))     die('phaseE: remove() false at slot ' + slot + ' gen ' + targetGen);
+    if (a.count !== 0)    die('phaseE: count != 0 after remove at slot ' + slot + ' gen ' + targetGen);
+    if (a.has(h))         die('phaseE: has() true after remove at slot ' + slot + ' gen ' + targetGen);
+
+    // despawn() must cascade across every registered component. Re-attach first.
+    a.add(h);
+    if (!arena.despawn(h)) die('phaseE: despawn() false at slot ' + slot + ' gen ' + targetGen);
+    if (a.count !== 0 || b.count !== 0 || tag.count !== 0) {
+        die('phaseE: despawn cascade left a component non-empty at slot ' + slot + ' gen ' + targetGen);
+    }
+}
+
+function phaseE() {
+    // Generations bracketing the sign-bit boundary (2048): below, on, just past,
+    // and the top of the live range.
+    const GENS = [1, 2047, 2048, 2049, 4094, 4095];
+    const SLOTS = 8; // sweep several distinct slot indices, not just slot 0
+
+    for (let slot = 0; slot < SLOTS; slot++) {
+        for (let g = 0; g < GENS.length; g++) {
+            sweepSlotAtGen(slot, GENS[g], SLOTS);
+        }
+    }
+    return { ok: true };
+}
+
 // --- gate --------------------------------------------------------------------
 
 async function main() {
@@ -302,13 +397,17 @@ async function main() {
     const b = await phaseB();
     const c = await phaseC();
     const d = await phaseD();
+    // Phase E self-reports via die() on any failure, so reaching here means the
+    // full handle-space sweep passed. It is included in the gate for symmetry.
+    const e = phaseE();
 
     const retentionOk = a.activeCount === 0 && a.trackerSize === 0;
     const budgetOk = b.report.ok;
     const joinOk = c.report.ok;
     const reserveOk = d.report.ok;
+    const sweepOk = e.ok;
 
-    if (retentionOk && budgetOk && joinOk && reserveOk) {
+    if (retentionOk && budgetOk && joinOk && reserveOk && sweepOk) {
         process.stdout.write('ok\n');
         process.exit(0);
     }
