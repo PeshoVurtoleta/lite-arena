@@ -14,6 +14,8 @@
  *   - Swap-and-Pop: O(1) component removal keeps dense arrays contiguous
  *     without shifting.
  *   - Zero-GC: All buffers and free-lists are allocated once at construction.
+ *     They grow only via an explicit, between-frames `reserve()` call -- never
+ *     implicitly, so `spawn()` can never reallocate and invalidate hoisted refs.
  *
  * @module @zakkster/lite-arena
  * @author Zahary Shinikchiev
@@ -206,6 +208,72 @@ export class Arena {
         }
         return r;
     }
+
+    /**
+     * Explicit, opt-in capacity growth. The ONLY way the universe ever grows.
+     *
+     * There is deliberately no auto-grow: `spawn()` at capacity throws and never
+     * calls this. Growth reallocates every backing array (arena-level and every
+     * component's `dense` + each `data.*`), so it MUST be caller-initiated and
+     * MUST happen between frames -- never inside a hot loop. Live contents are
+     * copied, so every handle, every membership, and every dense index survives.
+     *
+     * LOUD CAVEAT -- STALE HOISTED REFERENCES: after `reserve()` returns true,
+     * every typed-array reference you previously hoisted (`const x = comp.data.x`,
+     * or a saved `arena.generations` / `comp.dense`) points at the OLD, discarded
+     * buffer. Re-read `comp.data.x` (etc.) after reserving. This is by design and
+     * is exactly why growth is not implicit: an auto-grow would invalidate those
+     * references mid-frame with no call site to blame.
+     *
+     * Cold path only: `spawn` / `despawn` / `isAlive` / `idx` bodies are
+     * untouched, and nothing on any hot path ever reaches this method.
+     *
+     * @param {number} newCapacity - Target capacity. Must be an integer
+     *   <= 1048575 (the 20-bit handle-index ceiling).
+     * @returns {boolean} `true` if the arena grew; `false` (a no-op) if
+     *   `newCapacity <= capacity`.
+     * @throws {Error} If `newCapacity` is not an integer, or exceeds 1048575.
+     */
+    reserve(newCapacity) {
+        if (!Number.isInteger(newCapacity) || newCapacity > INDEX_MASK) {
+            throw new Error(`lite-arena: reserve capacity must be an integer <= ${INDEX_MASK}, got ${newCapacity}`);
+        }
+        // Grow-only. Shrinking would strand live entities in dropped slots, so a
+        // request for the same-or-smaller capacity is a defined no-op.
+        if (newCapacity <= this.capacity) return false;
+
+        const oldCapacity = this.capacity;
+
+        // Generations: copy live/retired state verbatim; initialize the new
+        // slots to generation 1 (same as the constructor) so a synthesized
+        // gen-0 handle into the new region is rejected by isAlive.
+        const newGenerations = new Uint32Array(newCapacity);
+        newGenerations.set(this.generations);
+        newGenerations.fill(1, oldCapacity);
+        this.generations = newGenerations;
+
+        // Free list: copy the existing chain intact, then push the fresh slots
+        // [oldCapacity, newCapacity) onto the head so spawn() hands them out
+        // first. The tail of the new chain points at the old freeHead -- which
+        // is INDEX_MASK when the arena was full, correctly terminating the list.
+        const newFreeList = new Uint32Array(newCapacity);
+        newFreeList.set(this.freeList);
+        for (let i = oldCapacity; i < newCapacity - 1; i++) {
+            newFreeList[i] = (i + 1) | 0;
+        }
+        newFreeList[newCapacity - 1] = this.freeHead;
+        this.freeList = newFreeList;
+        this.freeHead = oldCapacity | 0;
+
+        // Grow every registered component in lockstep. Copies live contents;
+        // stale [count, capacity) tails are copied too but never read.
+        for (let i = 0; i < this.components.length; i++) {
+            this.components[i]._grow(newCapacity);
+        }
+
+        this.capacity = newCapacity | 0;
+        return true;
+    }
 }
 
 export class SparseSet {
@@ -324,5 +392,32 @@ export class SparseSet {
      */
     idx(entity) {
         return this.sparse[entity & INDEX_MASK];
+    }
+
+    /**
+     * INTERNAL, COLD PATH: reallocate this set's backing arrays to a larger
+     * capacity, copying every existing element. Driven only by `Arena.reserve()`
+     * (which grows all components in lockstep); never call it directly, and never
+     * from a hot loop. `count` and every dense index are preserved, so live
+     * membership and SoA payloads survive unchanged -- only the buffers move.
+     *
+     * @param {number} newCapacity - Strictly greater than the current length.
+     */
+    _grow(newCapacity) {
+        const newSparse = new Uint32Array(newCapacity);
+        newSparse.set(this.sparse);
+        this.sparse = newSparse;
+
+        const newDense = new Uint32Array(newCapacity);
+        newDense.set(this.dense);
+        this.dense = newDense;
+
+        // Reallocate each parallel SoA array to the SAME typed-array type.
+        for (const key in this.data) {
+            const old = this.data[key];
+            const grown = new old.constructor(newCapacity);
+            grown.set(old);
+            this.data[key] = grown;
+        }
     }
 }

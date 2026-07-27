@@ -141,6 +141,26 @@ export class Arena {
      * @returns The reused {@link JoinPlan}: `{ driver, other, count }`.
      */
     join(a: SparseSet<any>, b: SparseSet<any>): JoinPlan;
+
+    /**
+     * Explicit, opt-in capacity growth -- the ONLY way the universe grows.
+     * There is no auto-grow: `spawn()` at capacity throws and never calls this.
+     *
+     * Reallocates every backing buffer (arena-level and each component's `dense`
+     * + every `data.*`), copying live contents, so every {@link Entity} handle,
+     * every membership, and every dense index is preserved. Grow-only: a
+     * `newCapacity <= capacity` request is a no-op that returns `false`.
+     *
+     * COLD, BETWEEN-FRAMES ONLY. Because the buffers move, any typed-array
+     * reference you hoisted before the call -- `const x = comp.data.x`, a saved
+     * `comp.dense`, etc. -- is STALE afterward and must be re-read. This is by
+     * design; it is precisely why growth is never implicit.
+     *
+     * @param newCapacity Target capacity; an integer `<= 1048575`.
+     * @returns `true` if the arena grew, `false` if it was already large enough.
+     * @throws Error when `newCapacity` is not an integer, or exceeds 1048575.
+     */
+    reserve(newCapacity: number): boolean;
 }
 
 export class SparseSet<T extends Record<string, TypedArrayConstructor>> {

@@ -5,6 +5,50 @@ All notable changes to `@zakkster/lite-arena` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-07-27
+
+An explicit, opt-in capacity escape hatch. The arena still never auto-grows --
+`spawn()` at capacity throws exactly as before -- but a caller who KNOWS they are
+between frames can now grow the universe loudly and on purpose.
+
+### Added
+
+- **`arena.reserve(newCapacity)`** -- the ONLY way the arena grows, and only
+  when asked. Reallocates every backing buffer (the arena's `generations` /
+  `freeList` and each component's `dense` + every `data.*`), copying live
+  contents, so every handle, every component membership, and every dense index
+  is preserved. Grow-only: `newCapacity <= capacity` is a defined no-op that
+  returns `false`; a real grow returns `true`. Throws on a non-integer or a
+  value above the 20-bit ceiling (`1048575`). Cold, between-frames path only.
+- `reserve(newCapacity): boolean` in `Arena.d.ts`, with the stale-reference
+  caveat documented in the type.
+- Torture Phase D: fill to capacity, `reserve()` to grow between "frames" (a
+  legitimate cold-path allocation), then run the hot tick over the grown arrays.
+  Gated at `maxMajor: 0` -- proof that growth is a one-time cold cost and never
+  leaks into the hot loop.
+- Nine `reserve` tests: a grow oracle (live entities / memberships / SoA values
+  all preserved), spawn-at-capacity-still-throws (no auto-grow), spawning into
+  the freshly reserved region, free-list integrity across a grow, and an
+  explicit check that hoisted `data.x` / `dense` refs point at the OLD buffer
+  afterward (the documented footgun).
+
+### Changed
+
+- README FAQ "why no auto-grow" now points at `reserve()` as the explicit,
+  between-frames alternative, with the re-hoist caveat and a code sample.
+- `llms.txt` API surface and invariants document `reserve()` and the
+  never-auto-grow guarantee.
+
+### Notes
+
+- Hot paths are untouched: `spawn()`, `despawn()`, `isAlive()`, and `idx()`
+  bodies are byte-for-byte identical to 1.3.0. `reserve()` is a new cold method;
+  nothing on any hot path reaches it, and `spawn()` never calls it.
+- STALE REFERENCES BY DESIGN: after `reserve()` returns `true`, any typed-array
+  reference hoisted before the call (`const x = comp.data.x`) points at the old,
+  discarded buffer. Re-read it. This is exactly why growth is explicit and
+  between-frames -- an implicit grow would invalidate such refs mid-frame.
+
 ## [1.3.0] - 2026-07-27
 
 First-class tag components and a rarest-first join planner. Both formalize

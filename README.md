@@ -326,6 +326,7 @@ Throws if `maxEntities` is out of range or non-integer.
 | `registerComponent(schema)` | `SparseSet` | Mounts a new SoA component. Schema: `{ key: TypedArrayConstructor }`. |
 | `registerTag()` | `SparseSet` | Zero-size tag component (membership only). `registerComponent({})` with intent. `data === {}`. |
 | `join(a, b)` | `{ driver, other, count }` | Cold-path join planner. Returns a **reused** scratch with the smaller-count set as `driver`; allocates nothing. Not an iterator — you write the loop. |
+| `reserve(newCap)` | `boolean` | **Explicit, between-frames capacity growth** — the only way the arena grows. Reallocates every backing buffer (all handles/data preserved); `false` no-op if `newCap <= capacity`. Invalidates hoisted refs — re-read `data.x` after. |
 
 ### `SparseSet<T>` instance members
 
@@ -502,7 +503,18 @@ Components' typed arrays own their backing `ArrayBuffer`. If you need cross-thre
 ## FAQ
 
 **Why a hard `maxEntities` cap? Why not auto-grow?**
-Because growing would reallocate every component's parallel TypedArrays and every system that hoisted a reference to `data.x`. The whole point of pre-allocation is that none of that ever happens. Pick a number 2-4× the worst-case spawn burst; you pay ~`maxEntities × sum-of-component-sizes` bytes of RAM, once.
+Because *implicit* growth would reallocate every component's parallel TypedArrays mid-frame and silently invalidate every system that hoisted a reference to `data.x` — with no call site to blame. The whole point of pre-allocation is that none of that ever happens on the hot path. Pick a number 2-4× the worst-case spawn burst; you pay ~`maxEntities × sum-of-component-sizes` bytes of RAM, once.
+
+If you genuinely outgrow the cap, grow **explicitly** with `arena.reserve(newCap)` — the sanctioned escape hatch. It reallocates all backing buffers on the cold path, copying live contents so every handle, membership, and dense index survives, and returns `true` (or `false` if `newCap <= capacity`). It is **between-frames only**: because the buffers move, any reference you hoisted (`const x = comp.data.x`) is stale afterward and must be re-read. `spawn()` still throws at capacity and *never* calls `reserve()` for you — growth is opt-in, by design.
+
+```js
+// Between frames — never inside a system's hot loop:
+if (arena.activeCount === arena.capacity && needMore) {
+    arena.reserve(arena.capacity * 2);   // cold, one-time reallocation
+}
+// Re-hoist AFTER reserving; the old Pos.data.x now points at freed memory:
+const x = Pos.data.x;
+```
 
 **How big should `maxEntities` be?**
 At a typical 4-component schema (position, velocity, sprite, lifetime) using `Float32Array` everywhere, **10,000 entities cost about 200 KB of RAM**. 100,000 entities cost 2 MB. Pick generously — it's much cheaper than you think.

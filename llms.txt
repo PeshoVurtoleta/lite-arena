@@ -58,6 +58,12 @@ for (let i = 0; i < n; i++) {
   x[i] += vx[i] * dt;
   y[i] += vy[i] * dt;
 }
+
+// Capacity growth (cold, between-frames, EXPLICIT only):
+arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
+// spawn() at capacity THROWS -- it never auto-grows. Call reserve() yourself
+// between frames. It reallocates every backing array, so any ref you hoisted
+// (const x = Pos.data.x) is STALE afterward -- re-read Pos.data.x post-reserve.
 ```
 
 ## Key invariants
@@ -78,6 +84,11 @@ for (let i = 0; i < n; i++) {
   smaller-count set); it allocates nothing and is called once per system, cold.
   It is a planner, not an iterator -- there is deliberately no `query()` or
   `forEach()`. Consume the result before the next `join()` on the same arena.
+- The arena NEVER auto-grows. `spawn()` at capacity throws; growth happens only
+  through an explicit, between-frames `reserve(newCap)`. `reserve()` reallocates
+  every backing buffer (copying live contents; all handles/memberships/dense
+  indices preserved), so hoisted refs like `const x = comp.data.x` are stale
+  after it returns -- re-read them. Grow-only: `newCap <= capacity` is a no-op.
 
 ## Files
 
@@ -86,9 +97,9 @@ for (let i = 0; i < n; i++) {
 - [./Arena.js](./Arena.js): The implementation (~190 lines, MIT, ESM).
 - [./Arena.d.ts](./Arena.d.ts): TypeScript definitions, fully typed including
   `ComponentData<T>` generic for typed `data` field access.
-- [test/Arena.test.js](test/Arena.test.js): 52 node:test cases including a
-  randomized churn oracle, tag/join stress, and a zero-allocation guarantee
-  under `--expose-gc`.
+- [test/Arena.test.js](test/Arena.test.js): 61 node:test cases including a
+  randomized churn oracle, tag/join stress, a reserve() growth oracle, and a
+  zero-allocation guarantee under `--expose-gc`.
 - [bench/bench.js](bench/bench.js): Benchmark harness comparing against
   `Map<id, object>`, `Array<Object>`, and a no-ECS manual SoA.
 - [example/demo.html](example/demo.html): 50,000-particle gravity-well demo,

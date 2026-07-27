@@ -650,6 +650,167 @@ test('Arena: non-goals > no query() / forEach() / each() iteration API exists', 
 });
 
 // -----------------------------------------------------------------
+// Arena: reserve -- explicit, opt-in capacity growth (1.4.0)
+// -----------------------------------------------------------------
+
+test('Arena: reserve > no-op returning false when newCapacity <= capacity', () => {
+    const arena = new Arena(8);
+    assert.equal(arena.reserve(8), false);   // equal -> no-op
+    assert.equal(arena.reserve(4), false);   // smaller -> no-op
+    assert.equal(arena.reserve(0), false);
+    assert.equal(arena.capacity, 8);         // untouched
+});
+
+test('Arena: reserve > grows and returns true when newCapacity > capacity', () => {
+    const arena = new Arena(8);
+    assert.equal(arena.reserve(16), true);
+    assert.equal(arena.capacity, 16);
+});
+
+test('Arena: reserve > rejects non-integers and values above 1048575', () => {
+    const arena = new Arena(8);
+    assert.throws(() => arena.reserve(16.5), /reserve capacity/);
+    assert.throws(() => arena.reserve(NaN), /reserve capacity/);
+    assert.throws(() => arena.reserve(1048576), /reserve capacity/);
+    assert.equal(arena.capacity, 8); // failed reserves leave capacity intact
+});
+
+test('Arena: reserve > preserves every live entity, membership, and data value (oracle)', () => {
+    const arena = new Arena(8);
+    const pos = arena.registerComponent({ x: Float32Array, y: Float64Array });
+    const vel = arena.registerComponent({ vx: Int32Array });
+    const tag = arena.registerTag();
+
+    // Build a known population; despawn one to leave a hole in the free list.
+    const handles = [];
+    for (let i = 0; i < 8; i++) handles.push(arena.spawn());
+    arena.despawn(handles[3]);           // create a gap
+    const live = handles.filter((_, i) => i !== 3);
+
+    // Oracle of expected state, captured BEFORE the grow.
+    const oracle = new Map(); // handle -> {x,y,vx,hasVel,hasTag}
+    for (let i = 0; i < live.length; i++) {
+        const e = live[i];
+        pos.add(e);
+        pos.data.x[pos.idx(e)] = i * 1.5;
+        pos.data.y[pos.idx(e)] = -i * 100;
+        const hasVel = (i % 2) === 0;
+        const hasTag = (i % 3) === 0;
+        if (hasVel) { vel.add(e); vel.data.vx[vel.idx(e)] = 1000 + i; }
+        if (hasTag) tag.add(e);
+        oracle.set(e, { x: i * 1.5, y: -i * 100, vx: 1000 + i, hasVel, hasTag });
+    }
+    const activeBefore = arena.activeCount;
+    const posCountBefore = pos.count;
+
+    assert.equal(arena.reserve(64), true);
+
+    // Nothing about the live population changed.
+    assert.equal(arena.capacity, 64);
+    assert.equal(arena.activeCount, activeBefore);
+    assert.equal(pos.count, posCountBefore);
+    for (const [e, exp] of oracle) {
+        assert.equal(arena.isAlive(e), true, 'handle survives grow');
+        assert.equal(pos.has(e), true);
+        assert.equal(pos.data.x[pos.idx(e)], exp.x, 'x preserved');
+        assert.equal(pos.data.y[pos.idx(e)], exp.y, 'y (Float64) preserved');
+        assert.equal(vel.has(e), exp.hasVel);
+        if (exp.hasVel) assert.equal(vel.data.vx[vel.idx(e)], exp.vx, 'vx preserved');
+        assert.equal(tag.has(e), exp.hasTag);
+    }
+    // The despawned handle stays dead across the grow.
+    assert.equal(arena.isAlive(handles[3]), false);
+});
+
+test('Arena: reserve > spawn() at full capacity throws and does NOT auto-grow', () => {
+    const arena = new Arena(4);
+    for (let i = 0; i < 4; i++) arena.spawn();
+    assert.equal(arena.activeCount, 4);
+    // The whole point: spawn never calls reserve() for you.
+    assert.throws(() => arena.spawn(), /out of memory/);
+    assert.equal(arena.capacity, 4, 'a failed spawn must not have grown the arena');
+    assert.equal(arena.activeCount, 4);
+});
+
+test('Arena: reserve > enables spawning beyond the old capacity into fresh slots', () => {
+    const arena = new Arena(4);
+    const pos = arena.registerComponent({ x: Float32Array });
+    const first = [];
+    for (let i = 0; i < 4; i++) { const e = arena.spawn(); pos.add(e); first.push(e); }
+    assert.throws(() => arena.spawn(), /out of memory/);
+
+    assert.equal(arena.reserve(8), true);
+
+    // Four more spawns now succeed and are distinct, live, and addressable.
+    const seen = new Set(first);
+    for (let i = 0; i < 4; i++) {
+        const e = arena.spawn();
+        assert.equal(seen.has(e), false, 'new handle is distinct from all prior');
+        seen.add(e);
+        assert.equal(arena.isAlive(e), true);
+        assert.equal(pos.add(e) >= 0, true);
+    }
+    assert.equal(arena.activeCount, 8);
+    assert.throws(() => arena.spawn(), /out of memory/); // full again at the new cap
+});
+
+test('Arena: reserve > free-list stays intact: despawn/respawn work after a grow', () => {
+    const arena = new Arena(4);
+    const a = arena.spawn(), b = arena.spawn();
+    assert.equal(arena.reserve(16), true);
+    // A pre-grow slot returned to the free list is still reusable post-grow.
+    arena.despawn(a);
+    const reused = arena.spawn();
+    assert.equal(arena.isAlive(reused), true);
+    assert.equal(arena.isAlive(a), false, 'the old (despawned) handle stays stale');
+    assert.equal(arena.isAlive(b), true);
+    assert.equal(arena.retiredCount, 0, 'reserve does not retire slots');
+});
+
+test('Arena: reserve > swaps in fresh backing buffers (hoisted refs are stale by design)', () => {
+    const arena = new Arena(4);
+    const pos = arena.registerComponent({ x: Float32Array });
+    const e = arena.spawn();
+    pos.add(e);
+    pos.data.x[pos.idx(e)] = 42;
+
+    const staleX = pos.data.x;       // the classic hoist
+    const staleDense = pos.dense;
+    assert.equal(arena.reserve(32), true);
+
+    // Post-grow the arena points at NEW buffers; the old ones are discarded.
+    assert.notEqual(pos.data.x, staleX, 'data.x buffer was replaced');
+    assert.notEqual(pos.dense, staleDense, 'dense buffer was replaced');
+    assert.equal(pos.data.x.length, 32, 'new buffer is the grown length');
+    // The value was copied forward into the new buffer.
+    assert.equal(pos.data.x[pos.idx(e)], 42);
+    // The stale reference still holds the OLD (shorter) buffer -- reading it
+    // would silently use pre-grow memory. This is the documented footgun.
+    assert.equal(staleX.length, 4);
+});
+
+test('Arena: reserve > preserves packed dense order after prior swap-and-pop churn', () => {
+    const arena = new Arena(8);
+    const c = arena.registerComponent({ v: Uint32Array });
+    const handles = [];
+    for (let i = 0; i < 8; i++) { const e = arena.spawn(); c.add(e); c.data.v[c.idx(e)] = i; handles.push(e); }
+    // Remove a couple from the middle to exercise swap-and-pop before growing.
+    c.remove(handles[2]);
+    c.remove(handles[5]);
+    const expected = new Map();
+    for (let i = 0; i < c.count; i++) expected.set(c.dense[i], c.data.v[i]);
+
+    assert.equal(arena.reserve(64), true);
+
+    assert.equal(c.count, expected.size);
+    // dense[0..count) still lists exactly the surviving members with their data.
+    for (let i = 0; i < c.count; i++) {
+        assert.equal(expected.has(c.dense[i]), true);
+        assert.equal(c.data.v[i], expected.get(c.dense[i]));
+    }
+});
+
+// -----------------------------------------------------------------
 // Arena: randomized churn (1000 ops) — pure correctness under churn
 // -----------------------------------------------------------------
 

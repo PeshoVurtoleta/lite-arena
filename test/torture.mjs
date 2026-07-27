@@ -26,6 +26,13 @@
  *     so a tight loop over it must show zero major GC under the same rules. If
  *     join() ever regressed to allocating per call, this window would light up.
  *
+ *   Phase D (reserve, then hot) -- fill to capacity, call arena.reserve() to
+ *     grow the universe BETWEEN frames (a cold op that itself allocates new
+ *     backing buffers -- that is fine), then spawn into the grown region and run
+ *     the same hot tick. reserve() must leave the arena in a state where the hot
+ *     path still allocates nothing: the measured window opens AFTER the grow, so
+ *     a pass proves growth is a one-time cold cost and never leaks into the loop.
+ *
  * A pass means something only if the gate can fail. Run
  *
  *     ARENA_TORTURE_LEAK=1 node --expose-gc test/torture.mjs
@@ -223,6 +230,67 @@ async function phaseC() {
     return { report: checkNoGc(summary, RULES), summary };
 }
 
+// --- Phase D: reserve is cold, the tick after it is still zero-major ----------
+
+async function phaseD() {
+    // Start at HALF the working capacity so reserve() has room to double.
+    const startCap = CAP >> 1;
+    const arena = new Arena(startCap);
+    const pos = arena.registerComponent({
+        x: Float32Array, y: Float32Array,
+        vx: Float32Array, vy: Float32Array,
+    });
+
+    // Fill to the OLD capacity, then grow explicitly BETWEEN "frames". reserve()
+    // reallocates every backing buffer -- a legitimate cold-path allocation.
+    for (let i = 0; i < startCap; i++) pos.add(arena.spawn());
+    if (!arena.reserve(CAP)) die('reserve failed to grow the arena');
+    if (arena.capacity !== CAP) die('reserve left capacity=' + arena.capacity);
+    if (pos.count !== startCap) die('reserve changed component count');
+
+    // Spawn into the freshly reserved slots so the hot tick exercises the grown
+    // region, not just the copied prefix.
+    for (let i = 0; i < CAP - startCap; i++) pos.add(arena.spawn());
+    const count = pos.count; // === CAP
+
+    // Re-hoist AFTER reserve: the pre-grow refs are stale by design.
+    const X = pos.data.x, Y = pos.data.y, VX = pos.data.vx, VY = pos.data.vy;
+    for (let i = 0; i < count; i++) {
+        X[i] = i * 0.5; Y[i] = -i; VX[i] = 1.0; VY[i] = 0.25;
+    }
+
+    const ticks = Math.ceil(HOT_OPS_MIN / count);
+
+    // Clear the reserve()/spawn garbage BEFORE opening the window, so freeing it
+    // inside the window cannot be misread as the hot tick allocating.
+    globalThis.gc();
+    globalThis.gc();
+
+    const gc = new GcProfiler(256, { heap: true }).start();
+    gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
+
+    // HOT PATH over the grown arrays -- identical shape to Phase B.
+    let acc = 0;
+    for (let t = 0; t < ticks; t++) {
+        for (let i = 0; i < count; i++) {
+            X[i] = X[i] + VX[i];
+            Y[i] = Y[i] + VY[i];
+            acc = acc + X[i] - Y[i];
+        }
+    }
+
+    const mu = process.memoryUsage();
+    gc.sampleHeap(performance.now(), mu.heapUsed, mu);
+
+    await gc.settle();
+    const summary = gc.summary();
+    gc.stop();
+
+    if (!Number.isFinite(acc)) die('post-reserve hot tick produced a non-finite accumulator');
+
+    return { report: checkNoGc(summary, RULES), summary };
+}
+
 // --- gate --------------------------------------------------------------------
 
 async function main() {
@@ -233,12 +301,14 @@ async function main() {
     const a = phaseA();
     const b = await phaseB();
     const c = await phaseC();
+    const d = await phaseD();
 
     const retentionOk = a.activeCount === 0 && a.trackerSize === 0;
     const budgetOk = b.report.ok;
     const joinOk = c.report.ok;
+    const reserveOk = d.report.ok;
 
-    if (retentionOk && budgetOk && joinOk) {
+    if (retentionOk && budgetOk && joinOk && reserveOk) {
         process.stdout.write('ok\n');
         process.exit(0);
     }
@@ -262,6 +332,14 @@ async function main() {
         process.stderr.write(
             'torture: join -- verdict=' + c.report.verdict +
             ' source=' + c.summary.source +
+            ' major=' + g.major + ' maxMs=' + g.maxMs.toFixed(3) +
+            ' (rules ' + JSON.stringify(RULES) + ')\n');
+    }
+    if (!reserveOk) {
+        const g = d.summary.gc;
+        process.stderr.write(
+            'torture: reserve -- verdict=' + d.report.verdict +
+            ' source=' + d.summary.source +
             ' major=' + g.major + ' maxMs=' + g.maxMs.toFixed(3) +
             ' (rules ' + JSON.stringify(RULES) + ')\n');
     }

@@ -1,6 +1,6 @@
 {
   "name": "@zakkster/lite-arena",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Zero-GC Entity-Component-System (ECS) memory allocator. Generational handles, SoA sparse sets, swap-and-pop. ~190 lines, no dependencies.",
   "type": "module",
   "main": "./Arena.js",
