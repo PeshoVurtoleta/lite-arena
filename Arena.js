@@ -25,6 +25,69 @@
 const INDEX_MASK = 0xFFFFF; // 20 bits -> Max 1,048,575 entities
 const GEN_MASK = 0xFFF;     // 12 bits -> 4096 generations
 
+// The nine numeric TypedArray constructors -- the ONLY legal component field
+// types. Building a Set once, at module load, so schema validation is a cold
+// O(keys) membership test with no per-registration allocation. BigInt64Array /
+// BigUint64Array are deliberately excluded: component data is numeric SoA read
+// and written as Number, and a BigInt view throws on a Number store.
+const TYPED_ARRAY_CTORS = new Set([
+    Int8Array, Uint8Array, Uint8ClampedArray,
+    Int16Array, Uint16Array,
+    Int32Array, Uint32Array,
+    Float32Array, Float64Array,
+]);
+
+// Human-readable description of a rejected schema value, for the thrown message.
+function describeSchemaValue(v) {
+    if (v === null) return 'null';
+    if (typeof v === 'function') return v.name || 'an anonymous function';
+    return typeof v; // 'string', 'number', 'object', 'undefined', 'symbol', ...
+}
+
+/**
+ * Validate a component schema at registration (a COLD path -- runs once per
+ * component at startup, so cost is irrelevant). Fail closed: a schema that lies
+ * about its field types is rejected here rather than silently producing a
+ * polymorphic Array or a boxed Number that quietly voids the zero-GC guarantee.
+ *
+ * @param {Object<string, Function>} schema
+ * @throws {Error} A library error naming the offending key / what was passed.
+ */
+function validateSchema(schema) {
+    if (schema === null || typeof schema !== 'object') {
+        throw new Error(
+            `lite-arena: component schema must be an object, got ${describeSchemaValue(schema)}`);
+    }
+    // A `__proto__` entry in a schema literal sets the object's PROTOTYPE and
+    // silently drops the field (Object.keys never sees it). Detect that footgun
+    // and throw, instead of handing back a component missing a field. A plain
+    // `{}` has Object.prototype; Object.create(null) schemas are allowed too.
+    const proto = Object.getPrototypeOf(schema);
+    if (proto !== Object.prototype && proto !== null) {
+        throw new Error(
+            'lite-arena: component schema has a non-default prototype -- a `__proto__` ' +
+            'key in the schema literal sets the prototype and silently drops that field; ' +
+            'use a plain string key instead');
+    }
+    // Component field names are strings. Symbol keys are never iterated into
+    // `data`, so reject them loudly rather than dropping them.
+    if (Object.getOwnPropertySymbols(schema).length > 0) {
+        throw new Error('lite-arena: component schema keys must be strings; symbol keys are not allowed');
+    }
+    const keys = Object.keys(schema); // own, enumerable, string-keyed only
+    for (let i = 0; i < keys.length; i++) {
+        const key = keys[i];
+        const ctor = schema[key];
+        if (!TYPED_ARRAY_CTORS.has(ctor)) {
+            throw new Error(
+                `lite-arena: component field "${key}" must be one of the 9 numeric TypedArray ` +
+                'constructors (Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array, ' +
+                `Int32Array, Uint32Array, Float32Array, Float64Array), got ${describeSchemaValue(ctor)}`);
+        }
+    }
+    // An empty schema is intentionally legal: registerTag() is registerComponent({}).
+}
+
 export class Arena {
     /**
      * Allocates the memory pools for the ECS universe. Call once at setup.
@@ -292,6 +355,22 @@ export class SparseSet {
      * @param {Arena} arena
      */
     constructor(maxEntities, schema, arena) {
+        // AR-10: a SparseSet whose capacity does not match its arena's is a trap
+        // -- writes past `sparse.length` are silently discarded and `despawn`
+        // never cleans an unregistered set. Fail closed: require a real arena and
+        // an exactly-matching capacity. `arena.registerComponent()` always passes
+        // `arena.capacity`, so this only ever fires on hand-rolled construction.
+        if (!(arena instanceof Arena)) {
+            throw new Error('lite-arena: SparseSet requires the owning Arena; use arena.registerComponent(schema)');
+        }
+        if (maxEntities !== arena.capacity) {
+            throw new Error(
+                `lite-arena: SparseSet capacity (${maxEntities}) must equal the arena capacity ` +
+                `(${arena.capacity}); use arena.registerComponent(schema)`);
+        }
+        // AR-03 / AR-04: reject a lying schema before allocating anything.
+        validateSchema(schema);
+
         this.arena = arena;
         this.count = 0 | 0;
 
@@ -309,9 +388,16 @@ export class SparseSet {
         // false for gen >= 2048, corrupting has/add/remove and the despawn cascade.
         this.dense = new Int32Array(maxEntities);
 
+        // AR-04: null-prototype bag. A schema key of `toString` / `constructor`
+        // now lands in a clean own slot instead of colliding with an inherited
+        // Object.prototype member, and the `for...in` in remove() walks a shorter
+        // chain. `data` is built only from own, enumerable, string keys, already
+        // validated by validateSchema() above.
         /** @type {Object<string, ArrayBufferView>} Parallel SoA payload arrays. */
-        this.data = {};
-        for (const key in schema) {
+        this.data = Object.create(null);
+        const keys = Object.keys(schema);
+        for (let i = 0; i < keys.length; i++) {
+            const key = keys[i];
             const TypedArrayConstructor = schema[key];
             this.data[key] = new TypedArrayConstructor(maxEntities);
         }

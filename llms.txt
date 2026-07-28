@@ -38,7 +38,7 @@ Pos.remove(e): boolean;    // O(1) swap-and-pop
 Pos.idx(e): number;        // UNSAFE fast-path — no checks; use only after has()
 
 // Tag components (zero-size membership markers):
-const Frozen = arena.registerTag();     // SparseSet with data === {}
+const Frozen = arena.registerTag();     // SparseSet, empty null-proto data
 Frozen.add(e); Frozen.has(e); Frozen.remove(e);   // dense/count as usual
 
 // Two-component join (rarest-first). Cold planner; caller writes the loop.
@@ -79,7 +79,20 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
   it stays `0` on realistic workloads. See decisions/0001-generational-rollover.md.
 - `idx()` skips validation; only call inside loops where validity is guaranteed.
 - `despawn()` automatically removes the entity from every registered component.
-- `registerTag()` is `registerComponent({})`: membership only, `data === {}`.
+- `registerComponent(schema)` validates the schema at registration (a cold path):
+  every field type must be one of the nine numeric TypedArray constructors
+  (Int8/Uint8/Uint8Clamped/Int16/Uint16/Int32/Uint32/Float32/Float64Array), or
+  it throws a library error naming the key. `Array`, `Object`, `SharedArrayBuffer`,
+  `BigInt64Array`, a string, `null`, etc. are all rejected -- a schema that lies
+  about its types never silently produces a polymorphic Array or a boxed Number.
+- `comp.data` is an `Object.create(null)` bag, not a plain `{}`: it has the
+  schema's keys and NO prototype, so `toString` / `constructor` are usable field
+  names and a `__proto__` schema key fails closed instead of dropping a field.
+- `registerTag()` is `registerComponent({})`: membership only; `data` is an empty
+  null-prototype object (`Object.keys(data).length === 0`).
+- `SparseSet` is exported, but constructing one directly requires the owning
+  `Arena` and a capacity equal to `arena.capacity`; a mismatch throws. Prefer
+  `arena.registerComponent(schema)`, which always constructs it correctly.
 - `join(a, b)` returns a REUSED scratch `{driver, other, count}` (driver = the
   smaller-count set); it allocates nothing and is called once per system, cold.
   It is a planner, not an iterator -- there is deliberately no `query()` or

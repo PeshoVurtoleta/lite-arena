@@ -324,7 +324,7 @@ Throws if `maxEntities` is out of range or non-integer.
 | `isAlive(e)` | `boolean` | O(1). Safe on any 32-bit integer; never throws. |
 | `despawn(e)` | `boolean` | O(1). Removes from every component; returns false if already dead. |
 | `registerComponent(schema)` | `SparseSet` | Mounts a new SoA component. Schema: `{ key: TypedArrayConstructor }`. |
-| `registerTag()` | `SparseSet` | Zero-size tag component (membership only). `registerComponent({})` with intent. `data === {}`. |
+| `registerTag()` | `SparseSet` | Zero-size tag component (membership only). `registerComponent({})` with intent. `data` is an empty null-prototype object. |
 | `join(a, b)` | `{ driver, other, count }` | Cold-path join planner. Returns a **reused** scratch with the smaller-count set as `driver`; allocates nothing. Not an iterator — you write the loop. |
 | `reserve(newCap)` | `boolean` | **Explicit, between-frames capacity growth** — the only way the arena grows. Reallocates every backing buffer (all handles/data preserved); `false` no-op if `newCap <= capacity`. Invalidates hoisted refs — re-read `data.x` after. |
 

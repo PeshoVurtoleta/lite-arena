@@ -296,6 +296,119 @@ test('Arena: component registration > starts with count=0', () => {
 });
 
 // -----------------------------------------------------------------
+// Arena: schema validation & data hardening (1.5.0)
+//   AR-03: a schema that lies about its field types is rejected.
+//   AR-04: `data` is a null-prototype bag; __proto__ / symbol keys fail closed.
+//   AR-10: a SparseSet whose capacity != its arena's is rejected.
+// -----------------------------------------------------------------
+
+test('Arena: schema validation > accepts all nine numeric TypedArray constructors', () => {
+    const arena = new Arena(8);
+    // Each of the nine, one at a time, must register without throwing.
+    const nine = [
+        Int8Array, Uint8Array, Uint8ClampedArray,
+        Int16Array, Uint16Array,
+        Int32Array, Uint32Array,
+        Float32Array, Float64Array,
+    ];
+    for (const Ctor of nine) {
+        const c = arena.registerComponent({ v: Ctor });
+        assert.ok(c.data.v instanceof Ctor);
+        assert.equal(c.data.v.length, arena.capacity);
+    }
+});
+
+test('Arena: schema validation > rejects non-TypedArray field types with a library error naming the key', () => {
+    const arena = new Arena(8);
+    const bad = [
+        ['arr', Array],
+        ['obj', Object],
+        ['fn', Function],
+        ['sab', SharedArrayBuffer],
+        ['str', 'Float32Array'],   // a string, not the constructor
+        ['nul', null],
+        ['undef', undefined],
+        ['plain', { nested: Float32Array }],
+        ['bigi', BigInt64Array],   // a TypedArray, but not numeric -> rejected
+        ['bigu', BigUint64Array],
+    ];
+    for (const [key, value] of bad) {
+        assert.throws(
+            () => arena.registerComponent({ [key]: value }),
+            (err) => err instanceof Error &&
+                     /lite-arena:/.test(err.message) &&
+                     err.message.includes(`"${key}"`),
+            `expected a library error naming "${key}" for value ${String(value)}`,
+        );
+    }
+});
+
+test('Arena: schema validation > empty schema and registerTag() remain legal', () => {
+    const arena = new Arena(8);
+    assert.doesNotThrow(() => arena.registerComponent({}));
+    assert.doesNotThrow(() => arena.registerTag());
+    const tag = arena.registerTag();
+    assert.equal(Object.keys(tag.data).length, 0);
+});
+
+test('Arena: schema validation > a __proto__ schema key throws instead of silently losing the field', () => {
+    const arena = new Arena(8);
+    // `{ __proto__: Float32Array }` sets the literal's PROTOTYPE (to a function),
+    // leaving zero own keys -- the pre-1.5.0 silent field loss. It must now throw.
+    assert.throws(
+        () => arena.registerComponent({ __proto__: Float32Array }),
+        /lite-arena:.*prototype/,
+    );
+});
+
+test('Arena: schema validation > toString / constructor keys land in clean own slots (null-proto data)', () => {
+    const arena = new Arena(8);
+    // These names collide with Object.prototype members on a plain `{}` bag.
+    // On a null-proto bag they are ordinary component fields.
+    const c = arena.registerComponent({ toString: Float32Array, constructor: Int32Array });
+    assert.ok(c.data.toString instanceof Float32Array);
+    assert.ok(c.data.constructor instanceof Int32Array);
+    assert.equal(Object.keys(c.data).length, 2);
+    const e = arena.spawn();
+    const i = c.add(e);
+    c.data.toString[i] = 1.5;
+    c.data.constructor[i] = 7;
+    assert.equal(c.data.toString[i], 1.5);
+    assert.equal(c.data.constructor[i], 7);
+});
+
+test('Arena: schema validation > a symbol schema key throws', () => {
+    const arena = new Arena(8);
+    assert.throws(
+        () => arena.registerComponent({ [Symbol('x')]: Float32Array }),
+        /lite-arena:.*symbol/,
+    );
+});
+
+test('Arena: data hardening > registered component data has a null prototype', () => {
+    const arena = new Arena(8);
+    const c = arena.registerComponent({ x: Float32Array, y: Float32Array });
+    assert.equal(Object.getPrototypeOf(c.data), null);
+});
+
+test('Arena: data hardening > SparseSet rejects a capacity that does not match its arena (AR-10)', () => {
+    const arena = new Arena(4);
+    // Mismatched capacity: the exact trap from the roadmap -- writes past
+    // sparse.length would be silently discarded and despawn would never clean it.
+    assert.throws(
+        () => new SparseSet(2, { x: Float32Array }, arena),
+        /lite-arena:.*capacity/,
+    );
+    // A missing / non-Arena owner is also rejected (fail closed).
+    assert.throws(
+        () => new SparseSet(4, { x: Float32Array }, null),
+        /lite-arena:.*Arena/,
+    );
+    // A matching capacity with a real arena is fine.
+    assert.doesNotThrow(() => new SparseSet(4, { x: Float32Array }, arena));
+});
+
+// -----------------------------------------------------------------
 // SparseSet: add / has / remove
 // -----------------------------------------------------------------
 
@@ -514,11 +627,14 @@ test('SparseSet: iteration > idx() matches has() for valid entities', () => {
 // Arena: registerTag -- zero-size membership components (1.3.0)
 // -----------------------------------------------------------------
 
-test('Arena: registerTag > data is an empty object with no keys', () => {
+test('Arena: registerTag > data is an empty null-prototype object with no keys', () => {
     const arena = new Arena(8);
     const tag = arena.registerTag();
-    assert.deepEqual(tag.data, {});
     assert.equal(Object.keys(tag.data).length, 0);
+    // AR-04: `data` is an Object.create(null) bag, not a plain `{}`. A tag's
+    // data has no own keys and, deliberately, no prototype -- so `data.toString`
+    // etc. are undefined rather than inherited Object.prototype members.
+    assert.equal(Object.getPrototypeOf(tag.data), null);
 });
 
 test('Arena: registerTag > add / has / remove / count / dense all work', () => {

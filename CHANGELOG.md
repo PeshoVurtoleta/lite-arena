@@ -5,6 +5,60 @@ All notable changes to `@zakkster/lite-arena` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-07-28
+
+Schema validation and data hardening. A schema that lies about its field types
+is now rejected at registration instead of silently voiding the zero-GC
+guarantee. All validation is on the cold registration path; the hot loop is
+untouched.
+
+### Added
+
+- **Schema validation in `registerComponent()` / `SparseSet`** (AR-03). Every
+  field type must be one of the nine numeric TypedArray constructors
+  (`Int8Array`, `Uint8Array`, `Uint8ClampedArray`, `Int16Array`, `Uint16Array`,
+  `Int32Array`, `Uint32Array`, `Float32Array`, `Float64Array`). Anything else --
+  `Array` (which used to produce a polymorphic, GC-visible sparse array),
+  `Object` (a boxed `Number` that swallowed writes), `Function`,
+  `SharedArrayBuffer`, `BigInt64Array` / `BigUint64Array` (numeric SoA is stored
+  as `Number`, which a BigInt view rejects), a string, `null`, `undefined`, or a
+  plain object -- throws a library error naming the offending key and describing
+  what was passed. Runs once per component at startup; zero hot-path cost.
+- **Owner + capacity validation on direct `SparseSet` construction** (AR-10).
+  The constructor now requires an `Arena` owner and `maxEntities ===
+  arena.capacity`; a mismatch throws instead of silently discarding out-of-range
+  writes and leaking an unregistered (never-despawn-cleaned) set.
+- Eight tests covering the nine accepted types, ten rejected types, the empty
+  schema / `registerTag()` allowance, `__proto__` / symbol keys, `toString` /
+  `constructor` field names, the null prototype, and rogue `SparseSet`
+  construction. See
+  [`decisions/0003-schema-validation.md`](decisions/0003-schema-validation.md).
+
+### Changed
+
+- **`comp.data` is now an `Object.create(null)` bag, not a plain `{}`** (AR-04).
+  Consequences: `toString` / `constructor` are usable component field names
+  (previously they collided with inherited `Object.prototype` members); a
+  `__proto__` key in a schema literal now throws (previously it set the
+  prototype and silently produced a component missing that field); symbol keys
+  throw. Migration: code that read `data === {}` as literally-a-plain-object, or
+  relied on `data.hasOwnProperty` / inherited `data.toString`, must adjust --
+  `data` has no prototype. The docs' "`data === {}`" wording is corrected to "an
+  empty null-prototype object" for tags.
+- `Arena.d.ts`: `registerComponent` and the `SparseSet` constructor document the
+  new `@throws`; `registerTag`'s `data === {}` note corrected.
+
+### Notes
+
+- Hot paths unchanged. `remove()`'s body is byte-for-byte identical; it iterates
+  `data` with `for...in`, and `data`'s new null prototype only shortens that
+  chain. Measured: ~36 ns/op (best) removing over a three-field component on a
+  100k-entity arena. Phases A-E of the torture gate remain green at
+  `maxMajor: 0`.
+- AR-11 (a `checked: true` mode making `idx()` on an unattached entity throw) was
+  considered and DEFERRED: any form of it adds a branch to the `idx()` fast path
+  even when off. Recorded in decision 0003 as a separate future decision.
+
 ## [1.4.1] - 2026-07-28
 
 A silent-corruption fix. Every `SparseSet` operation broke once a slot reached

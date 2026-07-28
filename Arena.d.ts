@@ -113,11 +113,20 @@ export class Arena {
      * Mounts a new SoA component definition to the arena.
      * Each schema key becomes a parallel TypedArray of length `capacity`.
      *
+     * The schema is validated at registration (a cold path): every field type
+     * must be one of the nine numeric TypedArray constructors. A lying schema
+     * (`Array`, `Object`, `SharedArrayBuffer`, `BigInt64Array`, a string, etc.)
+     * throws a library error naming the offending key. `data` is built as an
+     * `Object.create(null)` bag, so `toString` / `constructor` are usable field
+     * names and a `__proto__` key throws instead of silently dropping a field.
+     *
      * @example
      *   const Transform = arena.registerComponent({
      *       x: Float32Array,
      *       y: Float32Array,
      *   });
+     * @throws {Error} If any field type is not a numeric TypedArray constructor,
+     *   or the schema carries a `__proto__` / symbol key.
      */
     registerComponent<T extends Record<string, TypedArrayConstructor>>(
         schema: T
@@ -125,8 +134,9 @@ export class Arena {
 
     /**
      * Registers a zero-size TAG component: membership tracking with no payload.
-     * Equivalent to `registerComponent({})`; the returned set has `data === {}`.
-     * Use `add`/`has`/`remove` and iterate `dense[0..count)`.
+     * Equivalent to `registerComponent({})`; the returned set's `data` is an
+     * empty null-prototype object. Use `add`/`has`/`remove` and iterate
+     * `dense[0..count)`.
      */
     registerTag(): SparseSet<{}>;
 
@@ -187,6 +197,14 @@ export class SparseSet<T extends Record<string, TypedArrayConstructor>> {
     /**
      * Prefer `arena.registerComponent(schema)` — the arena version registers
      * this set for automatic cleanup on entity despawn.
+     *
+     * Direct construction is validated: `arena` must be an `Arena` and
+     * `maxEntities` must equal `arena.capacity`, or the constructor throws. A
+     * mismatched-capacity set would silently discard out-of-range writes and,
+     * being unregistered, would never be cleaned on despawn.
+     *
+     * @throws {Error} If `arena` is not an `Arena`, `maxEntities !== arena.capacity`,
+     *   or the schema is invalid (see {@link Arena.registerComponent}).
      */
     constructor(maxEntities: number, schema: T, arena: Arena);
 
