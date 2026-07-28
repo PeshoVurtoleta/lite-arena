@@ -1322,3 +1322,195 @@ test('Arena: checked mode > production hot path untouched: prototype idx() vs ow
     assert.equal(Object.prototype.hasOwnProperty.call(checkedSet, 'idx'), true);
     assert.notEqual(checkedSet.idx, SparseSet.prototype.idx);
 });
+
+// -----------------------------------------------------------------
+// Arena: caller-supplied component payload buffers (1.7.0 / S5)
+//
+// registerComponent(schema, { buffers }) lets each data.* field VIEW a buffer
+// the caller owns (ArrayBuffer or SharedArrayBuffer) instead of one the arena
+// allocates -- so a component's payload can live in memory shared with a Worker.
+// The read path (count/dense) is NOT shared yet; the worker cannot iterate. See
+// decisions/0006 and the cross-thread smoke test in test/cross-thread.test.js.
+//
+// Fail-before/pass-after note: on 1.6.1 the second argument was ignored, so the
+// "independent view sees the write" test below would fail (data.x would be a
+// private own buffer the independent view never sees). It passes only because
+// registerComponent now views the supplied buffer.
+// -----------------------------------------------------------------
+
+// A correctly-sized ArrayBuffer for `capacity` elements of a typed-array ctor.
+function bufFor(Ctor, capacity) {
+    return new ArrayBuffer(capacity * Ctor.BYTES_PER_ELEMENT);
+}
+
+test('Arena: caller buffers > no options is byte-identical own-allocation (no _callerBacked own prop)', () => {
+    const arena = new Arena(4);
+    const c = arena.registerComponent({ x: Float32Array });
+    // The production default keeps the exact 1.6.1 instance shape: no own flag.
+    assert.equal(Object.prototype.hasOwnProperty.call(c, '_callerBacked'), false);
+    assert.equal(c._callerBacked, undefined);
+    // And an empty options object (no buffers key) is still own-allocation.
+    const c2 = arena.registerComponent({ y: Float32Array }, {});
+    assert.equal(Object.prototype.hasOwnProperty.call(c2, '_callerBacked'), false);
+});
+
+test('Arena: caller buffers > a supplied ArrayBuffer is genuinely the backing store (independent view)', () => {
+    const CAP = 4;
+    const arena = new Arena(CAP);
+    const buf = bufFor(Float32Array, CAP);
+    const pos = arena.registerComponent({ x: Float32Array }, { buffers: { x: buf } });
+
+    assert.equal(Object.prototype.hasOwnProperty.call(pos, '_callerBacked'), true);
+    assert.equal(pos._callerBacked, true);
+    // The component's view must be over the SAME ArrayBuffer the caller passed.
+    assert.equal(pos.data.x.buffer, buf);
+
+    const e = arena.spawn();
+    const i = pos.add(e);
+    pos.data.x[i] = 42.5;
+
+    // An INDEPENDENT view over the same buffer sees the write -- proof the arena
+    // did not quietly own-allocate a private array.
+    const independent = new Float32Array(buf);
+    assert.equal(independent[i], 42.5);
+
+    // And a write through the independent view is visible to the component.
+    independent[i] = -7.25;
+    assert.equal(pos.data.x[i], -7.25);
+});
+
+test('Arena: caller buffers > accepts a SharedArrayBuffer and round-trips a value (single thread)', () => {
+    const CAP = 4;
+    const arena = new Arena(CAP);
+    const sab = new SharedArrayBuffer(CAP * Float32Array.BYTES_PER_ELEMENT);
+    const pos = arena.registerComponent({ x: Float32Array }, { buffers: { x: sab } });
+    assert.ok(pos.data.x.buffer instanceof SharedArrayBuffer);
+
+    const e = arena.spawn();
+    const i = pos.add(e);
+    pos.data.x[i] = 3.5;
+    assert.equal(new Float32Array(sab)[i], 3.5);
+});
+
+test('Arena: caller buffers > swap-and-pop on remove() writes through the shared buffer', () => {
+    const CAP = 4;
+    const arena = new Arena(CAP);
+    const buf = bufFor(Float64Array, CAP);
+    const c = arena.registerComponent({ v: Float64Array }, { buffers: { v: buf } });
+
+    const e0 = arena.spawn(), e1 = arena.spawn(), e2 = arena.spawn();
+    c.add(e0); c.add(e1); c.add(e2);
+    c.data.v[c.idx(e0)] = 10;
+    c.data.v[c.idx(e1)] = 20;
+    c.data.v[c.idx(e2)] = 30;
+
+    // Remove the middle: swap-and-pop moves e2's row (30) into e1's dense slot.
+    assert.equal(c.remove(e1), true);
+    assert.equal(c.count, 2);
+    // The moved payload must be visible through an independent view of the buffer.
+    const view = new Float64Array(buf);
+    assert.equal(view[c.idx(e2)], 30);
+    assert.equal(c.data.v[c.idx(e0)], 10);
+});
+
+test('Arena: caller buffers > despawn cascades across caller-backed components', () => {
+    const CAP = 3;
+    const arena = new Arena(CAP);
+    const a = arena.registerComponent({ x: Float32Array }, { buffers: { x: bufFor(Float32Array, CAP) } });
+    const b = arena.registerComponent({ y: Int32Array }, { buffers: { y: bufFor(Int32Array, CAP) } });
+    const e = arena.spawn();
+    a.add(e); b.add(e);
+    assert.equal(a.count, 1);
+    assert.equal(b.count, 1);
+    assert.equal(arena.despawn(e), true);
+    assert.equal(a.count, 0);
+    assert.equal(b.count, 0);
+});
+
+test('Arena: caller buffers > multi-field component requires a buffer for EVERY field', () => {
+    const CAP = 4;
+    const arena = new Arena(CAP);
+    // Two fields supplied: fine.
+    assert.doesNotThrow(() => arena.registerComponent(
+        { x: Float32Array, y: Float32Array },
+        { buffers: { x: bufFor(Float32Array, CAP), y: bufFor(Float32Array, CAP) } }));
+    // One field missing: a partial caller-backing is refused, naming the field.
+    assert.throws(() => arena.registerComponent(
+        { x: Float32Array, y: Float32Array },
+        { buffers: { x: bufFor(Float32Array, CAP) } }), /"y"/);
+});
+
+test('Arena: caller buffers > a null or undefined buffer for a declared field throws (no silent own-alloc)', () => {
+    const CAP = 4;
+    const arena = new Arena(CAP);
+    assert.throws(() => arena.registerComponent(
+        { x: Float32Array }, { buffers: { x: null } }), /missing a buffer for component field "x"/);
+    assert.throws(() => arena.registerComponent(
+        { x: Float32Array }, { buffers: { x: undefined } }), /missing a buffer for component field "x"/);
+});
+
+test('Arena: caller buffers > an undersized or oversized buffer throws naming the byte lengths', () => {
+    const CAP = 4;
+    const arena = new Arena(CAP);
+    const exact = CAP * Float32Array.BYTES_PER_ELEMENT; // 16
+    assert.throws(() => arena.registerComponent(
+        { x: Float32Array }, { buffers: { x: new ArrayBuffer(exact - 4) } }),
+        /wrong byteLength.*expected 16.*got 12/s);
+    assert.throws(() => arena.registerComponent(
+        { x: Float32Array }, { buffers: { x: new ArrayBuffer(exact + 4) } }),
+        /wrong byteLength.*expected 16.*got 20/s);
+});
+
+test('Arena: caller buffers > a wrong-type buffer (number, or a TypedArray not its buffer) throws', () => {
+    const CAP = 4;
+    const arena = new Arena(CAP);
+    assert.throws(() => arena.registerComponent(
+        { x: Float32Array }, { buffers: { x: 123 } }), /must be an ArrayBuffer or SharedArrayBuffer/);
+    // A TypedArray is a common mistake -- pass `.buffer`, not the view itself.
+    assert.throws(() => arena.registerComponent(
+        { x: Float32Array }, { buffers: { x: new Float32Array(CAP) } }),
+        /must be an ArrayBuffer or SharedArrayBuffer/);
+});
+
+test('Arena: caller buffers > a buffer with no matching schema field throws (reverse direction)', () => {
+    const CAP = 4;
+    const arena = new Arena(CAP);
+    assert.throws(() => arena.registerComponent(
+        { x: Float32Array },
+        { buffers: { x: bufFor(Float32Array, CAP), z: bufFor(Float32Array, CAP) } }),
+        /supplies a buffer for "z", which is not a field/);
+    // Empty schema (what registerTag builds) + any buffer is the same reverse error.
+    assert.throws(() => arena.registerComponent(
+        {}, { buffers: { x: bufFor(Float32Array, CAP) } }),
+        /is not a field in the component schema/);
+});
+
+test('Arena: caller buffers > a non-object buffers option throws', () => {
+    const CAP = 4;
+    const arena = new Arena(CAP);
+    assert.throws(() => arena.registerComponent(
+        { x: Float32Array }, { buffers: 42 }), /buffers option must be an object/);
+    // A top-level null buffers (as opposed to a per-field null) is a provided-
+    // but-empty map: fail closed with the object-type message, not silent own-alloc.
+    assert.throws(() => arena.registerComponent(
+        { x: Float32Array }, { buffers: null }), /buffers option must be an object/);
+});
+
+test('Arena: caller buffers > reserve() refuses to grow an arena with any caller-backed component', () => {
+    const CAP = 4;
+    const arena = new Arena(CAP);
+    arena.registerComponent({ x: Float32Array }); // own-allocated
+    arena.registerComponent({ y: Float32Array }, { buffers: { y: bufFor(Float32Array, CAP) } });
+    assert.throws(() => arena.reserve(CAP * 2),
+        /reserve\(\) cannot grow.*caller-supplied buffers.*decisions\/0006/s);
+    // The refusal must name the offending component (#1) and its field.
+    assert.throws(() => arena.reserve(CAP * 2), /component #1.*fields: y/s);
+});
+
+test('Arena: caller buffers > reserve() still grows an own-allocated arena (regression guard)', () => {
+    const CAP = 4;
+    const arena = new Arena(CAP);
+    arena.registerComponent({ x: Float32Array });
+    assert.equal(arena.reserve(CAP * 2), true);
+    assert.equal(arena.capacity, CAP * 2);
+});

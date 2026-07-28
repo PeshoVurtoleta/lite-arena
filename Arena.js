@@ -94,6 +94,75 @@ function validateSchema(schema) {
 }
 
 /**
+ * Validate a caller-supplied `buffers` map at registration (a COLD path). Fail
+ * closed in BOTH directions before a single view is built: every declared schema
+ * field must have a correctly-typed, correctly-sized backing buffer, and every
+ * supplied buffer must map to a declared field. A partially shared component --
+ * some fields sharing caller memory, others silently own-allocated -- is the
+ * worst of both worlds and impossible to debug, so a missing/null buffer for a
+ * declared key is an ERROR here, never a quiet fall back to own-allocation.
+ *
+ * Accepts both `ArrayBuffer` and `SharedArrayBuffer`: the feature is "the caller
+ * owns the memory"; sharing across a Worker is one reason to want that, and the
+ * path is far easier to test with a plain ArrayBuffer.
+ *
+ * @param {Object<string, Function>} schema - already validated by validateSchema.
+ * @param {Object<string, ArrayBufferLike>} buffers
+ * @param {number} capacity - arena capacity; each buffer must span exactly it.
+ * @throws {Error} A library error naming the offending key and both byte lengths.
+ */
+function validateBuffers(schema, buffers, capacity) {
+    if (buffers === null || typeof buffers !== 'object') {
+        throw new Error(
+            'lite-arena: the buffers option must be an object mapping each schema field to an ' +
+            `ArrayBuffer or SharedArrayBuffer, got ${describeSchemaValue(buffers)}`);
+    }
+    const hasSAB = typeof SharedArrayBuffer === 'function';
+    // Forward: every declared field needs a valid, exactly-sized buffer.
+    const keys = Object.keys(schema);
+    for (let i = 0; i < keys.length; i++) {
+        const key = keys[i];
+        const buf = buffers[key];
+        if (buf === undefined || buf === null) {
+            throw new Error(
+                `lite-arena: the buffers option is missing a buffer for component field "${key}". ` +
+                'Every declared field must get its own buffer -- a partially caller-backed component ' +
+                '(some fields shared, some own-allocated) is impossible to debug. Supply a buffer for ' +
+                'every field, or omit the buffers option entirely to own-allocate all of them. ' +
+                'See decisions/0006-caller-supplied-buffers.md');
+        }
+        if (!(buf instanceof ArrayBuffer) && !(hasSAB && buf instanceof SharedArrayBuffer)) {
+            throw new Error(
+                `lite-arena: the buffer for component field "${key}" must be an ArrayBuffer or ` +
+                `SharedArrayBuffer, got ${describeSchemaValue(buf)}`);
+        }
+        const bytesPerElement = schema[key].BYTES_PER_ELEMENT;
+        const expected = capacity * bytesPerElement;
+        if (buf.byteLength !== expected) {
+            throw new Error(
+                `lite-arena: the buffer for component field "${key}" has the wrong byteLength: ` +
+                `expected ${expected} (capacity ${capacity} * ${bytesPerElement} bytes/element for ` +
+                `${schema[key].name}), got ${buf.byteLength}. The arena never resizes a caller-supplied ` +
+                'buffer, so it must span exactly the arena capacity.');
+        }
+    }
+    // Reverse: no buffer may target a field the schema does not declare -- a
+    // buffer with no home is a typo or a stale key, and dropping it silently is
+    // exactly how the payload the caller thinks is shared ends up own-allocated.
+    const bufKeys = Object.keys(buffers);
+    for (let i = 0; i < bufKeys.length; i++) {
+        const key = bufKeys[i];
+        if (!Object.prototype.hasOwnProperty.call(schema, key)) {
+            throw new Error(
+                `lite-arena: the buffers option supplies a buffer for "${key}", which is not a field ` +
+                'in the component schema. Every buffer must map to a declared schema field (both ' +
+                'directions are checked). Remove it or add the field. ' +
+                'See decisions/0006-caller-supplied-buffers.md');
+        }
+    }
+}
+
+/**
  * Checked-mode replacement for `SparseSet.prototype.idx` (AR-11). Installed as an
  * OWN property by the SparseSet constructor ONLY when the owning arena was built
  * with `{ checked: true }`, so the production `idx()` fast path is byte-for-byte
@@ -309,11 +378,29 @@ export class Arena {
     /**
      * Mounts a new SoA component definition to the arena.
      * Each key of the schema becomes a parallel TypedArray of length `capacity`.
+     *
+     * By default the arena allocates each field's backing array itself. Pass
+     * `{ buffers }` to have each `data[key]` instead VIEW a buffer the caller
+     * owns -- an `ArrayBuffer` or a `SharedArrayBuffer` -- so a component's
+     * payload can live in memory shared with a Worker. When `buffers` is given it
+     * must supply one correctly-sized buffer for EVERY schema field and no
+     * others (validated fail-closed in both directions); when omitted, the path
+     * is byte-identical to own-allocation. The arena never frees, grows, or
+     * reassigns a caller-supplied buffer -- see decisions/0006 and note that
+     * `reserve()` refuses to grow an arena that has any caller-backed component.
+     *
+     * The tick loop is unaffected either way: `data.x` is the same
+     * `Float32Array` whether it views an own buffer or a caller's.
+     *
      * @param {Object<string, Function>} schema - e.g. `{ x: Float32Array, y: Float32Array }`.
+     * @param {{ buffers?: Object<string, ArrayBufferLike> }} [options] - Optional.
+     *   `buffers` maps each schema field to a caller-owned ArrayBuffer /
+     *   SharedArrayBuffer of exactly `capacity * BYTES_PER_ELEMENT` bytes.
      * @returns {SparseSet}
      */
-    registerComponent(schema) {
-        const set = new SparseSet(this.capacity, schema, this);
+    registerComponent(schema, options) {
+        const buffers = options != null ? options.buffers : undefined;
+        const set = new SparseSet(this.capacity, schema, this, buffers);
         this.components.push(set);
         return set;
     }
@@ -398,15 +485,38 @@ export class Arena {
      * Cold path only: `spawn` / `despawn` / `isAlive` / `idx` bodies are
      * untouched, and nothing on any hot path ever reaches this method.
      *
+     * S5 -- caller-backed components (option A, exclusive): `reserve()` throws if
+     * ANY registered component views caller-supplied buffers. Growth reallocates
+     * every `data.*`, which the arena cannot do to a buffer it does not own, and
+     * there is no synchronous way to tell a Worker its view just detached. The
+     * smallest honest contract is to forbid the combination; S6 revisits it once
+     * a shared epoch exists to signal a re-hoist. See decisions/0006.
+     *
      * @param {number} newCapacity - Target capacity. Must be an integer
      *   <= 1048575 (the 20-bit handle-index ceiling).
      * @returns {boolean} `true` if the arena grew; `false` (a no-op) if
      *   `newCapacity <= capacity`.
-     * @throws {Error} If `newCapacity` is not an integer, or exceeds 1048575.
+     * @throws {Error} If `newCapacity` is not an integer, exceeds 1048575, or any
+     *   registered component is caller-backed.
      */
     reserve(newCapacity) {
         if (!Number.isInteger(newCapacity) || newCapacity > INDEX_MASK) {
             throw new Error(`lite-arena: reserve capacity must be an integer <= ${INDEX_MASK}, got ${newCapacity}`);
+        }
+        // S5 option A: refuse to grow an arena with any caller-backed component --
+        // the arena never resizes a buffer it does not own. Cold scan; names the
+        // first offending component (registration index + its fields) so the
+        // caller knows which registerComponent(schema, { buffers }) call to fix.
+        for (let i = 0; i < this.components.length; i++) {
+            if (this.components[i]._callerBacked) {
+                const fields = Object.keys(this.components[i].data).join(', ');
+                throw new Error(
+                    `lite-arena: reserve() cannot grow this arena because component #${i} ` +
+                    `(fields: ${fields || '<tag>'}) is backed by caller-supplied buffers, which the ` +
+                    'arena never resizes or reassigns. Size caller-backed buffers for the maximum ' +
+                    'capacity you need up front, or register the component with own-allocation if it ' +
+                    'must grow. See decisions/0006-caller-supplied-buffers.md');
+            }
         }
         // Grow-only. Shrinking would strand live entities in dropped slots, so a
         // request for the same-or-smaller capacity is a defined no-op.
@@ -504,8 +614,12 @@ export class SparseSet {
      * @param {number} maxEntities
      * @param {Object<string, Function>} schema
      * @param {Arena} arena
+     * @param {Object<string, ArrayBufferLike>} [buffers] - Optional caller-owned
+     *   backing buffers, one per schema field (see `Arena.registerComponent`).
+     *   When supplied, each `data[key]` views `buffers[key]` instead of a freshly
+     *   allocated array; validated fail-closed in both directions.
      */
-    constructor(maxEntities, schema, arena) {
+    constructor(maxEntities, schema, arena, buffers) {
         // AR-10: a SparseSet whose capacity does not match its arena's is a trap
         // -- writes past `sparse.length` are silently discarded and `despawn`
         // never cleans an unregistered set. Fail closed: require a real arena and
@@ -521,6 +635,18 @@ export class SparseSet {
         }
         // AR-03 / AR-04: reject a lying schema before allocating anything.
         validateSchema(schema);
+
+        // S5: if the caller supplied backing buffers, validate them fail-closed
+        // (both directions, exact sizes) BEFORE building any view. Only `data.*`
+        // payload can be caller-backed; `sparse` and `dense` remain private
+        // own-buffer arrays -- sharing the read path (count/dense) is S6.
+        //
+        // OMITTED (undefined) means own-allocate. Any OTHER provided value --
+        // including null -- goes through validation and fails closed: a caller
+        // who wrote `{ buffers: someVar }` with `someVar` accidentally null wants
+        // a loud error, not a silent private allocation they think is shared.
+        const callerBacked = buffers !== undefined;
+        if (callerBacked) validateBuffers(schema, buffers, maxEntities);
 
         this.arena = arena;
         this.count = 0 | 0;
@@ -550,8 +676,19 @@ export class SparseSet {
         for (let i = 0; i < keys.length; i++) {
             const key = keys[i];
             const TypedArrayConstructor = schema[key];
-            this.data[key] = new TypedArrayConstructor(maxEntities);
+            // Own-allocation is byte-identical to 1.6.1. The caller-backed branch
+            // builds a length-bounded view [0, maxEntities) over the supplied
+            // buffer -- validateBuffers already proved it spans exactly that.
+            this.data[key] = callerBacked
+                ? new TypedArrayConstructor(buffers[key], 0, maxEntities)
+                : new TypedArrayConstructor(maxEntities);
         }
+
+        // S5: mark caller-backed sets so reserve() can refuse to grow them (it
+        // cannot resize a buffer it does not own; see decisions/0006). The flag is
+        // an OWN property set ONLY on the caller path, so an own-allocated set --
+        // the production default -- keeps the exact 1.6.1 instance shape.
+        if (callerBacked) this._callerBacked = true;
 
         // AR-11: in checked mode only, shadow the prototype idx() with a validating
         // one, installed as an OWN property so the production idx() fast path is

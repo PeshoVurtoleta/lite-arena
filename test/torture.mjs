@@ -58,6 +58,18 @@
  *     /retirement/clear trips a die(). (Named Phase F: E is the handle sweep above
  *     and D is the reserve gate, both already shipped under those names.)
  *
+ *   Phase G (caller-supplied buffers) -- the S5 (1.7.0) gate. Runs the Phase B
+ *     hot tick over a 4-field component TWICE: once own-allocated, once backed by
+ *     caller-supplied SharedArrayBuffers via registerComponent(schema,{buffers}).
+ *     Both are gated at maxMajor:0 / maxPauseMs:4 AND maxArrayBuffersGrowth:0
+ *     (measureOps with stabilize:'deep', which is what the profiler's external
+ *     arrayBuffers channel needs to be gateable). It proves two things: the
+ *     caller-backed hot path allocates nothing -- not on the heap, and not a
+ *     single new backing buffer -- and the SAB path is byte-for-byte as quiet as
+ *     own-allocation. The gate can see SAB: process.memoryUsage().arrayBuffers
+ *     counts a SharedArrayBuffer identically to an ArrayBuffer, so a per-frame
+ *     buffer allocation on the shared path would light up growthBytes.
+ *
  * A pass means something only if the gate can fail. Run
  *
  *     ARENA_TORTURE_LEAK=1 node --expose-gc test/torture.mjs
@@ -71,7 +83,7 @@
  */
 
 import { Arena } from '../Arena.js';
-import { GcProfiler, checkNoGc } from '@zakkster/lite-gc-profiler';
+import { GcProfiler, checkNoGc, measureOps } from '@zakkster/lite-gc-profiler';
 import { createLeakTracker } from '@zakkster/lite-leak';
 
 // --- config -----------------------------------------------------------------
@@ -516,6 +528,67 @@ function phaseF() {
     return { ok: true };
 }
 
+// --- Phase G: caller-supplied buffers (the S5 / 1.7.0 gate) -------------------
+
+const RULES_SAB = { maxMajor: 0, maxPauseMs: 4, maxArrayBuffersGrowth: 0 };
+
+// Build a filled 4-field component whose payload is either own-allocated or
+// backed by four caller-supplied SharedArrayBuffers -- the ONLY difference is the
+// { buffers } option, which is exactly the point. Returns the hoisted typed-array
+// refs so the measured tick touches no property chains.
+function buildTickWorkload(useSab) {
+    const arena = new Arena(CAP);
+    const schema = { x: Float32Array, y: Float32Array, vx: Float32Array, vy: Float32Array };
+    let comp;
+    if (useSab) {
+        const bpe = Float32Array.BYTES_PER_ELEMENT;
+        comp = arena.registerComponent(schema, {
+            buffers: {
+                x: new SharedArrayBuffer(CAP * bpe),
+                y: new SharedArrayBuffer(CAP * bpe),
+                vx: new SharedArrayBuffer(CAP * bpe),
+                vy: new SharedArrayBuffer(CAP * bpe),
+            },
+        });
+        if (!comp._callerBacked) die('phaseG: SAB component is not flagged caller-backed');
+        if (!(comp.data.x.buffer instanceof SharedArrayBuffer)) {
+            die('phaseG: SAB component data.x does not view a SharedArrayBuffer');
+        }
+    } else {
+        comp = arena.registerComponent(schema);
+    }
+    for (let i = 0; i < CAP; i++) comp.add(arena.spawn());
+    const count = comp.count;
+    const X = comp.data.x, Y = comp.data.y, VX = comp.data.vx, VY = comp.data.vy;
+    for (let i = 0; i < count; i++) { X[i] = i * 0.5; Y[i] = -i; VX[i] = 1.0; VY[i] = 0.25; }
+    return { count, X, Y, VX, VY };
+}
+
+// Measure one variant's hot tick and gate it. measureOps(stabilize:'deep')
+// forces the double settle the external arrayBuffers channel needs to report a
+// gateable growthBytes; source:'gc' reads process.memoryUsage() (where SAB is
+// counted). acc is read after so V8 cannot dead-code the body.
+function measureTickVariant(useSab) {
+    const w = buildTickWorkload(useSab);
+    const count = w.count, X = w.X, Y = w.Y, VX = w.VX, VY = w.VY;
+    let acc = 0;
+    const res = measureOps(function () {
+        for (let i = 0; i < count; i++) {
+            X[i] = X[i] + VX[i];
+            Y[i] = Y[i] + VY[i];
+            acc = acc + X[i] - Y[i];
+        }
+    }, { ops: Math.ceil(HOT_OPS_MIN / count), warmup: 8, source: 'gc', stabilize: 'deep' });
+    if (!Number.isFinite(acc)) die('phaseG: non-finite accumulator (useSab=' + useSab + ')');
+    return checkNoGc(res.summary, RULES_SAB);
+}
+
+function phaseG() {
+    const own = measureTickVariant(false); // own-allocated payload
+    const sab = measureTickVariant(true);  // caller-supplied SAB payload
+    return { ok: own.ok && sab.ok, own, sab };
+}
+
 // --- gate --------------------------------------------------------------------
 
 async function main() {
@@ -532,6 +605,7 @@ async function main() {
     // gate for symmetry.
     const e = phaseE();
     const f = phaseF();
+    const g = phaseG();
 
     const retentionOk = a.activeCount === 0 && a.trackerSize === 0;
     const budgetOk = b.report.ok;
@@ -539,8 +613,9 @@ async function main() {
     const reserveOk = d.report.ok;
     const sweepOk = e.ok;
     const conservationOk = f.ok;
+    const sabOk = g.ok;
 
-    if (retentionOk && budgetOk && joinOk && reserveOk && sweepOk && conservationOk) {
+    if (retentionOk && budgetOk && joinOk && reserveOk && sweepOk && conservationOk && sabOk) {
         process.stdout.write('ok\n');
         process.exit(0);
     }
@@ -568,12 +643,20 @@ async function main() {
             ' (rules ' + JSON.stringify(RULES) + ')\n');
     }
     if (!reserveOk) {
-        const g = d.summary.gc;
+        const gc = d.summary.gc;
         process.stderr.write(
             'torture: reserve -- verdict=' + d.report.verdict +
             ' source=' + d.summary.source +
-            ' major=' + g.major + ' maxMs=' + g.maxMs.toFixed(3) +
+            ' major=' + gc.major + ' maxMs=' + gc.maxMs.toFixed(3) +
             ' (rules ' + JSON.stringify(RULES) + ')\n');
+    }
+    if (!sabOk) {
+        process.stderr.write(
+            'torture: caller-buffers -- own verdict=' + g.own.verdict +
+            ' checked=' + JSON.stringify(g.own.checked) +
+            '; sab verdict=' + g.sab.verdict +
+            ' checked=' + JSON.stringify(g.sab.checked) +
+            ' (rules ' + JSON.stringify(RULES_SAB) + ')\n');
     }
     die('gate rejected' + (LEAK ? ' (leaky control -- expected)' : ''));
 }

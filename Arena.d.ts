@@ -137,16 +137,32 @@ export class Arena {
      * `Object.create(null)` bag, so `toString` / `constructor` are usable field
      * names and a `__proto__` key throws instead of silently dropping a field.
      *
+     * Pass `{ buffers }` to have each `data[key]` VIEW a caller-owned buffer --
+     * an `ArrayBuffer` or `SharedArrayBuffer` -- instead of one the arena
+     * allocates, so a component's payload can live in memory shared with a
+     * Worker. When supplied, `buffers` must give one buffer of exactly
+     * `capacity * BYTES_PER_ELEMENT` bytes for EVERY schema field and no others,
+     * validated fail-closed in both directions; omitting it own-allocates as
+     * before. The arena never frees, grows, or reassigns a caller-supplied
+     * buffer, and `reserve()` refuses to grow an arena that has any caller-backed
+     * component (see decisions/0006). The tick loop is identical either way.
+     *
      * @example
      *   const Transform = arena.registerComponent({
      *       x: Float32Array,
      *       y: Float32Array,
      *   });
+     *   // Shared payload for a Worker:
+     *   const sab = new SharedArrayBuffer(arena.capacity * 4);
+     *   const Vel = arena.registerComponent({ vx: Float32Array }, { buffers: { vx: sab } });
      * @throws {Error} If any field type is not a numeric TypedArray constructor,
-     *   or the schema carries a `__proto__` / symbol key.
+     *   the schema carries a `__proto__` / symbol key, or (when `buffers` is
+     *   given) any field lacks a correctly-typed, correctly-sized buffer or a
+     *   buffer targets no declared field.
      */
     registerComponent<T extends Record<string, TypedArrayConstructor>>(
-        schema: T
+        schema: T,
+        options?: { buffers?: { [K in keyof T]?: ArrayBufferLike } }
     ): SparseSet<T>;
 
     /**
@@ -183,9 +199,16 @@ export class Arena {
      * `comp.dense`, etc. -- is STALE afterward and must be re-read. This is by
      * design; it is precisely why growth is never implicit.
      *
+     * Throws if ANY registered component is backed by caller-supplied buffers
+     * (option A, exclusive): the arena cannot resize a buffer it does not own,
+     * and there is no synchronous way to signal a Worker that its view detached.
+     * Size caller-backed buffers for the maximum capacity up front. See
+     * decisions/0006.
+     *
      * @param newCapacity Target capacity; an integer `<= 1048575`.
      * @returns `true` if the arena grew, `false` if it was already large enough.
-     * @throws Error when `newCapacity` is not an integer, or exceeds 1048575.
+     * @throws Error when `newCapacity` is not an integer, exceeds 1048575, or any
+     *   registered component is caller-backed.
      */
     reserve(newCapacity: number): boolean;
 
@@ -233,10 +256,21 @@ export class SparseSet<T extends Record<string, TypedArrayConstructor>> {
      * mismatched-capacity set would silently discard out-of-range writes and,
      * being unregistered, would never be cleaned on despawn.
      *
+     * The optional `buffers` map makes each `data[key]` view a caller-owned
+     * `ArrayBuffer` / `SharedArrayBuffer` instead of an allocated array; it is
+     * validated fail-closed in both directions. See {@link Arena.registerComponent}.
+     *
      * @throws {Error} If `arena` is not an `Arena`, `maxEntities !== arena.capacity`,
-     *   or the schema is invalid (see {@link Arena.registerComponent}).
+     *   the schema is invalid, or (when `buffers` is given) any field lacks a
+     *   correctly-typed, correctly-sized buffer or a buffer targets no field
+     *   (see {@link Arena.registerComponent}).
      */
-    constructor(maxEntities: number, schema: T, arena: Arena);
+    constructor(
+        maxEntities: number,
+        schema: T,
+        arena: Arena,
+        buffers?: { [K in keyof T]?: ArrayBufferLike }
+    );
 
     /** O(1). True if the entity is alive AND possesses this component. */
     has(entity: Entity): boolean;

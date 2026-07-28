@@ -538,7 +538,18 @@ The library is plain ESM and uses only `TypedArray` + `ArrayBuffer` — works ev
 
 ### SharedArrayBuffer / Workers
 
-Components' typed arrays own their backing `ArrayBuffer`. If you need cross-thread access, instantiate components with `SharedArrayBuffer` views — but you'll need to fork the constructor to thread your own buffers in. Out of scope for v1.
+Since **1.7.0**, a component's payload can VIEW buffers you own instead of ones the arena allocates. Pass `{ buffers }` to `registerComponent`, one buffer per schema field, each exactly `capacity * BYTES_PER_ELEMENT` bytes:
+
+```js
+const cap = arena.capacity;
+const sabX = new SharedArrayBuffer(cap * Float32Array.BYTES_PER_ELEMENT);
+const Pos = arena.registerComponent({ x: Float32Array }, { buffers: { x: sabX } });
+// Pos.data.x now views sabX; hand sabX to a Worker via postMessage.
+```
+
+Both `ArrayBuffer` and `SharedArrayBuffer` are accepted (the feature is "you own the memory"; a plain `ArrayBuffer` lets you test the path without a Worker). It is validated fail-closed in both directions: every declared field needs a correctly-typed, correctly-sized buffer, no buffer may target a field the schema doesn't declare, and a missing/null buffer for a declared field throws rather than silently own-allocating.
+
+**What works today, and what doesn't.** This ships the *payload* path only. A Worker can read and write `data.*` over a range the main thread hands it by message — the `postMessage` round trip is the fence, so there are no atomics and no locking. A Worker **cannot iterate the set**: `count` and `dense` are not shared yet, so it must be told the live range `n` and read `data.x[0..n)` directly. Shared iteration (a shared control block plus a published memory-ordering model) is the next step, **v2.0.0**. Consequently `reserve()` throws on an arena with any caller-backed component — the arena never resizes a buffer it doesn't own. See [decisions/0006-caller-supplied-buffers.md](decisions/0006-caller-supplied-buffers.md).
 
 ---
 
@@ -596,7 +607,7 @@ for (let i = 0; i < n; i++) {
 `join()` is a **cold-path planner**, called once per system per frame: it returns a *reused* scratch object (so it allocates nothing) and it does **not** iterate — that keeps your loop hot and allocation-free. This is what every ECS does under the hood; a full `query()` API would only add overhead. For deeply heterogeneous queries, archetype-based ECSes (bitecs, etc.) win — but they're an order of magnitude more code. Note: consume the returned object (or start your loop) before the next `join()` call on the same arena; it is reused, not fresh.
 
 **Does it work with SharedArrayBuffer for Web Workers?**
-The current constructor allocates its own buffers. You can copy data into shared buffers manually; first-class SAB support is a v2 candidate. File an issue if you need it.
+Partly, as of **1.7.0**. Pass `{ buffers }` to `registerComponent` and a component's payload views a `SharedArrayBuffer` you own, so a Worker can read and write `data.*` over a range you hand it by `postMessage` (the message is the fence — no atomics needed). The Worker can't yet *iterate* the set, because `count` and `dense` aren't shared; give it the live range `n` and it reads `data.x[0..n)` directly. Full shared iteration (a shared control block + a published sync model) is v2.0.0. See [SharedArrayBuffer / Workers](#sharedarraybuffer--workers) above and [decisions/0006](decisions/0006-caller-supplied-buffers.md). Note that browser SAB requires cross-origin isolation (`COOP`/`COEP`); a plain `ArrayBuffer` works everywhere if you only need caller-owned (not cross-thread) memory.
 
 **Why no `forEach` / iterator API?**
 Iterators allocate. The hot-loop pattern is `for (let i = 0; i < comp.count; i++) { ... }` directly against `comp.data.field`. That's not a regression — it's *deliberately* what the API encourages.

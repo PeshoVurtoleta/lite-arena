@@ -5,6 +5,63 @@ All notable changes to `@zakkster/lite-arena` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0] - 2026-07-28
+
+Caller-supplied component payload buffers -- the first step of the S-track
+(SharedArrayBuffer). A component's `data.*` can now VIEW buffers the caller
+owns, so its payload can live in memory shared with a Worker. This release ships
+ONLY the payload path: a Worker can read and write `data.*` over a range the
+main thread hands it by message (the `postMessage` round trip is the fence). It
+cannot iterate the set -- `count` and `dense` are not shared, that is S6
+(v2.0.0). Additive and opt-in: with no `buffers` option the path is byte-for-byte
+1.6.1, and the six hot methods are proven unchanged by diff.
+
+### Added
+
+- **`registerComponent(schema, { buffers })`.** Each `data[key]` views
+  `buffers[key]` -- an `ArrayBuffer` or `SharedArrayBuffer` of exactly
+  `capacity * BYTES_PER_ELEMENT` bytes -- instead of an allocated array. Both
+  buffer types are accepted (the feature is "the caller owns the memory"; a
+  plain `ArrayBuffer` makes the path testable without a Worker). Validated
+  fail-closed in BOTH directions before any view is built: every declared field
+  needs a correctly-typed, correctly-sized buffer, and no buffer may target a
+  field the schema does not declare. A missing / null / undefined buffer for a
+  declared field throws -- never a silent fall back to own-allocation, which
+  would leave a component the caller thinks is shared quietly private. See
+  [`decisions/0006`](decisions/0006-caller-supplied-buffers.md).
+- **Cross-thread smoke test** (`test/cross-thread.test.js` + `sab-worker.mjs`):
+  a `worker_threads` Worker registers a component over the same
+  `SharedArrayBuffer`, reads what the main thread wrote, and writes back --
+  proven visible on the main thread through the same view, postMessage-fenced,
+  no atomics.
+- **Torture Phase G**: the hot tick over own-allocated AND SAB-backed payload,
+  each gated `maxMajor:0` / `maxPauseMs:4` / `maxArrayBuffersGrowth:0`
+  (`measureOps` with `stabilize:'deep'`). Proves the caller-backed hot path
+  allocates nothing -- not on the heap, not a single new backing buffer -- and is
+  as quiet as own-allocation. Verified load-bearing: a per-op buffer allocation
+  injected into the measured tick flips the gate to fail.
+
+### Changed
+
+- **`reserve()` now throws if any registered component is caller-backed** (option
+  A, exclusive). The arena never resizes a buffer it does not own, and there is
+  no synchronous way to tell a Worker its view detached. The throw names the
+  offending component and its fields. Own-allocated arenas grow exactly as
+  before. See [`decisions/0006`](decisions/0006-caller-supplied-buffers.md).
+
+### Notes
+
+- Non-goals, stated plainly and enforced by their absence: no shared
+  `count`/`dense` (the Worker cannot iterate yet), no atomics, no multi-writer,
+  no locking, no auto-threading. Those are S6.
+- `Arena.js` changes are confined to cold paths: one new `validateBuffers`
+  helper and three branches (`registerComponent`, the `SparseSet` ctor,
+  `reserve`). `spawn` / `despawn` / `add` / `has` / `remove` / `idx` are
+  byte-for-byte identical to 1.6.1 (verified by diff). Zero runtime deps.
+- Unit suite: 98 cases (84 + 13 caller-buffer unit + 1 cross-thread; 2 zero-alloc
+  cases still need `--expose-gc`). Torture gate is now Phases A-G, green at
+  `maxMajor: 0`.
+
 ## [1.6.1] - 2026-07-28
 
 Docs-reconciliation release (finishes finding AR-08). **No library logic

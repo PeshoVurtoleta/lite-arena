@@ -28,6 +28,14 @@ const Pos = arena.registerComponent({
   y: Float32Array,
 });
 
+// Optional: back a component's payload with buffers YOU own (ArrayBuffer or
+// SharedArrayBuffer) so it can be shared with a Worker. One buffer per field,
+// each exactly capacity * BYTES_PER_ELEMENT bytes; validated fail-closed both
+// ways. Omit to own-allocate (byte-identical to before). reserve() refuses to
+// grow an arena that has any caller-backed component.
+const sab = new SharedArrayBuffer(arena.capacity * Float32Array.BYTES_PER_ELEMENT);
+const Vel = arena.registerComponent({ vx: Float32Array }, { buffers: { vx: sab } });
+
 // Entity lifecycle:
 const e: Entity = arena.spawn();        // O(1), throws when full (throw names full vs retired)
 arena.isAlive(e): boolean;              // O(1), safe on arbitrary input
@@ -123,6 +131,19 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
   every backing buffer (copying live contents; all handles/memberships/dense
   indices preserved), so hoisted refs like `const x = comp.data.x` are stale
   after it returns -- re-read them. Grow-only: `newCap <= capacity` is a no-op.
+- Caller-supplied buffers (`registerComponent(schema, { buffers })`): each
+  `data[key]` can VIEW a buffer the caller owns -- an `ArrayBuffer` or
+  `SharedArrayBuffer` of exactly `capacity * BYTES_PER_ELEMENT` bytes -- so a
+  component's payload can live in memory shared with a Worker. Validated
+  fail-closed both ways: every declared field needs a correctly-typed,
+  correctly-sized buffer, and no buffer may target an undeclared field; a
+  missing/null buffer for a declared field throws rather than silently
+  own-allocating. Only `data.*` is shareable -- `count` and `dense` are NOT
+  shared, so a Worker can read/write `data.*` over a range the main thread hands
+  it by message (postMessage is the fence) but CANNOT iterate the set itself yet.
+  No atomics, no locking, no multi-writer. The arena never frees, grows, or
+  reassigns a caller-supplied buffer, and `reserve()` throws if any component is
+  caller-backed. See decisions/0006-caller-supplied-buffers.md.
 
 ## Files
 
@@ -131,10 +152,14 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
 - [./Arena.js](./Arena.js): The implementation (~280 lines, MIT, ESM).
 - [./Arena.d.ts](./Arena.d.ts): TypeScript definitions, fully typed including
   `ComponentData<T>` generic for typed `data` field access.
-- [test/Arena.test.js](test/Arena.test.js): 81 node:test cases including a
+- [test/Arena.test.js](test/Arena.test.js): node:test unit suite including a
   randomized churn oracle, tag/join stress, a reserve() growth oracle,
-  retirement/`clear()` observability, checked-mode assertions, and a
-  zero-allocation guarantee under `--expose-gc`.
+  retirement/`clear()` observability, checked-mode assertions, caller-supplied
+  buffer validation (both directions), and a zero-allocation guarantee under
+  `--expose-gc`.
+- [test/cross-thread.test.js](test/cross-thread.test.js): a `worker_threads`
+  smoke test proving a SharedArrayBuffer-backed component payload is reachable
+  from a Worker both ways, postMessage-fenced.
 - [bench/bench.js](bench/bench.js): Benchmark harness comparing against
   `Map<id, object>`, `Array<Object>`, and a no-ECS manual SoA.
 - [demo/demo.html](demo/demo.html): 50,000-particle gravity-well demo,
