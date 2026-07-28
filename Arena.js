@@ -94,6 +94,38 @@ function validateSchema(schema) {
 }
 
 /**
+ * Shared per-field buffer check (type + exact byte size), used by BOTH
+ * `validateBuffers` (registration, S5) and `SparseSet.rebind` (re-adopt after a
+ * transfer round-trip, S6). Throws a library error naming the field and, for a
+ * size mismatch, both byte lengths. Deliberately does NOT check presence --
+ * that policy differs between callers: registration demands every field, rebind
+ * accepts a partial map -- so each caller handles presence itself before calling.
+ *
+ * @param {string} key
+ * @param {ArrayBufferLike} buf
+ * @param {Function} ctor - the field's TypedArray constructor (BYTES_PER_ELEMENT + name)
+ * @param {number} capacity - each buffer must span exactly capacity * BYTES_PER_ELEMENT
+ * @param {boolean} hasSAB - whether SharedArrayBuffer exists in this runtime
+ * @throws {Error} On a wrong-typed or wrong-sized buffer.
+ */
+function validateBufferTypeAndSize(key, buf, ctor, capacity, hasSAB) {
+    if (!(buf instanceof ArrayBuffer) && !(hasSAB && buf instanceof SharedArrayBuffer)) {
+        throw new Error(
+            `lite-arena: the buffer for component field "${key}" must be an ArrayBuffer or ` +
+            `SharedArrayBuffer, got ${describeSchemaValue(buf)}`);
+    }
+    const bytesPerElement = ctor.BYTES_PER_ELEMENT;
+    const expected = capacity * bytesPerElement;
+    if (buf.byteLength !== expected) {
+        throw new Error(
+            `lite-arena: the buffer for component field "${key}" has the wrong byteLength: ` +
+            `expected ${expected} (capacity ${capacity} * ${bytesPerElement} bytes/element for ` +
+            `${ctor.name}), got ${buf.byteLength}. The arena never resizes a caller-supplied ` +
+            'buffer, so it must span exactly the arena capacity.');
+    }
+}
+
+/**
  * Validate a caller-supplied `buffers` map at registration (a COLD path). Fail
  * closed in BOTH directions before a single view is built: every declared schema
  * field must have a correctly-typed, correctly-sized backing buffer, and every
@@ -131,20 +163,7 @@ function validateBuffers(schema, buffers, capacity) {
                 'every field, or omit the buffers option entirely to own-allocate all of them. ' +
                 'See decisions/0006-caller-supplied-buffers.md');
         }
-        if (!(buf instanceof ArrayBuffer) && !(hasSAB && buf instanceof SharedArrayBuffer)) {
-            throw new Error(
-                `lite-arena: the buffer for component field "${key}" must be an ArrayBuffer or ` +
-                `SharedArrayBuffer, got ${describeSchemaValue(buf)}`);
-        }
-        const bytesPerElement = schema[key].BYTES_PER_ELEMENT;
-        const expected = capacity * bytesPerElement;
-        if (buf.byteLength !== expected) {
-            throw new Error(
-                `lite-arena: the buffer for component field "${key}" has the wrong byteLength: ` +
-                `expected ${expected} (capacity ${capacity} * ${bytesPerElement} bytes/element for ` +
-                `${schema[key].name}), got ${buf.byteLength}. The arena never resizes a caller-supplied ` +
-                'buffer, so it must span exactly the arena capacity.');
-        }
+        validateBufferTypeAndSize(key, buf, schema[key], capacity, hasSAB);
     }
     // Reverse: no buffer may target a field the schema does not declare -- a
     // buffer with no home is a typo or a stale key, and dropping it silently is
@@ -517,6 +536,23 @@ export class Arena {
                     'capacity you need up front, or register the component with own-allocation if it ' +
                     'must grow. See decisions/0006-caller-supplied-buffers.md');
             }
+            // S6: refuse a component with any DETACHED field -- its backing buffer
+            // was transferred to a Worker and not yet rebound, so `_grow`'s
+            // `newArr.set(detachedArr)` would silently copy zero bytes. An
+            // own-allocated set that was transferred out is not `_callerBacked`,
+            // so this is a separate, truthful check (a detached view is
+            // byteLength 0). Fail closed. See decisions/0007-transferable-roundtrip.md.
+            const data = this.components[i].data;
+            const dkeys = Object.keys(data);
+            for (let k = 0; k < dkeys.length; k++) {
+                if (data[dkeys[k]].byteLength === 0) {
+                    throw new Error(
+                        `lite-arena: reserve() cannot grow this arena because component #${i} has a detached ` +
+                        `field "${dkeys[k]}" -- its backing buffer was transferred to a Worker and not yet ` +
+                        'rebound. Rebind the returned buffer (comp.rebind({ ... })) before calling reserve(). ' +
+                        'See decisions/0007-transferable-roundtrip.md');
+                }
+            }
         }
         // Grow-only. Shrinking would strand live entities in dropped slots, so a
         // request for the same-or-smaller capacity is a defined no-op.
@@ -813,6 +849,127 @@ export class SparseSet {
             grown.set(old);
             this.data[key] = grown;
         }
+    }
+
+    /**
+     * COLD PATH: collect the backing `ArrayBuffer`(s) for the given fields,
+     * ready to spread into a `postMessage(msg, transferList)` transfer list.
+     * This is the SEND half of a transferable round-trip (S6): hand a field's
+     * buffer to a Worker, let it transform the payload in place, and get it back
+     * via `rebind()`.
+     *
+     * It does NOT detach anything itself -- transferring the returned buffer is
+     * what detaches the sender's view; `isDetached()` reads the truth afterward.
+     * Sugar over `comp.data[key].buffer`, but it validates the field names and
+     * returns them in a transfer-ready array. See
+     * decisions/0007-transferable-roundtrip.md.
+     *
+     * @param {string[]} [keys] - fields to collect; omit for every field.
+     * @returns {ArrayBufferLike[]} the backing buffers, in `keys` order.
+     * @throws {Error} If `keys` is not an array, or names a field not in the schema.
+     */
+    detach(keys) {
+        const fields = keys === undefined ? Object.keys(this.data) : keys;
+        if (!Array.isArray(fields)) {
+            throw new Error(
+                'lite-arena: detach() expects an array of field names (or no argument for all fields), ' +
+                `got ${describeSchemaValue(keys)}`);
+        }
+        const out = [];
+        for (let i = 0; i < fields.length; i++) {
+            const key = fields[i];
+            if (!Object.prototype.hasOwnProperty.call(this.data, key)) {
+                throw new Error(
+                    `lite-arena: detach() was asked for field "${key}", which is not a field in this ` +
+                    'component schema. See decisions/0007-transferable-roundtrip.md');
+            }
+            out.push(this.data[key].buffer);
+        }
+        return out;
+    }
+
+    /**
+     * COLD PATH: is this field's backing buffer currently detached -- transferred
+     * away and not yet rebound? TRUTHFUL, not bookkept: transferring a buffer
+     * detaches its view to zero length, so this reads `byteLength === 0` directly
+     * (a live field spans `capacity * BYTES_PER_ELEMENT > 0`). No flag to fall
+     * out of sync.
+     *
+     * Use it as a ONCE-PER-FRAME system guard -- iterating a detached field is a
+     * caller bug -- never per element. Raw `data[key][i]` reads cannot be
+     * intercepted without taxing the hot path, so this cheap guard is the
+     * sanctioned fail-closed check. See decisions/0007-transferable-roundtrip.md.
+     *
+     * @param {string} key
+     * @returns {boolean}
+     * @throws {Error} If `key` is not a field in the schema.
+     */
+    isDetached(key) {
+        if (!Object.prototype.hasOwnProperty.call(this.data, key)) {
+            throw new Error(
+                `lite-arena: isDetached() was asked about field "${key}", which is not a field in this ` +
+                'component schema. See decisions/0007-transferable-roundtrip.md');
+        }
+        return this.data[key].byteLength === 0;
+    }
+
+    /**
+     * COLD PATH: re-point one or more `data[key]` views at caller-supplied
+     * buffers -- typically the ones a Worker just transferred back. This is the
+     * RETURN half of a transferable round-trip (S6): `detach()` -> transfer ->
+     * Worker transforms -> transfer back -> `rebind()`.
+     *
+     * `buffers` is a PARTIAL map `{ [field]: ArrayBufferLike }`: only the
+     * supplied fields are re-pointed; every other field is left exactly as it was
+     * (rebind just the field(s) that came home). Fail-closed like registration --
+     * an unknown schema key, a wrong-typed buffer, or one that does not span
+     * exactly `capacity * BYTES_PER_ELEMENT` throws, naming the field, and
+     * NOTHING is re-pointed until every supplied buffer has passed (no
+     * half-applied state). A garbage buffer returned by a Worker throws instead
+     * of silently corrupting the component.
+     *
+     * After a successful rebind the set is marked caller-backed, so `reserve()`
+     * refuses to grow it -- the arena never resizes a buffer it does not own.
+     * See decisions/0007-transferable-roundtrip.md.
+     *
+     * @param {Object<string, ArrayBufferLike>} buffers - partial field -> buffer map.
+     * @throws {Error} Non-object/empty map, unknown key, wrong type, or wrong size.
+     */
+    rebind(buffers) {
+        if (buffers === null || typeof buffers !== 'object') {
+            throw new Error(
+                'lite-arena: rebind() requires an object mapping one or more component fields to an ' +
+                `ArrayBuffer or SharedArrayBuffer, got ${describeSchemaValue(buffers)}`);
+        }
+        const keys = Object.keys(buffers);
+        if (keys.length === 0) {
+            throw new Error(
+                'lite-arena: rebind() was given an empty buffers map -- nothing to rebind. Supply the ' +
+                'field(s) whose buffers a Worker transferred back, e.g. rebind({ x: returnedBuffer }).');
+        }
+        const hasSAB = typeof SharedArrayBuffer === 'function';
+        const capacity = this.arena.capacity;
+        // Validate EVERY supplied buffer before re-pointing anything, so a bad
+        // buffer in a multi-field rebind leaves the component untouched.
+        for (let i = 0; i < keys.length; i++) {
+            const key = keys[i];
+            if (!Object.prototype.hasOwnProperty.call(this.data, key)) {
+                throw new Error(
+                    `lite-arena: rebind() was given a buffer for "${key}", which is not a field in this ` +
+                    'component schema. Every buffer must map to a declared field. ' +
+                    'See decisions/0007-transferable-roundtrip.md');
+            }
+            // The field's TypedArray constructor survives detachment on the view
+            // itself, so there is no need to retain the schema separately.
+            validateBufferTypeAndSize(key, buffers[key], this.data[key].constructor, capacity, hasSAB);
+        }
+        // All valid: re-point each supplied field to a fresh length-bounded view.
+        for (let i = 0; i < keys.length; i++) {
+            const key = keys[i];
+            const Ctor = this.data[key].constructor;
+            this.data[key] = new Ctor(buffers[key], 0, capacity);
+        }
+        this._callerBacked = true;
     }
 }
 

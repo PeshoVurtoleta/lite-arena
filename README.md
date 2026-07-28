@@ -549,7 +549,26 @@ const Pos = arena.registerComponent({ x: Float32Array }, { buffers: { x: sabX } 
 
 Both `ArrayBuffer` and `SharedArrayBuffer` are accepted (the feature is "you own the memory"; a plain `ArrayBuffer` lets you test the path without a Worker). It is validated fail-closed in both directions: every declared field needs a correctly-typed, correctly-sized buffer, no buffer may target a field the schema doesn't declare, and a missing/null buffer for a declared field throws rather than silently own-allocating.
 
-**What works today, and what doesn't.** This ships the *payload* path only. A Worker can read and write `data.*` over a range the main thread hands it by message — the `postMessage` round trip is the fence, so there are no atomics and no locking. A Worker **cannot iterate the set**: `count` and `dense` are not shared yet, so it must be told the live range `n` and read `data.x[0..n)` directly. Shared iteration (a shared control block plus a published memory-ordering model) is the next step, **v2.0.0**. Consequently `reserve()` throws on an arena with any caller-backed component — the arena never resizes a buffer it doesn't own. See [decisions/0006-caller-supplied-buffers.md](decisions/0006-caller-supplied-buffers.md).
+**Offloading to a Worker (1.8.0): the transferable round-trip.** For zero-copy cross-thread work you don't need shared memory at all — you hand a buffer to a Worker with `postMessage(buf, [buf])` (transfer list), let it transform the payload, and re-adopt it on return. This is the path that runs **inside a Twitch extension iframe**, which *cannot* be cross-origin isolated and so has no `SharedArrayBuffer`:
+
+```js
+const Vel = arena.registerComponent({ vx: Float32Array });   // own-allocated is fine
+// ...spawn, add, fill Vel.data.vx...
+
+// SEND — collect the backing buffer and transfer it (this detaches Vel.data.vx):
+const [vxBuf] = Vel.detach(['vx']);
+worker.postMessage({ vxBuf, n: Vel.count }, [vxBuf]);
+
+// While it's gone, guard once per frame (a hot loop over a detached field is a bug):
+if (Vel.isDetached('vx')) { /* skip systems that read vx until it returns */ }
+
+// RETURN — the Worker transfers the (rewritten) buffer back; re-adopt it:
+worker.onmessage = ({ data: vxBuf }) => Vel.rebind({ vx: vxBuf });   // data.vx live again
+```
+
+`rebind()` is fail-closed and atomic — an unknown field, wrong type, or wrong `byteLength` throws, and a bad buffer in a multi-field rebind re-points nothing. `isDetached(key)` is truthful (a detached view has `byteLength === 0`), meant as a once-per-frame guard: raw `data.vx[i]` reads can't be policed without taxing the hot path, so a detached read yields `NaN` (visibly wrong), never a plausible `0`. `reserve()` refuses an arena with any detached (or caller-backed) field — the arena never resizes a buffer it doesn't own. The transfer is the fence: the buffer belongs to exactly one thread at a time, so there are no atomics and no locking. See [decisions/0007-transferable-roundtrip.md](decisions/0007-transferable-roundtrip.md).
+
+**Shared iteration (the SAB path) is deliberately not here.** Letting a Worker *iterate* the set (share `count`/`dense` under a memory-ordering model) needs `SharedArrayBuffer`, which the flagship Twitch target can't use — so it's parked as a possible future item for SAB-capable runtimes (Node `worker_threads`, Electron, cross-origin-isolated same-origin apps), not a committed release. The transferable round-trip above is what ships, and it needs no special headers.
 
 ---
 
@@ -606,8 +625,8 @@ for (let i = 0; i < n; i++) {
 
 `join()` is a **cold-path planner**, called once per system per frame: it returns a *reused* scratch object (so it allocates nothing) and it does **not** iterate — that keeps your loop hot and allocation-free. This is what every ECS does under the hood; a full `query()` API would only add overhead. For deeply heterogeneous queries, archetype-based ECSes (bitecs, etc.) win — but they're an order of magnitude more code. Note: consume the returned object (or start your loop) before the next `join()` call on the same arena; it is reused, not fresh.
 
-**Does it work with SharedArrayBuffer for Web Workers?**
-Partly, as of **1.7.0**. Pass `{ buffers }` to `registerComponent` and a component's payload views a `SharedArrayBuffer` you own, so a Worker can read and write `data.*` over a range you hand it by `postMessage` (the message is the fence — no atomics needed). The Worker can't yet *iterate* the set, because `count` and `dense` aren't shared; give it the live range `n` and it reads `data.x[0..n)` directly. Full shared iteration (a shared control block + a published sync model) is v2.0.0. See [SharedArrayBuffer / Workers](#sharedarraybuffer--workers) above and [decisions/0006](decisions/0006-caller-supplied-buffers.md). Note that browser SAB requires cross-origin isolation (`COOP`/`COEP`); a plain `ArrayBuffer` works everywhere if you only need caller-owned (not cross-thread) memory.
+**Can I run component work on a Web Worker?**
+Yes, two ways. **(1) Transferable round-trip (1.8.0, recommended, works anywhere).** `detach()` a component's backing buffer, `postMessage(buf, [buf])` it to a Worker, and `rebind()` it on return — zero copy, no shared memory, no cross-origin isolation. This is the path that runs **inside a Twitch extension iframe**, which cannot be cross-origin isolated and therefore has no `SharedArrayBuffer`. **(2) SharedArrayBuffer payload (1.7.0).** Pass `{ buffers }` with a `SharedArrayBuffer` you own and a Worker can read/write `data.*` over a range you hand it by `postMessage`; but browser SAB requires cross-origin isolation (`COOP`/`COEP`), so it's for SAB-capable targets (Node `worker_threads`, Electron, isolated same-origin apps), *not* a Twitch iframe. In neither case can a Worker *iterate* the set — `count`/`dense` aren't shared — so hand it the live range `n`. See [SharedArrayBuffer / Workers](#sharedarraybuffer--workers) above, [decisions/0007](decisions/0007-transferable-roundtrip.md), and [decisions/0006](decisions/0006-caller-supplied-buffers.md).
 
 **Why no `forEach` / iterator API?**
 Iterators allocate. The hot-loop pattern is `for (let i = 0; i < comp.count; i++) { ... }` directly against `comp.data.field`. That's not a regression — it's *deliberately* what the API encourages.

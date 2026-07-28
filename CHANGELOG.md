@@ -5,6 +5,64 @@ All notable changes to `@zakkster/lite-arena` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.0] - 2026-07-29
+
+Transferable-`ArrayBuffer` round-trip -- the cross-thread half of the S-track,
+the piece that actually runs inside a Twitch Extension iframe. S5 (1.7.0) let a
+component's payload live in a buffer you own; 1.8.0 closes the loop so you can
+hand that buffer to a Worker with `postMessage(buf, [buf])`, let the Worker
+transform it, and re-adopt it on return.
+
+This SUPERSEDES the "shared iteration / v2.0.0" direction referenced in the
+1.7.0 note. A Twitch Extension iframe cannot be cross-origin isolated, so
+`SharedArrayBuffer` (and the seqlock shared-iteration design) is unavailable on
+the flagship target; the platform's sanctioned zero-copy cross-thread path there
+is the transferable `ArrayBuffer`. That path needs no cross-origin isolation, no
+atomics, and no shared control block -- and, being opt-in and additive, it is a
+minor: with no transfer the path is byte-for-byte 1.7.0, and the six hot methods
+are proven unchanged by diff. SAB shared iteration remains a possible future item
+for SAB-capable runtimes (Node `worker_threads`, Electron, COI'd same-origin
+apps). See [decisions/0007](decisions/0007-transferable-roundtrip.md).
+
+### Added
+
+- `SparseSet.rebind(buffers)` -- re-point one or more `data[key]` views at
+  caller-supplied buffers (the ones a Worker transferred back). A partial map;
+  validated fail-closed in both directions (unknown key, wrong type, wrong size),
+  and atomic: a bad buffer in a multi-field rebind re-points nothing. Marks the
+  set caller-backed, so `reserve()` then refuses it.
+- `SparseSet.detach(keys?)` -- collect the backing `ArrayBuffer`(s) for a
+  `postMessage` transfer list (all fields if `keys` omitted). Validates the field
+  names; does not itself detach.
+- `SparseSet.isDetached(key)` -- truthful (`byteLength === 0`) detachment check,
+  meant as a once-per-frame system guard, never per element.
+- Cross-thread test (`test/transfer.test.js` + `test/transfer-worker.mjs`): a
+  real `ArrayBuffer` transferred to a Worker, doubled, transferred back, and
+  rebound -- twice, proving repeatable ping-pong. Plain `ArrayBuffer`, no SAB, no
+  cross-origin isolation.
+- Torture **Phase H**: the arena side of the hand-off (`detach` + `rebind`, same
+  buffer) over many frames, gated `maxArrayBuffersGrowth:0` -- `rebind` is
+  zero-copy (views the existing buffer, never reallocates). Its control is
+  `ARENA_TORTURE_HLEAK=1` (a retained per-frame allocation that trips the gate).
+
+### Changed
+
+- `reserve()` now also refuses to grow an arena that has any component with a
+  DETACHED field (buffer transferred away, not yet rebound), naming the component
+  and field -- `_grow` would otherwise silently copy zero bytes. The existing
+  caller-backed refusal (S5) is unchanged. Nothing else is breaking: the default,
+  no-transfer path is byte-for-byte 1.7.0.
+
+### Notes
+
+- Non-goals (unchanged): no `SharedArrayBuffer`, no seqlock, no atomics, no
+  shared iteration, no auto double-buffering. The arena provides
+  `detach`/`rebind`; the caller owns the message plumbing.
+- `VERSION` const deferred (see decisions/0007): it needs a docs-drift assertion
+  tying it to `package.json` and `/release` taught a fourth sync place first.
+- Unit suite: 111 cases (98 + 12 transfer unit + 1 cross-thread transfer; 2
+  zero-alloc cases still need `--expose-gc`). Torture gate is now Phases A-H.
+
 ## [1.7.0] - 2026-07-28
 
 Caller-supplied component payload buffers -- the first step of the S-track

@@ -36,6 +36,17 @@ const Pos = arena.registerComponent({
 const sab = new SharedArrayBuffer(arena.capacity * Float32Array.BYTES_PER_ELEMENT);
 const Vel = arena.registerComponent({ vx: Float32Array }, { buffers: { vx: sab } });
 
+// Optional: OFFLOAD a component's payload to a Worker with a zero-copy
+// transferable-ArrayBuffer round-trip. Works INSIDE a Twitch extension iframe --
+// no SharedArrayBuffer, no cross-origin isolation, no atomics. detach() collects
+// the backing buffer for the postMessage transfer list; transferring it detaches
+// the view; rebind() re-adopts the buffer the Worker transfers back (validated
+// fail-closed); isDetached() is a once-per-frame guard, never per element.
+const [vxBuf] = Vel.detach(['vx']);          // send leg: transfer vxBuf (list [vxBuf])
+// ...worker transforms vxBuf in place and transfers it back...
+if (Vel.isDetached('vx')) { /* skip systems reading vx until it returns */ }
+Vel.rebind({ vx: vxBuf });                   // return leg: Vel.data.vx is live again
+
 // Entity lifecycle:
 const e: Entity = arena.spawn();        // O(1), throws when full (throw names full vs retired)
 arena.isAlive(e): boolean;              // O(1), safe on arbitrary input
@@ -144,6 +155,20 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
   No atomics, no locking, no multi-writer. The arena never frees, grows, or
   reassigns a caller-supplied buffer, and `reserve()` throws if any component is
   caller-backed. See decisions/0006-caller-supplied-buffers.md.
+- Transferable round-trip (`detach` / `rebind` / `isDetached`): OFFLOAD a
+  component's payload to a Worker with zero copy, using a plain `ArrayBuffer` and
+  `postMessage(buf, [buf])` -- no `SharedArrayBuffer`, so it runs INSIDE a Twitch
+  extension iframe (which cannot be cross-origin isolated). `detach(keys?)`
+  collects the backing buffer(s) for the transfer list; transferring one detaches
+  the sender's view (`byteLength` 0). `rebind(buffers)` re-adopts the buffer(s) a
+  Worker transfers back -- a PARTIAL, fail-closed map (unknown key, wrong type, or
+  wrong size throws; nothing is re-pointed until every buffer passes), after which
+  the set is caller-backed. `isDetached(key)` is truthful (`byteLength === 0`) and
+  is the sanctioned ONCE-PER-FRAME system guard -- raw `data[key][i]` reads are
+  not policed (they cannot be, without taxing the hot path), so a hot loop over a
+  detached field is a caller bug. `reserve()` also refuses a component with a
+  detached field. The transfer is the fence: the buffer is owned by exactly one
+  thread at a time. See decisions/0007-transferable-roundtrip.md.
 
 ## Files
 
@@ -160,6 +185,10 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
 - [test/cross-thread.test.js](test/cross-thread.test.js): a `worker_threads`
   smoke test proving a SharedArrayBuffer-backed component payload is reachable
   from a Worker both ways, postMessage-fenced.
+- [test/transfer.test.js](test/transfer.test.js): a `worker_threads` test proving
+  the transferable-`ArrayBuffer` round-trip (detach -> transfer -> transform ->
+  transfer back -> rebind) across a real thread boundary, twice; plain
+  `ArrayBuffer`, no cross-origin isolation.
 - [bench/bench.js](bench/bench.js): Benchmark harness comparing against
   `Map<id, object>`, `Array<Object>`, and a no-ECS manual SoA.
 - [demo/demo.html](demo/demo.html): 50,000-particle gravity-well demo,

@@ -203,12 +203,15 @@ export class Arena {
      * (option A, exclusive): the arena cannot resize a buffer it does not own,
      * and there is no synchronous way to signal a Worker that its view detached.
      * Size caller-backed buffers for the maximum capacity up front. See
-     * decisions/0006.
+     * decisions/0006. It ALSO throws if any component has a DETACHED field (a
+     * buffer transferred to a Worker and not yet rebound) -- growing it would
+     * silently copy zero bytes; rebind the returned buffer first. See
+     * decisions/0007.
      *
      * @param newCapacity Target capacity; an integer `<= 1048575`.
      * @returns `true` if the arena grew, `false` if it was already large enough.
-     * @throws Error when `newCapacity` is not an integer, exceeds 1048575, or any
-     *   registered component is caller-backed.
+     * @throws Error when `newCapacity` is not an integer, exceeds 1048575, any
+     *   registered component is caller-backed, or any component has a detached field.
      */
     reserve(newCapacity: number): boolean;
 
@@ -299,4 +302,43 @@ export class SparseSet<T extends Record<string, TypedArrayConstructor>> {
      * uses the prototype fast path unchanged.
      */
     idx(entity: Entity): number;
+
+    /**
+     * COLD PATH. Collect the backing `ArrayBuffer`(s) for the given fields, ready
+     * to spread into a `postMessage(msg, transferList)` transfer list -- the SEND
+     * half of a transferable round-trip. Does NOT itself detach: transferring the
+     * returned buffer is what detaches the sender's view; {@link isDetached} reads
+     * the truth afterward. Sugar over `comp.data[key].buffer`, but it validates
+     * the field names.
+     *
+     * @param keys Fields to collect; omit for every field, in schema order.
+     * @returns The backing buffers, in `keys` order.
+     * @throws If `keys` is not an array, or names a field not in the schema.
+     */
+    detach(keys?: (keyof T & string)[]): ArrayBufferLike[];
+
+    /**
+     * COLD PATH. Is this field's backing buffer currently detached -- transferred
+     * away and not yet rebound? Truthful, not bookkept: a transferred buffer
+     * detaches its view to zero length, so this reads `byteLength === 0`. Use it
+     * as a ONCE-PER-FRAME system guard (iterating a detached field is a caller
+     * bug), never per element.
+     *
+     * @throws If `key` is not a field in the schema.
+     */
+    isDetached(key: keyof T & string): boolean;
+
+    /**
+     * COLD PATH. Re-point one or more `data[key]` views at caller-supplied
+     * buffers -- typically the ones a Worker transferred back (the RETURN half of
+     * a transferable round-trip). A PARTIAL map: only the supplied fields are
+     * re-pointed; the rest are left untouched. Fail-closed like registration --
+     * an unknown key, wrong type, or a buffer not spanning exactly
+     * `capacity * BYTES_PER_ELEMENT` throws, and nothing is re-pointed until every
+     * supplied buffer passes (no half-applied state). After a successful rebind
+     * the set is caller-backed, so {@link Arena.reserve} refuses to grow it.
+     *
+     * @throws On a non-object/empty map, unknown key, wrong type, or wrong size.
+     */
+    rebind(buffers: { [K in keyof T]?: ArrayBufferLike }): void;
 }

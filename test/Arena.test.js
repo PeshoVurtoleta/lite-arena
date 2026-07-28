@@ -1514,3 +1514,164 @@ test('Arena: caller buffers > reserve() still grows an own-allocated arena (regr
     assert.equal(arena.reserve(CAP * 2), true);
     assert.equal(arena.capacity, CAP * 2);
 });
+
+// -----------------------------------------------------------------
+// Arena: transferable-ArrayBuffer round-trip (1.8.0 / S6)
+//
+// detach() -> postMessage(buf, [buf]) -> Worker transforms -> transfer back ->
+// rebind(). Transferring a buffer DETACHES the sender's view (byteLength 0);
+// rebind() re-adopts the returned buffer, fail-closed. isDetached() is the
+// truthful, once-per-frame guard. Works with a PLAIN ArrayBuffer -- no
+// SharedArrayBuffer, no cross-origin isolation -- so it runs inside a Twitch
+// extension iframe. See decisions/0007 and the Worker test in test/transfer.test.js.
+//
+// Fail-before/pass-after note: on 1.7.0 there was no rebind()/detach()/
+// isDetached(), so the round-trip below could not close -- a transferred buffer
+// left data.x permanently detached with no way back. It passes only because S6
+// added the return half.
+// -----------------------------------------------------------------
+
+// Detach a component field's buffer in-thread, exactly as postMessage(transfer)
+// would: returns a byte-copy the "worker" can transform, and leaves the original
+// view detached (byteLength 0).
+function transferOut(buffer) {
+    return structuredClone(buffer, { transfer: [buffer] });
+}
+
+test('Arena: transfer > detach() returns the exact backing buffer, and transferring it detaches the view', () => {
+    const CAP = 4;
+    const arena = new Arena(CAP);
+    const Pos = arena.registerComponent({ x: Float32Array });
+    const bufs = Pos.detach(['x']);
+    assert.equal(bufs.length, 1);
+    assert.equal(bufs[0], Pos.data.x.buffer);   // the real backing store, not a copy
+    assert.equal(Pos.isDetached('x'), false);
+    transferOut(bufs[0]);                        // simulate the postMessage transfer
+    assert.equal(Pos.isDetached('x'), true);
+    assert.equal(Pos.data.x.byteLength, 0);
+});
+
+test('Arena: transfer > detach() with no argument returns every field buffer, in schema order', () => {
+    const CAP = 4;
+    const arena = new Arena(CAP);
+    const Pos = arena.registerComponent({ x: Float32Array, y: Float64Array });
+    const bufs = Pos.detach();
+    assert.deepEqual(bufs, [Pos.data.x.buffer, Pos.data.y.buffer]);
+});
+
+test('Arena: transfer > a full round-trip on an own-allocated component (transfer out, transform, rebind)', () => {
+    const CAP = 8;
+    const arena = new Arena(CAP);
+    const Pos = arena.registerComponent({ x: Float32Array });   // own-allocated
+    const handles = [];
+    for (let i = 0; i < CAP; i++) {
+        const h = arena.spawn(); Pos.add(h);
+        Pos.data.x[Pos.idx(h)] = (i + 1) * 1.5;
+        handles.push(h);
+    }
+    const n = Pos.count;
+    const [xbuf] = Pos.detach(['x']);
+    const clone = transferOut(xbuf);            // Pos.data.x now detached
+    assert.equal(Pos.isDetached('x'), true);
+    // "Worker" transforms the transferred buffer in place.
+    const w = new Float32Array(clone);
+    for (let i = 0; i < n; i++) w[i] *= 2;
+    // Return: re-adopt. An own-allocated component becomes caller-backed on rebind.
+    Pos.rebind({ x: clone });
+    assert.equal(Pos.isDetached('x'), false);
+    for (let i = 0; i < n; i++) assert.equal(Pos.data.x[i], (i + 1) * 1.5 * 2);
+    assert.equal(Pos._callerBacked, true);
+});
+
+test('Arena: transfer > partial rebind re-points only the named field; others untouched', () => {
+    const CAP = 4;
+    const arena = new Arena(CAP);
+    const Pos = arena.registerComponent({ x: Float32Array, y: Float32Array });
+    for (let i = 0; i < CAP; i++) { const h = arena.spawn(); Pos.add(h); Pos.data.x[i] = i; Pos.data.y[i] = i * 10; }
+    const yViewBefore = Pos.data.y;
+    const [xbuf] = Pos.detach(['x']);
+    const clone = transferOut(xbuf);
+    assert.equal(Pos.isDetached('x'), true);
+    assert.equal(Pos.isDetached('y'), false);   // y never left
+    Pos.rebind({ x: clone });
+    assert.equal(Pos.data.y, yViewBefore);       // same view object -- untouched
+    for (let i = 0; i < CAP; i++) assert.equal(Pos.data.y[i], i * 10);
+});
+
+test('Arena: transfer > isDetached() throws on a field not in the schema', () => {
+    const arena = new Arena(4);
+    const Pos = arena.registerComponent({ x: Float32Array });
+    assert.throws(() => Pos.isDetached('nope'), /not a field in this component schema/);
+});
+
+test('Arena: transfer > detach() throws on a non-array argument and on an unknown field', () => {
+    const arena = new Arena(4);
+    const Pos = arena.registerComponent({ x: Float32Array });
+    assert.throws(() => Pos.detach('x'), /expects an array of field names/);
+    assert.throws(() => Pos.detach(['zzz']), /field "zzz", which is not a field/);
+});
+
+test('Arena: transfer > rebind() fails closed on a non-object or empty map', () => {
+    const arena = new Arena(4);
+    const Pos = arena.registerComponent({ x: Float32Array });
+    assert.throws(() => Pos.rebind(null), /rebind\(\) requires an object/);
+    assert.throws(() => Pos.rebind(42), /rebind\(\) requires an object/);
+    assert.throws(() => Pos.rebind({}), /empty buffers map/);
+});
+
+test('Arena: transfer > rebind() fails closed on an unknown key (reverse direction)', () => {
+    const CAP = 4;
+    const arena = new Arena(CAP);
+    const Pos = arena.registerComponent({ x: Float32Array });
+    assert.throws(() => Pos.rebind({ z: new ArrayBuffer(CAP * 4) }),
+        /buffer for "z", which is not a field/);
+});
+
+test('Arena: transfer > rebind() fails closed on wrong type and wrong size, naming byte lengths', () => {
+    const CAP = 4;
+    const arena = new Arena(CAP);
+    const Pos = arena.registerComponent({ x: Float32Array });
+    assert.throws(() => Pos.rebind({ x: 123 }), /must be an ArrayBuffer or SharedArrayBuffer/);
+    // A TypedArray is not its buffer -- reject it (a common caller mistake).
+    assert.throws(() => Pos.rebind({ x: new Float32Array(CAP) }), /must be an ArrayBuffer or SharedArrayBuffer/);
+    assert.throws(() => Pos.rebind({ x: new ArrayBuffer(CAP * 4 - 4) }),
+        /wrong byteLength: expected 16 .* got 12/s);
+    assert.throws(() => Pos.rebind({ x: new ArrayBuffer(CAP * 4 + 4) }),
+        /wrong byteLength: expected 16 .* got 20/s);
+});
+
+test('Arena: transfer > rebind() is atomic: a bad buffer in a multi-field rebind re-points nothing', () => {
+    const CAP = 4;
+    const arena = new Arena(CAP);
+    const Pos = arena.registerComponent({ x: Float32Array, y: Float32Array });
+    const xView = Pos.data.x, yView = Pos.data.y;
+    // x is valid, y is the wrong size -- the whole call must throw and touch neither.
+    assert.throws(() => Pos.rebind({ x: new ArrayBuffer(CAP * 4), y: new ArrayBuffer(4) }),
+        /field "y" has the wrong byteLength/);
+    assert.equal(Pos.data.x, xView);
+    assert.equal(Pos.data.y, yView);
+    assert.equal(Pos._callerBacked, undefined);  // no partial state, not marked
+});
+
+test('Arena: transfer > reserve() refuses an arena with a DETACHED field (own-allocated, transferred out)', () => {
+    const CAP = 4;
+    const arena = new Arena(CAP);
+    arena.registerComponent({ x: Float32Array });                 // #0 own-allocated
+    const Pos = arena.registerComponent({ y: Float32Array });     // #1 own-allocated
+    const [ybuf] = Pos.detach(['y']);
+    transferOut(ybuf);                                            // Pos.data.y detached
+    assert.equal(Pos.isDetached('y'), true);
+    assert.throws(() => arena.reserve(CAP * 2),
+        /component #1 has a detached field "y".*decisions\/0007/s);
+});
+
+test('Arena: transfer > after rebind the set is caller-backed, so reserve() refuses it', () => {
+    const CAP = 4;
+    const arena = new Arena(CAP);
+    const Pos = arena.registerComponent({ x: Float32Array });     // own-allocated
+    const [xbuf] = Pos.detach(['x']);
+    const clone = transferOut(xbuf);
+    Pos.rebind({ x: clone });                                    // now caller-backed
+    assert.throws(() => arena.reserve(CAP * 2),
+        /caller-supplied buffers.*decisions\/0006/s);
+});

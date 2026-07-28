@@ -70,12 +70,26 @@
  *     counts a SharedArrayBuffer identically to an ArrayBuffer, so a per-frame
  *     buffer allocation on the shared path would light up growthBytes.
  *
+ *   Phase H (transfer round-trip) -- the S6 (1.8.0) gate. Simulates the arena
+ *     side of a transferable-ArrayBuffer ping-pong: each of H_FRAMES frames calls
+ *     detach(['x']) (the send leg) then rebind({ x }) re-viewing the same buffer
+ *     (the return leg), with no worker and no copy. The property gated is
+ *     ZERO-COPY: rebind views the EXISTING buffer, allocating no new backing
+ *     buffer, so process arrayBuffers must not grow. Gated at RULES_SAB
+ *     (maxArrayBuffersGrowth:0) with stabilize:'deep' -- the same synchronously
+ *     readable channel as Phase G (a GC-event count reads 0 inside a sync
+ *     measureOps window, so the arrayBuffers channel, not maxMajor, is the
+ *     load-bearing rule). Its control is ARENA_TORTURE_HLEAK=1 (below).
+ *
  * A pass means something only if the gate can fail. Run
  *
- *     ARENA_TORTURE_LEAK=1 node --expose-gc test/torture.mjs
+ *     ARENA_TORTURE_LEAK=1 node --expose-gc test/torture.mjs    (Phase A/retention)
+ *     ARENA_TORTURE_HLEAK=1 node --expose-gc test/torture.mjs   (Phase H/transfer)
  *
- * to skip every despawn: the retention oracles stay non-zero and the process
- * exits non-zero. That is the control -- see CHANGELOG.md and the DONE-WHEN.
+ * ARENA_TORTURE_LEAK skips every despawn: the retention oracles stay non-zero and
+ * the process exits non-zero. ARENA_TORTURE_HLEAK injects a retained per-frame
+ * allocation into Phase H's hand-off loop, tripping maxMajor. Either is the
+ * control -- see CHANGELOG.md and the DONE-WHEN.
  *
  * Peers are devDependencies, never runtime deps: Arena.js has zero deps.
  *
@@ -589,6 +603,56 @@ function phaseG() {
     return { ok: own.ok && sab.ok, own, sab };
 }
 
+// --- Phase H: transferable round-trip hand-off (the S6 / 1.8.0 gate) ----------
+
+// The arena-side cost of ONE ping-pong frame, with NO worker: detach(['x'])
+// collects the field buffer (the send leg) and rebind({ x }) re-views the same
+// buffer (the return leg). The property that matters is ZERO-COPY: rebind builds
+// a length-bounded view over the EXISTING buffer, allocating no new backing
+// buffer, so the process arrayBuffers total must not grow across many frames.
+// That is what this phase gates -- RULES_SAB (maxArrayBuffersGrowth:0), the same
+// synchronously-readable channel Phase G uses (a GC-event count is delivered
+// async and reads 0 inside a sync measureOps window, so maxMajor cannot be the
+// load-bearing rule here; the arrayBuffers channel can). stabilize:'deep' forces
+// the double settle that channel needs to report a gateable growthBytes.
+//
+// Control: ARENA_TORTURE_HLEAK=1 injects a RETAINED Float64Array per frame; its
+// backing buffer counts in arrayBuffers, so the total grows and
+// maxArrayBuffersGrowth:0 trips -- proving the phase is load-bearing (exactly how
+// Phase G was proven with an injected per-op ArrayBuffer).
+const HLEAK = process.env.ARENA_TORTURE_HLEAK === '1';
+const H_FRAMES = 20000;   // simulated frames of detach+rebind hand-off
+const hSink = [];         // retains the control's per-frame allocations
+
+function phaseH() {
+    const arena = new Arena(CAP);
+    const comp = arena.registerComponent({ x: Float32Array });
+    for (let i = 0; i < CAP; i++) comp.add(arena.spawn());
+    const count = comp.count;
+    const X0 = comp.data.x;
+    for (let i = 0; i < count; i++) X0[i] = i * 0.5;
+
+    let sum = 0;
+    const res = measureOps(function () {
+        // One frame's hand-off: send leg (detach) + return leg (rebind), the same
+        // buffer round-tripped in place -- no structuredClone, so this measures the
+        // ARENA's per-frame cost, not the platform's copy.
+        const bufs = comp.detach(['x']);
+        comp.rebind({ x: bufs[0] });
+        // Touch the rebound view so V8 cannot dead-code the rebind away.
+        const x = comp.data.x;
+        sum = sum + x[0] + x[count - 1];
+        if (HLEAK) hSink.push(new Float64Array(4096)); // control: retained per-frame alloc
+    }, { ops: H_FRAMES, warmup: 8, source: 'gc', stabilize: 'deep' });
+
+    if (!Number.isFinite(sum)) die('phaseH: non-finite accumulator');
+    // The invariant the phase leans on: after a detach + rebind of the same
+    // buffer, the field is live (not detached) and its data survived untouched.
+    if (comp.isDetached('x')) die('phaseH: field left detached after rebind');
+    if (comp.data.x[count - 1] !== (count - 1) * 0.5) die('phaseH: rebind corrupted payload');
+    return checkNoGc(res.summary, RULES_SAB);
+}
+
 // --- gate --------------------------------------------------------------------
 
 async function main() {
@@ -606,6 +670,7 @@ async function main() {
     const e = phaseE();
     const f = phaseF();
     const g = phaseG();
+    const h = phaseH();
 
     const retentionOk = a.activeCount === 0 && a.trackerSize === 0;
     const budgetOk = b.report.ok;
@@ -614,8 +679,9 @@ async function main() {
     const sweepOk = e.ok;
     const conservationOk = f.ok;
     const sabOk = g.ok;
+    const transferOk = h.ok;
 
-    if (retentionOk && budgetOk && joinOk && reserveOk && sweepOk && conservationOk && sabOk) {
+    if (retentionOk && budgetOk && joinOk && reserveOk && sweepOk && conservationOk && sabOk && transferOk) {
         process.stdout.write('ok\n');
         process.exit(0);
     }
@@ -658,7 +724,13 @@ async function main() {
             ' checked=' + JSON.stringify(g.sab.checked) +
             ' (rules ' + JSON.stringify(RULES_SAB) + ')\n');
     }
-    die('gate rejected' + (LEAK ? ' (leaky control -- expected)' : ''));
+    if (!transferOk) {
+        process.stderr.write(
+            'torture: transfer-roundtrip -- verdict=' + h.verdict +
+            ' checked=' + JSON.stringify(h.checked) +
+            ' (rules ' + JSON.stringify(RULES_SAB) + ')\n');
+    }
+    die('gate rejected' + (LEAK || HLEAK ? ' (leaky control -- expected)' : ''));
 }
 
 main();
