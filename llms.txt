@@ -142,7 +142,8 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
 
 ## Headline performance
 
-On a 2022 laptop, iteration of 10,000 entities × 200 frames:
+On a 2022 laptop, iteration of 10,000 entities × 200 frames (illustrative --
+ratios are the portable result; see README for v1.6.1 numbers on current hardware):
 
 | Strategy | ms | vs lite-arena |
 |---|---:|---:|

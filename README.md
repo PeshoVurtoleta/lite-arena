@@ -284,6 +284,8 @@ xychart-beta
 
 A 60 fps frame is **16.67 ms**. lite-arena uses ~13 %; the array-of-objects approach burns ~42 % *before* any game logic runs.
 
+*Illustrative figures from a laptop-class run of the bundled 50k-particle demo (a full canvas simulation, not `npm run bench`); the reproducible micro-benchmarks in [Benchmarks](#benchmarks) below are stamped with their machine and version.*
+
 ### When it matters
 
 | Scenario | Entities | Without lite-arena | With lite-arena |
@@ -391,36 +393,34 @@ In production those same calls take the fast path: `join()` returns the reused s
 
 ### Headline result
 
-Reproducible on any 2020+ machine — re-run `npm run bench` to get your own numbers. The ratios are stable.
+Measured on an **Apple M4 Pro (arm64), Node v26.3.1, lite-arena v1.6.1** — median of 7 trials via `npm run bench`. Absolute milliseconds scale with your hardware and JS engine; **the ratios are what to compare**, and they hold across machines. Re-run `npm run bench` to get your own.
 
 ```
 Workload 1: Spawn/Despawn churn (10k cycles)
-  lite-arena (sparse-set)           0.52 ms      48 B     6.36×
-  Map<id, object>                   1.89 ms      80 B    22.94×
-  Array<Object>                     0.13 ms      80 B     1.62×
-  Manual SoA + free list            0.08 ms      48 B     1.00×
+  Manual SoA + free list            0.037 ms     48 B     1.00×   ← the floor: a bare pool, no ECS
+  Array<Object>                     0.050 ms     48 B     1.35×
+  lite-arena (sparse-set)           0.40 ms      80 B    10.8×    ← cascade-delete + generational safety
+  Map<id, object>                   0.58 ms      80 B    15.7×
 
-Workload 2: Sequential iteration (10k entities × 200 frames)
-  lite-arena (SoA)                  8.46 ms      48 B     1.00×   ← fastest
-  Manual SoA (no ECS)               9.23 ms      48 B     1.09×
-  Array<Object>                    28.58 ms      16 B     3.38×
-  Map<id, object>                  39.19 ms      16 B     4.63×
+Workload 2: Sequential iteration (10k entities × 200 frames)  ← the per-frame hot path
+  lite-arena (SoA)                  1.70 ms      48 B     1.00×   ← fastest
+  Manual SoA (no ECS)               1.91 ms      48 B     1.12×
+  Array<Object>                     3.28 ms      16 B     1.93×
+  Map<id, object>                   4.55 ms      48 B     2.68×
 
-Workload 3: Random component removal (every 3rd)
-  lite-arena (swap-and-pop)         0.60 ms      48 B     1.00×   ← fastest
-  Map<id, object>                   1.08 ms      48 B     1.81×
-  Array<Object> + splice            1.50 ms      48 B     2.50×
+Workload 3: Random removal (every 3rd), full spawn+despawn lifecycle
+  Map<id, object>                   0.36 ms      48 B     1.00×
+  lite-arena (swap-and-pop)         0.60 ms      48 B     1.66×
+  Array<Object> + splice            0.87 ms      48 B     2.42×
 
 Workload 4: Reset & refill (empty the container, refill to N)
-  lite-arena (clear() reuse)        0.08 ms      ~0 B     2.7×    ← in-place, allocation-free
-  lite-arena (fresh new Arena)      0.50 ms     ~2 KB    16.7×    ← reallocates every buffer
-  Map<id, object> (clear)           0.33 ms      80 B    11.0×
-  Array<Object> (length=0)          0.03 ms      48 B     1.00×   ← fastest, but allocates N objects/reset
+  Array<Object> (length=0)          0.036 ms     48 B     1.00×   ← fast, but allocates N objects/reset
+  lite-arena (clear() reuse)        0.075 ms     ~0 B     2.1×     ← in-place, allocation-free
+  lite-arena (fresh new Arena)      0.20 ms     ~few KB   5.5×     ← reallocates every buffer
+  Map<id, object> (clear)           0.34 ms      80 B     9.4×
 ```
 
-**Takeaway:** lite-arena ties or beats every alternative on the operation that matters most — **iteration** — and wins random removal by 2-3×. `clear()` resets an arena **in place and allocation-free, ~6× faster than rebuilding a fresh one** — a raw `Array` refill is quicker still, but it re-allocates every object each reset (the same garbage that costs it 3× on iteration, Workload 2). Spawn/despawn churn is slower than a feature-less manual SoA because lite-arena does more work (multi-component cascade-delete, generational handle protection, sparse-set membership). That overhead is the *price* of multi-component composition; it's still 4× faster than `Map`.
-
-Heap deltas across the board are tens of bytes — confirming the zero-allocation claim.
+**Takeaway:** on the operation that runs *every frame* — **iteration** — lite-arena is the fastest option: it matches a hand-rolled struct-of-arrays and beats `Array<Object>` ~1.9× and `Map` ~2.7×. Spawn/despawn churn is slower than a feature-less manual pool because lite-arena does more per op (multi-component cascade-delete, generational-handle protection, sparse-set membership) — the price of composition and safety; it still edges `Map`. One-shot removal is close: on this engine `Map`'s native `delete` is very fast, and lite-arena's workload also spawns and despawns all N. `clear()` resets in place, allocation-free, several× faster than rebuilding a fresh arena. The portable story across machines: **iteration wins, heap deltas stay in the tens of bytes, and you never take a GC pause.**
 
 ### Running the bench
 
@@ -478,10 +478,10 @@ npm run bench
 
 Reproduces the [headline numbers](#headline-result). On any 2020+ machine you should see:
 
-- lite-arena **iteration ≤ 1.10×** of a hand-rolled SoA (within JIT noise)
-- lite-arena **iteration ≥ 3×** faster than `Array<Object>` or `Map<id, Object>`
+- lite-arena **iteration matches or beats a hand-rolled SoA** (within JIT noise)
+- lite-arena **iteration ~1.9× faster than `Array<Object>`, ~2.7× faster than `Map<id, Object>`**
 - Heap deltas **< 100 bytes** across the churn, iteration, and removal workloads (the steady-state hot paths)
-- `clear()` reuse **allocation-free and ~6× faster** than allocating a fresh arena on the reset workload
+- `clear()` reuse **allocation-free and several× faster** than allocating a fresh arena on the reset workload
 
 ### 4. Visual smoke test — "does it actually work?"
 

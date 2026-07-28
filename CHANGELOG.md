@@ -5,6 +5,44 @@ All notable changes to `@zakkster/lite-arena` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.1] - 2026-07-28
+
+Docs-reconciliation release (finishes finding AR-08). **No library logic
+changed -- `Arena.js` is untouched.** The prose reconciliation shipped across
+1.5.0 / 1.6.0; this release adds the guard that keeps the docs from drifting
+again, and re-measures the benchmarks on current hardware.
+
+### Added
+
+- **Docs-drift guard test** (`test/docs-drift.test.js`). Fails CI when the docs
+  and the code disagree, all checked against the shipped prototype surface (no
+  allowlist to maintain): every public `Arena` / `SparseSet` method must be
+  documented as a call in `llms.txt`; every method call shown in an `llms.txt`
+  code block must be a real public method (no hallucinated signature for a
+  sibling package to copy); every relative link in README and `llms.txt` must
+  resolve to a repo file. Passes green today -- it ships as a ratchet against the
+  next drift, not a fix. See
+  [`decisions/0005`](decisions/0005-docs-drift-guard.md).
+
+### Changed
+
+- **Benchmark numbers re-measured and stamped.** The README headline block now
+  carries fresh figures from a stated machine + Node + package version (median
+  of 7 `npm run bench` trials), and the takeaway is corrected to what the numbers
+  actually show on current hardware: iteration is the win (matches a hand-rolled
+  SoA, ~1.9x over `Array<Object>`, ~2.7x over `Map`); one-shot removal is
+  competitive rather than a 2-3x win (a fast native `Map` delete edges it on this
+  engine); spawn/despawn churn is mid-pack by design. `llms.txt`'s headline table
+  and the 50k-particle case study are marked illustrative and machine-stamped.
+
+### Notes
+
+- No behaviour change and no `Arena.js` diff -- a docs + test release. Unit suite:
+  84 cases (81 + 3 drift-guard; 2 zero-alloc cases still need `--expose-gc`).
+  Torture gate (Phases A-F) remains green at `maxMajor: 0`.
+- Completes the lite-arena R-track (R1-R4). Findings AR-06 and AR-08 are both
+  closed; the drift guard now enforces AR-08 going forward.
+
 ## [1.6.0] - 2026-07-28
 
 Retirement observability and `clear()`. A shrinking arena can now say so:
