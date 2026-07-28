@@ -53,7 +53,10 @@ export type ComponentData<T extends Record<string, TypedArrayConstructor>> = {
  * to `has()`-check inside the loop, and `count` mirrors `driver.count`.
  *
  * This object is reused across `join()` calls on the same arena -- read it (or
- * start your loop) before the next `join()`; never retain it across calls.
+ * start your loop) before the next `join()`; never retain it across calls. In
+ * checked mode (`new Arena(n, { checked: true })`) reading any field of a plan
+ * after a later `join()` superseded it throws instead of silently returning the
+ * newer plan's values.
  */
 export interface JoinPlan {
     driver: SparseSet<any>;
@@ -84,9 +87,13 @@ export class Arena {
     /**
      * Pre-allocates the ECS universe.
      * @param maxEntities Integer in `[1, 1048575]`.
+     * @param options Optional. `checked: true` enables development-mode
+     *   assertions -- a stale {@link Arena.join} plan and a misused
+     *   {@link SparseSet.idx} throw -- that are OFF and zero-cost in production.
+     *   The production hot paths are byte-for-byte unaffected by this flag.
      * @throws Error when `maxEntities` is not an integer in that range.
      */
-    constructor(maxEntities: number);
+    constructor(maxEntities: number, options?: { checked?: boolean });
 
     /**
      * O(1) entity allocation.
@@ -108,6 +115,16 @@ export class Arena {
      * @returns true if the entity was alive, false if the handle was already stale.
      */
     despawn(entity: Entity): boolean;
+
+    /**
+     * O(1). Slots still available for {@link Arena.spawn} right now:
+     * `capacity - activeCount - retiredCount`. Equals the free-list length, so
+     * `activeCount + retiredCount + remainingCapacity() === capacity` always
+     * holds. Falls below `capacity - activeCount` once slots retire, so a `0`
+     * here with a low `activeCount` means slots have retired (see
+     * {@link Arena.retiredCount}), not that the arena is full. Never negative.
+     */
+    remainingCapacity(): number;
 
     /**
      * Mounts a new SoA component definition to the arena.
@@ -171,6 +188,19 @@ export class Arena {
      * @throws Error when `newCapacity` is not an integer, or exceeds 1048575.
      */
     reserve(newCapacity: number): boolean;
+
+    /**
+     * Resets the arena to empty WITHOUT reallocating: rebuilds the free list,
+     * advances every generation, revives every retired slot, and drops each
+     * registered component's `count` to 0. O(capacity); a cold, between-frames
+     * operation that allocates nothing.
+     *
+     * Every {@link Entity} handle minted before `clear()` is INVALID afterward --
+     * `isAlive()` rejects it (the honest contract of a reset). Reviving retired
+     * slots restores full capacity and returns `retiredCount` to 0. Do not retain
+     * or test any pre-clear handle across a `clear()`.
+     */
+    clear(): void;
 }
 
 export class SparseSet<T extends Record<string, TypedArrayConstructor>> {
@@ -229,6 +259,10 @@ export class SparseSet<T extends Record<string, TypedArrayConstructor>> {
      * Does NOT check liveness or membership.
      * Only use this inside tight loops where validity is guaranteed
      * (e.g. iterating `dense[0..count)`).
+     *
+     * In checked mode (`new Arena(n, { checked: true })`) this throws when the
+     * entity is dead or does not hold the component; production is unchecked and
+     * uses the prototype fast path unchanged.
      */
     idx(entity: Entity): number;
 }

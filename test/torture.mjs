@@ -46,6 +46,18 @@
  *     needed. (Named Phase E, not D: Phase D is the pre-existing reserve gate
  *     shipped in 1.4.0; renaming it would falsify that CHANGELOG entry.)
  *
+ *   Phase F (retirement soak) -- the AR-05 observability gate. Retire every slot
+ *     of a small arena by churning one slot at a time to generation exhaustion,
+ *     then clear() it. After EVERY spawn and despawn it asserts the conservation
+ *     law `activeCount + retiredCount + freeListLength === capacity` (free length
+ *     walked independently from the head) and that `remainingCapacity()` equals
+ *     that walked length exactly -- so remainingCapacity() cannot drift from the
+ *     real free count. It also asserts the exhaustion throw NAMES retirement when
+ *     the arena is empty-but-retired, and that clear() revives every retired slot
+ *     back to full capacity. Self-controlling: any off-by-one in remainingCapacity
+ *     /retirement/clear trips a die(). (Named Phase F: E is the handle sweep above
+ *     and D is the reserve gate, both already shipped under those names.)
+ *
  * A pass means something only if the gate can fail. Run
  *
  *     ARENA_TORTURE_LEAK=1 node --expose-gc test/torture.mjs
@@ -72,7 +84,8 @@ const RULES = { maxMajor: 0, maxPauseMs: 4 };
 
 // Low 20 bits of a handle are the slot index -- a primitive. Must match the
 // INDEX_MASK in Arena.js. We derive the slot from the raw 32-bit handle rather
-// than decomposing anything the arena hands us structurally.
+// than decomposing anything the arena hands us structurally. INDEX_MASK also
+// doubles as the free-list terminator sentinel (see Arena.js).
 const INDEX_MASK = 0xFFFFF;
 
 // Skip every despawn -- the deliberately leaky control. See file header.
@@ -386,6 +399,123 @@ function phaseE() {
     return { ok: true };
 }
 
+// --- Phase F: retirement soak + conservation law (the AR-05 observability gate) ---
+
+// Independently recomputed free-list length: walk the implicit free list from
+// the head to the INDEX_MASK sentinel. O(capacity). This is the third term of
+// the conservation law and is derived WITHOUT trusting remainingCapacity() -- so
+// the two can be cross-checked against each other.
+function freeListLength(arena) {
+    let len = 0;
+    let node = arena.freeHead;
+    const cap = arena.capacity;
+    while (node !== INDEX_MASK) {
+        len++;
+        if (len > cap) die('phaseF: free list exceeds capacity -- cycle detected');
+        node = arena.freeList[node];
+    }
+    return len;
+}
+
+// The invariant every slot obeys: it is in exactly one of three states, so
+// active + retired + free === capacity, always. And remainingCapacity() (a field
+// computation) must equal the independently-walked free-list length.
+function assertConservation(arena, where) {
+    const free = freeListLength(arena);
+    const sum = arena.activeCount + arena.retiredCount + free;
+    if (sum !== arena.capacity) {
+        die('phaseF: conservation broken ' + where + ' -- active=' + arena.activeCount +
+            ' retired=' + arena.retiredCount + ' free=' + free + ' cap=' + arena.capacity +
+            ' (sum=' + sum + ')');
+    }
+    if (arena.remainingCapacity() !== free) {
+        die('phaseF: remainingCapacity=' + arena.remainingCapacity() +
+            ' != freeListLength=' + free + ' ' + where);
+    }
+}
+
+function phaseF() {
+    const CAP_F = 6;
+    const arena = new Arena(CAP_F);
+    const comp = arena.registerComponent({ x: Float32Array });
+    const tag = arena.registerTag();
+
+    assertConservation(arena, 'at start');
+    if (arena.remainingCapacity() !== CAP_F) die('phaseF: fresh remainingCapacity != capacity');
+
+    // (1) Mixed spawn/despawn prelude -- the conservation law holds on the
+    // ordinary (non-retiring) path too, checked after every single op.
+    const held = [];
+    for (let i = 0; i < CAP_F; i++) {
+        const e = arena.spawn();
+        comp.add(e); tag.add(e);
+        held.push(e);
+        assertConservation(arena, 'prelude spawn ' + i);
+    }
+    while (held.length) {
+        arena.despawn(held.pop());
+        assertConservation(arena, 'prelude despawn');
+    }
+    if (arena.remainingCapacity() !== CAP_F) die('phaseF: prelude did not fully drain');
+
+    // (2) Retirement grind -- retire EVERY slot, checking conservation and
+    // remainingCapacity() after every spawn and every despawn. LIFO churn hammers
+    // one head slot at a time until the despawn that exhausts its generations
+    // retires it (gen-agnostic: we watch retiredCount rather than counting cycles,
+    // so a slot entering at any generation is handled). remainingCapacity() must
+    // tick down by exactly one per retirement even though activeCount returns to 0.
+    let retiredSoFar = 0;
+    while (arena.remainingCapacity() > 0) {
+        let h = arena.spawn();
+        comp.add(h);
+        assertConservation(arena, 'grind spawn');
+        for (;;) {
+            const before = arena.retiredCount;
+            arena.despawn(h);
+            assertConservation(arena, 'grind despawn');
+            if (arena.retiredCount > before) break; // that despawn retired the slot
+            h = arena.spawn();                       // LIFO: the very same slot again
+            comp.add(h);
+            assertConservation(arena, 'grind respawn');
+        }
+        retiredSoFar++;
+        if (arena.retiredCount !== retiredSoFar) {
+            die('phaseF: retiredCount=' + arena.retiredCount + ' expected ' + retiredSoFar);
+        }
+        if (arena.remainingCapacity() !== CAP_F - retiredSoFar) {
+            die('phaseF: remainingCapacity=' + arena.remainingCapacity() +
+                ' expected ' + (CAP_F - retiredSoFar) + ' after ' + retiredSoFar + ' retirements');
+        }
+    }
+
+    // (3) Fully retired: empty yet exhausted, and the throw must NAME retirement.
+    if (arena.activeCount !== 0) die('phaseF: activeCount != 0 after full retirement');
+    if (arena.retiredCount !== CAP_F) die('phaseF: retiredCount != capacity after full retirement');
+    if (arena.remainingCapacity() !== 0) die('phaseF: remainingCapacity != 0 after full retirement');
+    let msg = '';
+    try { arena.spawn(); } catch (err) { msg = err.message; }
+    if (!/out of memory/.test(msg) || !/retired/i.test(msg)) {
+        die('phaseF: exhaustion throw did not name retirement: ' + JSON.stringify(msg));
+    }
+
+    // (4) clear() restores the arena to full capacity and re-opens every slot,
+    // reviving the retired ones -- the conservation law holds again afterward.
+    arena.clear();
+    assertConservation(arena, 'after clear');
+    if (arena.activeCount !== 0)             die('phaseF: clear left activeCount != 0');
+    if (arena.retiredCount !== 0)            die('phaseF: clear did not revive retired slots');
+    if (arena.remainingCapacity() !== CAP_F) die('phaseF: clear did not restore full capacity');
+    if (comp.count !== 0 || tag.count !== 0) die('phaseF: clear did not empty components');
+    for (let i = 0; i < CAP_F; i++) {
+        const e = arena.spawn();
+        if (!arena.isAlive(e)) die('phaseF: slot not spawnable after clear');
+        assertConservation(arena, 'post-clear spawn ' + i);
+    }
+    if (arena.remainingCapacity() !== 0) die('phaseF: arena not full after respawning all slots post-clear');
+
+    return { ok: true };
+}
+
 // --- gate --------------------------------------------------------------------
 
 async function main() {
@@ -397,17 +527,20 @@ async function main() {
     const b = await phaseB();
     const c = await phaseC();
     const d = await phaseD();
-    // Phase E self-reports via die() on any failure, so reaching here means the
-    // full handle-space sweep passed. It is included in the gate for symmetry.
+    // Phases E and F self-report via die() on any failure, so reaching here means
+    // the handle-space sweep and the retirement soak both passed. Included in the
+    // gate for symmetry.
     const e = phaseE();
+    const f = phaseF();
 
     const retentionOk = a.activeCount === 0 && a.trackerSize === 0;
     const budgetOk = b.report.ok;
     const joinOk = c.report.ok;
     const reserveOk = d.report.ok;
     const sweepOk = e.ok;
+    const conservationOk = f.ok;
 
-    if (retentionOk && budgetOk && joinOk && reserveOk && sweepOk) {
+    if (retentionOk && budgetOk && joinOk && reserveOk && sweepOk && conservationOk) {
         process.stdout.write('ok\n');
         process.exit(0);
     }

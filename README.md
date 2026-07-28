@@ -122,7 +122,7 @@ flowchart LR
 
 - **Not a game engine.** No renderer, no physics, no scene graph.
 - **Not a query language.** No `arena.query(Position, Velocity).each(...)`. Iterate `dense[0..count)` directly — JIT inlines it perfectly.
-- **Not magic.** A hand-rolled struct-of-arrays with no bookkeeping is ~1.1× faster on iteration (see [benchmarks](#benchmarks)). This library trades that for **multi-component composition, generational handles, automatic cascade-delete, and dense iteration** in ~190 lines of code.
+- **Not magic.** A hand-rolled struct-of-arrays with no bookkeeping is ~1.1× faster on iteration (see [benchmarks](#benchmarks)). This library trades that for **multi-component composition, generational handles, automatic cascade-delete, and dense iteration** in ~280 lines of code.
 
 ---
 
@@ -300,11 +300,12 @@ Rule of thumb: once your per-frame entity count passes ~2,000 with multiple comp
 
 ## API reference
 
-### `new Arena(maxEntities)`
+### `new Arena(maxEntities, options?)`
 
 | Arg | Type | Description |
 |---|---|---|
 | `maxEntities` | `number` | Integer in `[1, 1_048_575]`. Hard cap on living entities; sizes all backing TypedArrays. |
+| `options` | `{ checked?: boolean }` | Optional. `checked: true` enables development-mode assertions — see [Checked mode](#checked-mode-development-only). **Off** by default and byte-for-byte zero-cost on the production hot paths. |
 
 Throws if `maxEntities` is out of range or non-integer.
 
@@ -320,21 +321,23 @@ Throws if `maxEntities` is out of range or non-integer.
 
 | Method | Returns | Description |
 |---|---|---|
-| `spawn()` | `Entity` | O(1) allocation. Throws when the arena is full. |
+| `spawn()` | `Entity` | O(1) allocation. Throws when no slot is free; the message names the cause — full vs. retirement-exhausted — and reports `capacity` / `activeCount` / `retiredCount` inline. |
 | `isAlive(e)` | `boolean` | O(1). Safe on any 32-bit integer; never throws. |
 | `despawn(e)` | `boolean` | O(1). Removes from every component; returns false if already dead. |
-| `registerComponent(schema)` | `SparseSet` | Mounts a new SoA component. Schema: `{ key: TypedArrayConstructor }`. |
+| `remainingCapacity()` | `number` | O(1). Slots still spawnable right now: `capacity - activeCount - retiredCount`. Equals the free-list length, so `activeCount + retiredCount + remainingCapacity() === capacity` always holds. Falls below `capacity - activeCount` once slots retire. |
+| `registerComponent(schema)` | `SparseSet` | Mounts a new SoA component. Schema: `{ key: TypedArrayConstructor }`. **Validated at registration** (a cold path): every field type must be one of the nine numeric TypedArray constructors, or it throws a library error naming the offending key (see [Schema validation](#schema-validation)). |
 | `registerTag()` | `SparseSet` | Zero-size tag component (membership only). `registerComponent({})` with intent. `data` is an empty null-prototype object. |
-| `join(a, b)` | `{ driver, other, count }` | Cold-path join planner. Returns a **reused** scratch with the smaller-count set as `driver`; allocates nothing. Not an iterator — you write the loop. |
+| `join(a, b)` | `{ driver, other, count }` | Cold-path join planner. Returns a **reused** scratch with the smaller-count set as `driver`; allocates nothing. Not an iterator — you write the loop. In [checked mode](#checked-mode-development-only) it returns a plan that throws if read after the next `join()`. |
 | `reserve(newCap)` | `boolean` | **Explicit, between-frames capacity growth** — the only way the arena grows. Reallocates every backing buffer (all handles/data preserved); `false` no-op if `newCap <= capacity`. Invalidates hoisted refs — re-read `data.x` after. |
+| `clear()` | `void` | Resets the arena to empty **without reallocating** — rebuilds the free list, bumps every generation, revives every retired slot, zeroes each component's `count`. O(capacity), allocates nothing. **Every handle minted before `clear()` is invalid afterward.** |
 
 ### `SparseSet<T>` instance members
 
 | Member | Type | Description |
 |---|---|---|
 | `count` | `number` | Number of entities possessing this component. Read-only. |
-| `dense` | `Uint32Array` | Packed live handles in `[0, count)`. |
-| `data` | `{ [K]: TypedArray }` | Parallel SoA payload arrays. |
+| `dense` | `Int32Array` | Packed live handles in `[0, count)`. **Signed** (`Int32Array`, not `Uint32Array`): a handle goes negative once its slot reaches generation 2048, and `dense` stores whole handles, so the container must share that signedness. Read a handle out of `dense[i]` and pass it straight back to the API. |
+| `data` | `{ [K]: TypedArray }` | Parallel SoA payload arrays. A null-prototype bag (`Object.create(null)`), so `toString` / `constructor` are usable field names. |
 
 ### `SparseSet<T>` methods
 
@@ -348,6 +351,39 @@ Throws if `maxEntities` is out of range or non-integer.
 ### Entity handle layout
 
 A 32-bit SMI; opaque. Never decompose it by hand — the layout is an implementation detail. High-generation handles may print as negative numbers; that's the intended bit pattern.
+
+### Schema validation
+
+`registerComponent(schema)` checks every field type at registration — a cold path that runs once per component. Each value must be one of the **nine numeric TypedArray constructors**: `Int8Array`, `Uint8Array`, `Uint8ClampedArray`, `Int16Array`, `Uint16Array`, `Int32Array`, `Uint32Array`, `Float32Array`, `Float64Array`. Anything else throws a library error naming the offending key:
+
+```js
+arena.registerComponent({ x: Float32Array });   // ok
+arena.registerComponent({ x: Array });          // throws: field "x" must be one of the 9 ...
+arena.registerComponent({ x: BigInt64Array });  // throws: numeric SoA is stored as Number
+arena.registerComponent({ __proto__: Int8Array }); // throws: a `__proto__` key sets the prototype
+```
+
+A lying schema used to silently produce a polymorphic `Array` or a boxed `Number` that quietly voided the zero-GC guarantee; now it fails closed at startup. Component `data` is an `Object.create(null)` bag, so `toString` / `constructor` are usable field names. (See [decisions/0003](decisions/0003-schema-validation.md).)
+
+### Checked mode (development only)
+
+`new Arena(n, { checked: true })` turns on two assertions that catch silent API misuse. Both are **off by default and byte-for-byte zero-cost in production** — the production `join()` scratch and the prototype `idx()` are unaffected by the flag. Turn it on in tests, off in shipping builds.
+
+```js
+const arena = new Arena(1000, { checked: true });
+
+// 1. A join() plan is a single-use scratch. Reading it after the next join() throws
+//    instead of silently returning the newer plan's driver/other/count.
+const p = arena.join(A, B);
+arena.join(C, D);          // supersedes p
+p.count;                   // throws: stale join() plan read
+
+// 2. idx() is an unchecked fast path. In checked mode it throws on an entity that
+//    is dead or does not hold the component (instead of returning garbage).
+comp.idx(deadOrUnattached); // throws: idx() ... dead or does not hold this component
+```
+
+In production those same calls take the fast path: `join()` returns the reused scratch, and `idx()` returns `sparse[index]` with no checks. (See [decisions/0004](decisions/0004-retirement-observability-and-clear.md).)
 
 ---
 
@@ -374,9 +410,15 @@ Workload 3: Random component removal (every 3rd)
   lite-arena (swap-and-pop)         0.60 ms      48 B     1.00×   ← fastest
   Map<id, object>                   1.08 ms      48 B     1.81×
   Array<Object> + splice            1.50 ms      48 B     2.50×
+
+Workload 4: Reset & refill (empty the container, refill to N)
+  lite-arena (clear() reuse)        0.08 ms      ~0 B     2.7×    ← in-place, allocation-free
+  lite-arena (fresh new Arena)      0.50 ms     ~2 KB    16.7×    ← reallocates every buffer
+  Map<id, object> (clear)           0.33 ms      80 B    11.0×
+  Array<Object> (length=0)          0.03 ms      48 B     1.00×   ← fastest, but allocates N objects/reset
 ```
 
-**Takeaway:** lite-arena ties or beats every alternative on the operation that matters most — **iteration** — and wins random removal by 2-3×. Spawn/despawn churn is slower than a feature-less manual SoA because lite-arena does more work (multi-component cascade-delete, generational handle protection, sparse-set membership). That overhead is the *price* of multi-component composition; it's still 4× faster than `Map`.
+**Takeaway:** lite-arena ties or beats every alternative on the operation that matters most — **iteration** — and wins random removal by 2-3×. `clear()` resets an arena **in place and allocation-free, ~6× faster than rebuilding a fresh one** — a raw `Array` refill is quicker still, but it re-allocates every object each reset (the same garbage that costs it 3× on iteration, Workload 2). Spawn/despawn churn is slower than a feature-less manual SoA because lite-arena does more work (multi-component cascade-delete, generational handle protection, sparse-set membership). That overhead is the *price* of multi-component composition; it's still 4× faster than `Map`.
 
 Heap deltas across the board are tens of bytes — confirming the zero-allocation claim.
 
@@ -393,7 +435,7 @@ Writes `bench/bench-results.json` for CI consumption. `--expose-gc` is required 
 
 ## Testing (for clients & QA)
 
-Three levels of verification, depending on how deep you want to go.
+Four levels of verification, depending on how deep you want to go.
 
 ### 1. Unit tests — "does the library do what it says?"
 
@@ -401,23 +443,34 @@ Three levels of verification, depending on how deep you want to go.
 npm test
 ```
 
-Runs **41 deterministic assertions** under `node --test`, covering:
+Runs **81 deterministic test cases** under `node --test`, covering:
 
 | Group | What's tested |
 |---|---|
 | Construction & validation | bounds, integer check, NaN/Infinity rejection, type coercion |
 | Lifecycle | spawn / despawn / isAlive, free-list exhaustion, slot reuse |
-| Generational handles | stale-handle rejection, 4095-cycle slot retirement (fail-closed rollover), sign-bit handles |
-| Component registration | all nine TypedArray types, parallel arrays sized to capacity |
+| Generational handles | stale-handle rejection, 4095-cycle slot retirement (fail-closed rollover), sign-bit / negative handles |
+| Schema validation | nine accepted TypedArray types, rejected types (`Array`, `BigInt64Array`, …), `__proto__` / symbol keys, null-prototype `data` |
+| Component registration | parallel arrays sized to capacity, rogue `SparseSet` owner/capacity guard |
 | SparseSet ops | add / has / remove, idempotency, dead-handle rejection |
 | Swap-and-pop correctness | middle/last/single-element removal, SoA data integrity |
+| Retirement observability | `remainingCapacity()` exactness, exhaustion message names full vs. retired, `clear()` resets + revives + invalidates prior handles |
+| Checked mode | stale `join()` plan throws; `idx()` on dead/non-member throws; prototype `idx()` untouched |
 | Iteration patterns | dense scan covers every member exactly once |
 | Randomized churn | 1000 random ops vs. Set/Map oracle |
 | Zero-allocation guarantee | 100k spawn/despawn → < 1 MB heap (requires `--expose-gc`) |
 
-A clean run ends with `41 passed, 0 failed`. Suitable for CI.
+Two zero-allocation cases require `--expose-gc`; without it they skip (`node --test` → `79 passed, 2 skipped`, or `81 passed` under `node --expose-gc --test`). Suitable for CI.
 
-### 2. Benchmark — "does it perform as claimed?"
+### 2. Torture gate — "does zero-GC actually hold under stress?"
+
+```bash
+npm run torture          # node --expose-gc test/torture.mjs
+```
+
+The unit tests prove behaviour; the torture gate proves the *guarantees*. It prints exactly `ok` (exit 0) or fails loudly (non-zero), across six phases: retention (create/dispose 4096 cycles, cross-checked by an external leak tracker), GC budget (`maxMajor: 0` over a 200k-op hot tick), join zero-alloc, reserve-then-hot, a handle-space sign-bit sweep, and a retirement soak that asserts the conservation law `activeCount + retiredCount + freeListLength === capacity` after every operation. Each phase is its own control — the gate can fail. (`ARENA_TORTURE_LEAK=1 npm run torture` forces the retention phase to leak and exit non-zero, proving the gate bites.)
+
+### 3. Benchmark — "does it perform as claimed?"
 
 ```bash
 npm run bench
@@ -427,9 +480,10 @@ Reproduces the [headline numbers](#headline-result). On any 2020+ machine you sh
 
 - lite-arena **iteration ≤ 1.10×** of a hand-rolled SoA (within JIT noise)
 - lite-arena **iteration ≥ 3×** faster than `Array<Object>` or `Map<id, Object>`
-- Heap deltas **< 100 bytes** across all three workloads
+- Heap deltas **< 100 bytes** across the churn, iteration, and removal workloads (the steady-state hot paths)
+- `clear()` reuse **allocation-free and ~6× faster** than allocating a fresh arena on the reset workload
 
-### 3. Visual smoke test — "does it actually work?"
+### 4. Visual smoke test — "does it actually work?"
 
 ```bash
 # Just open the file; no build step.
@@ -442,10 +496,11 @@ A 50,000-particle gravity simulation. Drag to move the gravity well; observe con
 
 | Command | What it does |
 |---|---|
-| `npm test` | Run the 41-test unit suite |
+| `npm test` | Run the unit suite (81 cases) under `node --test` |
 | `npm run test:watch` | Re-run on save |
+| `npm run torture` | Run the zero-GC torture gate (`node --expose-gc test/torture.mjs`) |
 | `npm run bench` | Run the Node benchmark, write `bench/bench-results.json` |
-| `npm run verify` | `npm test && npm run bench` — the full CI-style check |
+| `npm run verify` | `npm test && npm run torture && npm run bench` — the full CI-style check |
 
 ---
 
@@ -496,7 +551,10 @@ Components' typed arrays own their backing `ArrayBuffer`. If you need cross-thre
 - **`remove()` does not zero the SoA tail.** After swap-and-pop, indices `[count, capacity)` contain stale data. Iterate `[0, count)` and you're fine. Don't read past `count` — there's no defined value there.
 - **`idx()` is unsafe by design.** It skips both the alive check and the membership check. Use it inside loops where you've just iterated `dense[0..count)` or just called `has()`. Calling `idx()` on a dead handle returns whatever `sparse[index]` happens to hold — garbage.
 - **`add()` is idempotent.** Calling `add(e)` twice returns the same dense index both times; the second call is a no-op.
-- **The arena throws at construction or at exhaustion, never per-operation.** `spawn()` only ever throws "out of memory" when all slots are in use; everything else returns booleans / -1 / false. The hot loop does no validation.
+- **The arena throws at construction or at exhaustion, never per-operation.** `spawn()` only throws when no slot is free; everything else returns booleans / -1 / false. The hot loop does no validation. The exhaustion message still contains `"out of memory"`, but now also **names the cause** — genuinely full vs. retirement-exhausted — and reports `capacity`, `activeCount`, and `retiredCount`, so an empty-but-exhausted arena (all slots retired) does not read as a phantom leak.
+- **A shrinking arena says so.** `remainingCapacity()` (`capacity - activeCount - retiredCount`) is the number of entities you can still spawn; the conservation law `activeCount + retiredCount + remainingCapacity() === capacity` holds after every operation. Watch it, between frames, to see exhaustion coming before `spawn()` throws.
+- **`clear()` fully resets without reallocating.** It rebuilds the free list, bumps every generation, revives every retired slot, and zeroes each component's `count` — O(capacity), zero allocation, buffers reused. **Every handle issued before `clear()` is invalid afterward** (the honest contract of a reset): `isAlive()` rejects them. Do not retain a pre-clear handle across a `clear()`.
+- **Checked mode is opt-in and never in the hot path.** `new Arena(n, { checked: true })` makes a stale `join()` plan and a misused `idx()` throw. It is off by default and byte-for-byte zero-cost in production — the checked `idx()` is installed as an own property that shadows the untouched prototype method. See [Checked mode](#checked-mode-development-only).
 
 ---
 
@@ -548,6 +606,15 @@ Iterators allocate. The hot-loop pattern is `for (let i = 0; i < comp.count; i++
 
 **What about a tagged-component pattern (zero-size markers)?**
 Use `arena.registerTag()` — a named shortcut for `arena.registerComponent({})`. `data` is an empty object; only `dense` and `count` track membership. `add()` to tag, `has()` to test, `remove()` to untag, and iterate `dense[0..count)` to walk the set. Like any component, tags clear automatically on `despawn()`. Pair it with `join()` to iterate "all entities tagged X that also have component Y" without a query API.
+
+**How do I reset the arena between levels / rounds?**
+Call `arena.clear()`. It empties the arena and every registered component in place — O(capacity), no reallocation, no garbage — and is several times faster than building a fresh `new Arena(...)` (see [benchmarks](#benchmarks)). The one rule: **every handle from before the `clear()` is dead afterward**, exactly as if you'd built a new arena. Don't stash a handle across a reset and expect it to still be valid — `isAlive()` will (correctly) say it isn't.
+
+**How do I tell whether the arena is running low — or silently shrinking?**
+`arena.remainingCapacity()` returns how many more entities you can spawn right now. It normally equals `capacity - activeCount`, but under adversarial churn it can dip lower as slots retire (fail-closed rollover) — `arena.retiredCount` counts those. If `spawn()` throws while `activeCount` is well under `capacity`, retirement is why, and the throw message says so. Check `remainingCapacity()` between frames to grow (via `reserve()`) before you hit the wall. On realistic workloads `retiredCount` stays `0` and `remainingCapacity()` is just the free-slot count.
+
+**How do I catch API misuse in development?**
+Construct with `new Arena(n, { checked: true })` in your tests. It makes two silent mistakes loud: reading a `join()` plan after the next `join()` (the scratch is single-use), and calling `idx()` on a dead or unattached entity (it's an unchecked fast path). Both are off and zero-cost in production — see [Checked mode](#checked-mode-development-only).
 
 ---
 

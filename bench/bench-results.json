@@ -2,66 +2,88 @@
   "n": 10000,
   "frames": 200,
   "gc": true,
-  "timestamp": "2026-05-17T04:09:58.728Z",
+  "timestamp": "2026-07-28T04:49:55.316Z",
   "results": {
     "churn": [
       {
         "label": "lite-arena (sparse-set)",
-        "ms": 0.5423669999999987,
+        "ms": 0.38966700000000287,
         "heap": 48
       },
       {
         "label": "Map<id, object>",
-        "ms": 1.9947579999999903,
-        "heap": 80
+        "ms": 0.5822089999999989,
+        "heap": -48
       },
       {
         "label": "Array<Object>",
-        "ms": 0.15359399999999823,
+        "ms": 0.051458000000010884,
         "heap": 48
       },
       {
         "label": "Manual SoA + free list",
-        "ms": 0.1527810000000045,
-        "heap": 6408
+        "ms": 0.03795800000000327,
+        "heap": 48
       }
     ],
     "iter": [
       {
         "label": "lite-arena (SoA)",
-        "ms": 10.303769000000102,
+        "ms": 1.6592090000000042,
         "heap": 48
       },
       {
         "label": "Map<id, object>",
-        "ms": 40.434123,
+        "ms": 4.2435839999999985,
         "heap": 16
       },
       {
         "label": "Array<Object>",
-        "ms": 30.95952000000011,
+        "ms": 3.097417000000007,
         "heap": 16
       },
       {
         "label": "Manual SoA (no ECS)",
-        "ms": 10.83432700000003,
+        "ms": 1.7630829999999378,
         "heap": 48
       }
     ],
     "randomRemove": [
       {
         "label": "lite-arena (swap-and-pop)",
-        "ms": 0.6412089999998898,
-        "heap": 80
+        "ms": 0.5611659999999574,
+        "heap": 16
       },
       {
         "label": "Array<Object> + splice",
-        "ms": 2.7343590000000404,
+        "ms": 0.8268330000000788,
         "heap": 48
       },
       {
         "label": "Map<id, object>",
-        "ms": 1.2624229999996714,
+        "ms": 0.3604159999999865,
+        "heap": 48
+      }
+    ],
+    "reset": [
+      {
+        "label": "lite-arena (clear() reuse)",
+        "ms": 0.0810830000000351,
+        "heap": 48
+      },
+      {
+        "label": "lite-arena (fresh new Arena)",
+        "ms": 0.5079580000000306,
+        "heap": 1360
+      },
+      {
+        "label": "Map<id, object> (clear)",
+        "ms": 0.33062500000005457,
+        "heap": 80
+      },
+      {
+        "label": "Array<Object> (length=0)",
+        "ms": 0.028167000000053122,
         "heap": 48
       }
     ]

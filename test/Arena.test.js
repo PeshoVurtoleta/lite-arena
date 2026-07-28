@@ -1084,3 +1084,241 @@ test('Arena: zero-allocation guarantee (--expose-gc required) > 500k component i
     const delta = process.memoryUsage().heapUsed - baseline;
     assert.ok(delta < 1024 * 1024);
 });
+
+// -----------------------------------------------------------------
+// Arena: retirement observability, clear(), and checked mode (1.6.0)
+// -----------------------------------------------------------------
+
+const GEN_MASK = 0xFFF; // 4095 live generations per slot -- mirrors Arena.js.
+
+// Drive whichever slot the free-list head points at through its entire live
+// generation range and retire it. The free list is LIFO, so on a small arena a
+// spawn/despawn churn keeps hammering that one slot -- advancing only its
+// generation -- until the gen-GEN_MASK despawn withdraws it, leaving the other
+// slots untouched. Returns nothing; asserts exactly one new retirement.
+function retireOneSlot(arena) {
+    const before = arena.retiredCount;
+    let h = arena.spawn();                 // gen 1 on the head slot
+    for (let g = 1; g < GEN_MASK; g++) {   // churn it up to gen GEN_MASK (4095)
+        arena.despawn(h);
+        h = arena.spawn();
+    }
+    arena.despawn(h);                      // gen === GEN_MASK -> retire
+    assert.equal(arena.retiredCount, before + 1, 'retireOneSlot must retire exactly one slot');
+}
+
+test('Arena: remainingCapacity > equals capacity - activeCount - retiredCount across spawn/despawn', () => {
+    const arena = new Arena(4);
+    const check = () => assert.equal(
+        arena.remainingCapacity(),
+        arena.capacity - arena.activeCount - arena.retiredCount);
+
+    assert.equal(arena.remainingCapacity(), 4);
+    check();
+
+    const a = arena.spawn(); check();
+    const b = arena.spawn(); check();
+    assert.equal(arena.remainingCapacity(), 2);
+
+    arena.despawn(a); check();
+    assert.equal(arena.remainingCapacity(), 3);
+
+    arena.despawn(b); check();
+    assert.equal(arena.remainingCapacity(), 4); // back to empty, nothing retired
+    assert.equal(arena.retiredCount, 0);
+});
+
+test('Arena: remainingCapacity > falls below capacity - activeCount once a slot retires', () => {
+    const arena = new Arena(2);
+    retireOneSlot(arena);
+
+    // The arena is EMPTY (activeCount 0) yet can hold only 1 more -- a retired
+    // slot is gone, not free. This is the number a leak hunt would otherwise miss.
+    assert.equal(arena.activeCount, 0);
+    assert.equal(arena.retiredCount, 1);
+    assert.equal(arena.remainingCapacity(), 1);
+    assert.equal(arena.remainingCapacity(),
+        arena.capacity - arena.activeCount - arena.retiredCount);
+
+    // The one surviving slot is still spawnable.
+    const e = arena.spawn();
+    assert.equal(arena.isAlive(e), true);
+    assert.equal(arena.remainingCapacity(), 0);
+});
+
+test('Arena: exhaustion message > a genuinely full arena names capacity, not retirement', () => {
+    const arena = new Arena(2);
+    arena.spawn();
+    arena.spawn();
+    let msg = '';
+    try { arena.spawn(); } catch (err) { msg = err.message; }
+    assert.match(msg, /out of memory/);          // back-compat: old callers match this
+    assert.match(msg, /activeCount=2/);
+    assert.match(msg, /retiredCount=0/);
+    assert.doesNotMatch(msg, /retired by generation/); // must NOT blame retirement
+});
+
+test('Arena: exhaustion message > a retirement-exhausted arena names retirement and the counts', () => {
+    const arena = new Arena(1);
+    retireOneSlot(arena);
+    assert.equal(arena.activeCount, 0);
+    assert.equal(arena.retiredCount, 1);
+
+    let msg = '';
+    try { arena.spawn(); } catch (err) { msg = err.message; }
+    assert.match(msg, /out of memory/);
+    assert.match(msg, /retiredCount=1/);
+    assert.match(msg, /activeCount=0/);
+    assert.match(msg, /retired by generation/); // the reader is pointed at churn, not a leak
+});
+
+test('Arena: clear > empties the arena, resets counts, and invalidates every pre-clear handle', () => {
+    const arena = new Arena(4);
+    const pos = arena.registerComponent({ x: Float32Array });
+    const tag = arena.registerTag();
+
+    const handles = [];
+    for (let i = 0; i < 3; i++) {
+        const e = arena.spawn();
+        pos.add(e);
+        pos.data.x[pos.idx(e)] = i + 1;
+        if (i === 0) tag.add(e);
+        handles.push(e);
+    }
+    assert.equal(arena.activeCount, 3);
+    assert.ok(pos.count > 0 && tag.count > 0);
+
+    arena.clear();
+
+    assert.equal(arena.activeCount, 0);
+    assert.equal(arena.retiredCount, 0);
+    assert.equal(arena.remainingCapacity(), 4);
+    assert.equal(pos.count, 0);
+    assert.equal(tag.count, 0);
+    for (const e of handles) {
+        assert.equal(arena.isAlive(e), false, 'pre-clear handle must be dead after clear()');
+        assert.equal(pos.has(e), false);
+    }
+
+    // The arena is fully usable again, and the fresh handle is live.
+    const e2 = arena.spawn();
+    assert.equal(arena.isAlive(e2), true);
+    assert.equal(pos.add(e2) >= 0, true);
+});
+
+test('Arena: clear > revives retired slots back to full capacity', () => {
+    const arena = new Arena(2);
+    retireOneSlot(arena);
+    retireOneSlot(arena);
+    assert.equal(arena.retiredCount, 2);
+    assert.equal(arena.remainingCapacity(), 0);
+    assert.throws(() => arena.spawn(), /out of memory/); // fully retired -> exhausted
+
+    arena.clear();
+
+    assert.equal(arena.retiredCount, 0, 'clear() must revive retired slots');
+    assert.equal(arena.remainingCapacity(), 2);
+    const a = arena.spawn();
+    const b = arena.spawn();
+    assert.equal(arena.isAlive(a), true);
+    assert.equal(arena.isAlive(b), true);
+    assert.equal(arena.remainingCapacity(), 0);
+});
+
+test('Arena: clear > reuses every backing buffer (allocates nothing)', () => {
+    const arena = new Arena(4);
+    const pos = arena.registerComponent({ x: Float32Array, y: Uint16Array });
+    for (let i = 0; i < 4; i++) pos.add(arena.spawn());
+
+    // Identity of every buffer clear() touches, captured before the reset.
+    const gens = arena.generations;
+    const free = arena.freeList;
+    const dense = pos.dense;
+    const sparse = pos.sparse;
+    const dataX = pos.data.x;
+    const dataY = pos.data.y;
+
+    arena.clear();
+
+    // Same objects afterward: clear() overwrites in place, never reallocates.
+    assert.equal(arena.generations, gens);
+    assert.equal(arena.freeList, free);
+    assert.equal(pos.dense, dense);
+    assert.equal(pos.sparse, sparse);
+    assert.equal(pos.data.x, dataX);
+    assert.equal(pos.data.y, dataY);
+});
+
+test('Arena: onRetire > a rejected onRetire option is never honored (non-goal, in writing)', () => {
+    // Retirement deliberately does NOT call back into user code from the despawn
+    // path (see decisions/0004). Passing an `onRetire` must be inert -- the counter
+    // plus remainingCapacity() is the whole contract.
+    let called = false;
+    const arena = new Arena(1, { onRetire: () => { called = true; } });
+    retireOneSlot(arena);
+    assert.equal(called, false, 'onRetire must never fire -- it is a rejected shape');
+    assert.equal(arena.retiredCount, 1);
+});
+
+test('Arena: checked mode > a join() plan read after a later join() throws', () => {
+    const arena = new Arena(8, { checked: true });
+    const a = arena.registerComponent({ x: Float32Array });
+    const b = arena.registerTag();
+    const e = arena.spawn(); a.add(e); b.add(e);
+    const e2 = arena.spawn(); a.add(e2);   // a.count = 2, b.count = 1 -> b is rarer
+
+    const p1 = arena.join(a, b);
+    assert.equal(p1.count, 1);          // valid window: reads fine
+    assert.equal(p1.driver, b);         // rarer set drives (tag has the smaller count)
+
+    arena.join(a, b);                   // supersede p1
+
+    assert.throws(() => p1.count, /stale join/);
+    assert.throws(() => p1.driver, /stale join/);
+    assert.throws(() => p1.other, /stale join/);
+});
+
+test('Arena: checked mode > idx() throws on a dead or non-member entity; valid idx() works', () => {
+    const arena = new Arena(8, { checked: true });
+    const a = arena.registerComponent({ x: Float32Array });
+
+    const e = arena.spawn();
+    const di = a.add(e);
+    assert.equal(a.idx(e), di);                       // member: returns its dense index
+
+    const outsider = arena.spawn();                    // alive, but never added to `a`
+    assert.throws(() => a.idx(outsider), /checked mode/);
+
+    arena.despawn(e);                                  // now dead
+    assert.throws(() => a.idx(e), /checked mode/);
+});
+
+test('Arena: checked mode > OFF by default: join reuses the scratch, idx skips checks', () => {
+    const arena = new Arena(4); // unchecked
+    const a = arena.registerComponent({ x: Float32Array });
+    const b = arena.registerTag();
+    arena.spawn(); // populate so join has something to plan over
+
+    const j1 = arena.join(a, b);
+    const j2 = arena.join(a, b);
+    assert.equal(j1, j2, 'unchecked join() must hand back the one reused scratch');
+
+    // Unchecked idx() is the raw fast path: it must NOT throw on a non-member.
+    const outsider = arena.spawn();
+    assert.doesNotThrow(() => a.idx(outsider));
+});
+
+test('Arena: checked mode > production hot path untouched: prototype idx() vs own checked idx()', () => {
+    const plain = new Arena(2);
+    const plainSet = plain.registerComponent({ x: Float32Array });
+    // An unchecked set uses the shared prototype method -- no own idx, so every
+    // production set stays monomorphic on SparseSet.prototype.idx.
+    assert.equal(plainSet.idx, SparseSet.prototype.idx);
+    assert.equal(Object.prototype.hasOwnProperty.call(plainSet, 'idx'), false);
+
+    const checked = new Arena(2, { checked: true });
+    const checkedSet = checked.registerComponent({ x: Float32Array });
+    // A checked set shadows it with an OWN property -- the prototype is untouched.
+    assert.equal(Object.prototype.hasOwnProperty.call(checkedSet, 'idx'), true);
+    assert.notEqual(checkedSet.idx, SparseSet.prototype.idx);
+});

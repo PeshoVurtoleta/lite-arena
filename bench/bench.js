@@ -14,6 +14,7 @@
  *   1. Spawn / despawn churn      — lifecycle throughput
  *   2. Sequential iteration       — the systems hot path (apply velocity)
  *   3. Random-access removal      — the swap-and-pop sweet spot
+ *   4. Reset & refill             — clear() reuse vs. reallocating a fresh arena
  *
  * Requires `--expose-gc` for heap measurements.
  * Outputs both a formatted table and bench/bench-results.json.
@@ -209,6 +210,52 @@ function randomRemoveMap() {
 }
 
 // ─────────────────────────────────────────────────────────────────
+// Workload 4: reset & refill (clear() reuse vs. a fresh allocation)
+// ─────────────────────────────────────────────────────────────────
+
+// lite-arena reused via clear(): O(capacity) in-place reset, no reallocation,
+// no garbage. The arena and every component buffer are allocated ONCE (in the
+// factory); each timed call clears and refills them.
+function resetArenaClear() {
+    const a = new Arena(N);
+    const c = a.registerComponent({ x: Float32Array, y: Float32Array });
+    for (let i = 0; i < N; i++) { const e = a.spawn(); c.add(e); } // start full
+    return () => {
+        a.clear();
+        for (let i = 0; i < N; i++) { const e = a.spawn(); c.add(e); }
+    };
+}
+
+// The naive "just make a new one" reset: every call reallocates the arena and
+// its component buffers. Correct, but it churns megabytes the GC must reclaim --
+// the exact cost clear() exists to avoid.
+function resetArenaFresh() {
+    return () => {
+        const a = new Arena(N);
+        const c = a.registerComponent({ x: Float32Array, y: Float32Array });
+        for (let i = 0; i < N; i++) { const e = a.spawn(); c.add(e); }
+    };
+}
+
+function resetMap() {
+    const m = new Map();
+    for (let i = 0; i < N; i++) m.set(i, { x: 0, y: 0 });
+    return () => {
+        m.clear();
+        for (let i = 0; i < N; i++) m.set(i, { x: 0, y: 0 });
+    };
+}
+
+function resetAoO() {
+    const arr = [];
+    for (let i = 0; i < N; i++) arr.push({ x: 0, y: 0 });
+    return () => {
+        arr.length = 0;
+        for (let i = 0; i < N; i++) arr.push({ x: 0, y: 0 });
+    };
+}
+
+// ─────────────────────────────────────────────────────────────────
 // Runner
 // ─────────────────────────────────────────────────────────────────
 
@@ -270,6 +317,13 @@ const all = {
         ['lite-arena (swap-and-pop)', randomRemoveArena],
         ['Array<Object> + splice',    randomRemoveAoO],
         ['Map<id, object>',           randomRemoveMap],
+    ]),
+
+    reset: bench('Workload 4', 'Reset & refill (empty the container, refill to N)', [
+        ['lite-arena (clear() reuse)',   resetArenaClear],
+        ['lite-arena (fresh new Arena)', resetArenaFresh],
+        ['Map<id, object> (clear)',      resetMap],
+        ['Array<Object> (length=0)',     resetAoO],
     ]),
 };
 

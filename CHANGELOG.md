@@ -5,6 +5,81 @@ All notable changes to `@zakkster/lite-arena` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0] - 2026-07-28
+
+Retirement observability and `clear()`. A shrinking arena can now say so:
+`remainingCapacity()` reports the free count, `spawn()`'s exhaustion throw names
+whether the arena is full or has retired slots, and `clear()` resets the arena in
+place without reallocating. An optional checked mode makes two silent misuses
+loud. All hot paths are untouched.
+
+### Added
+
+- **`remainingCapacity()`** (AR-05). O(1); returns
+  `capacity - activeCount - retiredCount` -- the number of further entities that
+  can be spawned right now. Equals the free-list length, so
+  `activeCount + retiredCount + remainingCapacity() === capacity` holds after
+  every operation. It falls below `capacity - activeCount` once slots retire,
+  which is exactly the signal a phantom-leak hunt would otherwise miss.
+- **`clear()`** (AR-05). Resets the arena to empty WITHOUT reallocating --
+  rebuilds the free list, advances every generation, revives every retired slot,
+  and drops each component's `count` to 0. O(capacity); allocates nothing. Every
+  handle minted before `clear()` is invalid afterward (the honest contract of a
+  reset); reviving retired slots restores full capacity and returns `retiredCount`
+  to 0. Handle policy decided in
+  [`decisions/0004`](decisions/0004-retirement-observability-and-clear.md).
+- **Checked mode** -- `new Arena(n, { checked: true })` (AR-09, AR-11). OFF by
+  default and zero-cost in production. When on: `join()` returns a plan that
+  throws if read after a later `join()` superseded it (AR-09), and `idx()` throws
+  on an entity that is dead or does not hold the component (AR-11). The checked
+  `idx` is installed as an OWN property shadowing the prototype method, so the
+  production `idx()` fast path is byte-for-byte untouched -- this closes the AR-11
+  that 1.5.0 deferred, without the fast-path tax that forced the deferral.
+- Torture **Phase F** (retirement soak): retires every slot of a small arena and
+  then `clear()`s it, asserting the conservation law and `remainingCapacity()`
+  exactness after every operation, that the exhaustion throw names retirement,
+  and that `clear()` revives every retired slot. Self-controlling.
+- Twelve tests covering `remainingCapacity()` exactness, both exhaustion
+  messages, `clear()` semantics (pre-clear handles rejected, counts reset,
+  buffers reused), the rejected `onRetire`, and checked-mode `join` / `idx`.
+- Benchmark **Workload 4 (reset & refill)**: `clear()` reuse vs. a fresh
+  `new Arena()` vs. `Map.clear()` vs. `Array.length = 0`. `clear()` resets in
+  place allocation-free, several times faster than reallocating a fresh arena.
+
+### Changed
+
+- **`spawn()`'s exhaustion message now names the cause** (AR-05). It reports
+  `capacity`, `activeCount`, and `retiredCount` inline, and when slots have
+  retired it says so and points at `decisions/0001` rather than throwing a bare
+  `"out of memory"` while `activeCount === 0`. The string still contains
+  `"out of memory"`, so existing `/out of memory/` matchers are unaffected. Built
+  in a cold `_exhausted()` helper; spawn()'s allocation path is unchanged.
+- `Arena.d.ts`: the constructor gains the optional `{ checked?: boolean }`;
+  `remainingCapacity()` and `clear()` are typed; `JoinPlan` and `idx()` document
+  their checked-mode behavior.
+- **README and `llms.txt` reconciled with the code** (AR-08, pulled forward from
+  R4). Fixes a standing documentation error -- `SparseSet.dense` was still typed
+  `Uint32Array` in the README though it has been `Int32Array` since 1.4.1 --
+  documents `remainingCapacity()` / `clear()` / checked mode / schema validation,
+  corrects the test count (41 -> 81) and the `verify` command, adds the
+  `npm run torture` gate and the reset benchmark, and updates the "~190 lines"
+  figure. The README method reference now matches the shipped surface.
+
+### Notes
+
+- **No `onRetire` callback** (rejected in writing; see
+  [`decisions/0004`](decisions/0004-retirement-observability-and-clear.md)). A
+  callback into user code from the despawn path is the wrong shape;
+  `retiredCount` plus `remainingCapacity()` is the whole contract. Passing an
+  `onRetire` option is silently inert.
+- Hot paths unchanged: spawn's allocation path, `despawn`, `isAlive`, `add`,
+  `has`, `remove`, and the prototype `idx()` are byte-for-byte identical (proven
+  by diff). Phases A-F of the torture gate stay green at `maxMajor: 0`; `clear()`
+  holds buffer identity across the reset.
+- Docs reconciliation (AR-08) ships here rather than in a separate R4 pass, so
+  the released README documents this version's surface and no longer carries the
+  stale `dense` type or test counts.
+
 ## [1.5.0] - 2026-07-28
 
 Schema validation and data hardening. A schema that lies about its field types

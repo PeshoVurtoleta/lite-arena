@@ -16,6 +16,11 @@
  *   - Zero-GC: All buffers and free-lists are allocated once at construction.
  *     They grow only via an explicit, between-frames `reserve()` call -- never
  *     implicitly, so `spawn()` can never reallocate and invalidate hoisted refs.
+ *   - Optional checked mode (`new Arena(n, { checked: true })`): development-only
+ *     assertions -- a stale `join()` plan and a misused `idx()` throw instead of
+ *     failing silently. OFF and zero-cost in production; the hot paths (join()'s
+ *     reused scratch and the prototype `idx()`) are byte-for-byte identical
+ *     whether or not it is on.
  *
  * @module @zakkster/lite-arena
  * @author Zahary Shinikchiev
@@ -88,14 +93,43 @@ function validateSchema(schema) {
     // An empty schema is intentionally legal: registerTag() is registerComponent({}).
 }
 
+/**
+ * Checked-mode replacement for `SparseSet.prototype.idx` (AR-11). Installed as an
+ * OWN property by the SparseSet constructor ONLY when the owning arena was built
+ * with `{ checked: true }`, so the production `idx()` fast path is byte-for-byte
+ * untouched and stays monomorphic for every unchecked set. Refuses to hand back
+ * an index for an entity that is dead or does not hold this component -- the exact
+ * precondition the unchecked `idx()` trusts the caller to have already met.
+ *
+ * @this {SparseSet}
+ * @param {number} entity
+ * @returns {number}
+ */
+function checkedIdx(entity) {
+    if (!this.has(entity)) {
+        throw new Error(
+            'lite-arena: idx() in checked mode was called on an entity that is dead or does ' +
+            'not hold this component. idx() is an UNCHECKED fast path -- guard it with has(), ' +
+            'or iterate dense[0..count). (checked mode; OFF and zero-cost in production.)');
+    }
+    return this.sparse[entity & INDEX_MASK];
+}
+
 export class Arena {
     /**
      * Allocates the memory pools for the ECS universe. Call once at setup.
      * @param {number} maxEntities - Hard cap on living entities. Must be an
      *   integer in the range [1, 1048575]. Values outside this range throw.
+     * @param {{ checked?: boolean }} [options] - Optional. `checked: true` turns
+     *   on development-mode assertions that are OFF and zero-cost in production:
+     *   `join()` returns a plan that throws if read after a later `join()`
+     *   superseded it, and `idx()` throws on an entity that is dead or lacks the
+     *   component. Leave it off in shipping builds -- the production hot paths
+     *   (join()'s reused scratch and the prototype `idx()`) are byte-for-byte
+     *   unaffected by this flag.
      * @throws {Error} If `maxEntities` is not an integer in [1, 1048575].
      */
-    constructor(maxEntities) {
+    constructor(maxEntities, options) {
         if (!Number.isInteger(maxEntities) || maxEntities < 1 || maxEntities > INDEX_MASK) {
             throw new Error(`lite-arena: maxEntities must be an integer in [1, ${INDEX_MASK}], got ${maxEntities}`);
         }
@@ -129,6 +163,16 @@ export class Arena {
         // per-system planner -- hands back references without allocating on any
         // call. Mutated in place and returned; see join() for the reuse contract.
         this._joinResult = { driver: null, other: null, count: 0 };
+
+        // Optional development-mode assertions (AR-09 / AR-11). OFF by default and
+        // never consulted on any production hot path. When on: join() hands back a
+        // staleness-checked plan and every SparseSet gets a validating idx().
+        this._checked = !!(options && options.checked === true);
+
+        // Monotonic version stamp for join() plans, bumped on every checked join()
+        // so a plan read after a subsequent join() throws instead of silently
+        // reporting the newer join's driver/other/count. Unused when not checked.
+        this._joinEpoch = 0 | 0;
     }
 
     /**
@@ -139,7 +183,7 @@ export class Arena {
      * @throws {Error} If the arena is full.
      */
     spawn() {
-        if (this.freeHead === INDEX_MASK) throw new Error("lite-arena: out of memory");
+        if (this.freeHead === INDEX_MASK) throw this._exhausted();
 
         const index = this.freeHead;
         this.freeHead = this.freeList[index];
@@ -155,6 +199,37 @@ export class Arena {
         // range and into heap-boxed doubles -- an allocation on the spawn path.
         // The signed handle is correct; the container carries the signedness.
         return (gen << 20) | index;
+    }
+
+    /**
+     * COLD: builds the Error thrown by `spawn()` when no slot is free. Split out
+     * so spawn()'s already-cold exhaustion branch carries only `throw
+     * this._exhausted()` and its allocation path stays byte-for-byte unchanged.
+     *
+     * Names the CAUSE. A genuinely full arena and a retirement-shrunk arena both
+     * leave `freeHead` at the sentinel, but they are different problems: the first
+     * wants more capacity, the second is churning a single slot to generation
+     * exhaustion -- and there `activeCount` can be 0 while spawn() throws, which
+     * without this message reads as a phantom leak. Both counts are reported
+     * inline so the reader is not sent hunting for a leak a retired arena
+     * does not have.
+     * @returns {Error}
+     */
+    _exhausted() {
+        if (this.retiredCount > 0) {
+            return new Error(
+                `lite-arena: out of memory -- no free slot. capacity=${this.capacity}, ` +
+                `activeCount=${this.activeCount}, retiredCount=${this.retiredCount}. ` +
+                `${this.retiredCount} slot(s) were permanently retired by generation ` +
+                'exhaustion (fail-closed rollover; see retiredCount and ' +
+                'decisions/0001-generational-rollover.md), so this arena holds at most ' +
+                'capacity - retiredCount concurrent entities. Stop churning a single slot, ' +
+                'or raise capacity with reserve().');
+        }
+        return new Error(
+            `lite-arena: out of memory -- no free slot. capacity=${this.capacity}, ` +
+            `activeCount=${this.activeCount}, retiredCount=0. The arena is full; despawn ` +
+            'entities or raise capacity with reserve().');
     }
 
     /**
@@ -210,6 +285,25 @@ export class Arena {
         this.freeHead = index;
 
         return true;
+    }
+
+    /**
+     * O(1) count of further entities that can be spawned right now:
+     * `capacity - activeCount - retiredCount`. Equivalently the length of the
+     * free list -- every slot is in exactly one of three states (live, free, or
+     * retired), so `activeCount + retiredCount + remainingCapacity() === capacity`
+     * holds at all times.
+     *
+     * Distinct from spare ADDRESS space: retirement (fail-closed rollover)
+     * permanently withdraws slots, so a long-running arena's remainingCapacity()
+     * can fall below `capacity - activeCount`. A `0` here with a low `activeCount`
+     * and a non-zero `retiredCount` means slots have retired, NOT that the arena
+     * is full -- the same distinction `spawn()`'s exhaustion throw now names.
+     *
+     * @returns {number} Slots available for `spawn()`; never negative.
+     */
+    remainingCapacity() {
+        return (this.capacity - this.activeCount - this.retiredCount) | 0;
     }
 
     /**
@@ -273,6 +367,14 @@ export class Arena {
             r.driver = a; r.other = b; r.count = a.count;
         } else {
             r.driver = b; r.other = a; r.count = b.count;
+        }
+        // Production: hand back the reused scratch, zero allocation (Phase C proves
+        // it -- the branch below is predicted-false and never runs). Checked mode:
+        // stamp a fresh, staleness-guarded plan (AR-09) so a read after the next
+        // join() throws instead of silently returning the newer plan's fields.
+        if (this._checked) {
+            this._joinEpoch = (this._joinEpoch + 1) | 0;
+            return new CheckedJoinPlan(this, this._joinEpoch, r.driver, r.other, r.count);
         }
         return r;
     }
@@ -342,6 +444,55 @@ export class Arena {
         this.capacity = newCapacity | 0;
         return true;
     }
+
+    /**
+     * Resets the arena to empty WITHOUT reallocating -- rebuilds the free list,
+     * advances every generation, revives every retired slot, and drops every
+     * registered component's `count` to 0. O(capacity); a cold, between-frames
+     * operation, never a per-frame call. Allocates nothing: it only overwrites
+     * buffers that already exist.
+     *
+     * HANDLE POLICY (decided; see decisions/0004): every entity handle minted
+     * before `clear()` is INVALID afterward. clear() advances each slot's
+     * generation, so `isAlive()` rejects every pre-clear handle -- the honest
+     * contract of a reset. Retired slots are REVIVED by the same step (their
+     * poison generation maps back into the live range), so the arena regains its
+     * full capacity and `retiredCount` returns to 0. Do not retain or test any
+     * pre-clear handle across a clear().
+     */
+    clear() {
+        const cap = this.capacity;
+        const gens = this.generations;
+        const free = this.freeList;
+
+        // Advance every generation into a fresh LIVE value in [1, GEN_MASK]. The
+        // map g -> (g % GEN_MASK) + 1 does three jobs at once: it bumps a live slot
+        // (so its outstanding handle no longer matches isAlive), it wraps
+        // GEN_MASK -> 1, and it revives a retired slot (poison GEN_MASK+1 -> 2)
+        // back into a spawnable generation. The result is never 0 (which isAlive
+        // rejects) and never GEN_MASK+1 (retired), and always differs from the
+        // slot's pre-clear value -- so every slot ends live and reusable, and every
+        // pre-clear handle is rejected.
+        for (let i = 0; i < cap; i++) {
+            gens[i] = (gens[i] % GEN_MASK) + 1;
+        }
+
+        // Rebuild the implicit free list across the whole capacity -- revived slots
+        // included -- exactly as the constructor laid it out.
+        for (let i = 0; i < cap - 1; i++) free[i] = (i + 1) | 0;
+        free[cap - 1] = INDEX_MASK;
+        this.freeHead = 0 | 0;
+
+        // Empty every component without touching a buffer: the tail at
+        // [count, capacity) is undefined by the SparseSet contract, so dropping
+        // count to 0 is a complete logical reset with zero allocation.
+        for (let i = 0; i < this.components.length; i++) {
+            this.components[i].count = 0 | 0;
+        }
+
+        this.activeCount = 0 | 0;
+        this.retiredCount = 0 | 0;
+    }
 }
 
 export class SparseSet {
@@ -400,6 +551,13 @@ export class SparseSet {
             const key = keys[i];
             const TypedArrayConstructor = schema[key];
             this.data[key] = new TypedArrayConstructor(maxEntities);
+        }
+
+        // AR-11: in checked mode only, shadow the prototype idx() with a validating
+        // one, installed as an OWN property so the production idx() fast path is
+        // never touched and stays monomorphic for every unchecked set. See checkedIdx.
+        if (arena._checked) {
+            this.idx = checkedIdx;
         }
     }
 
@@ -519,4 +677,38 @@ export class SparseSet {
             this.data[key] = grown;
         }
     }
+}
+
+/**
+ * Checked-mode wrapper for a `join()` plan (AR-09). Only ever constructed when
+ * the arena was created with `{ checked: true }`; production `join()` returns the
+ * plain reused scratch and never allocates one of these. It snapshots the plan
+ * and validates on every field read that no later `join()` has superseded it --
+ * the reused-scratch contract ("consume before the next join()") made loud
+ * instead of silently handing back the newer join's driver/other/count.
+ *
+ * Structurally a `{ driver, other, count }`, so it is a drop-in for the
+ * production scratch at every call site.
+ */
+class CheckedJoinPlan {
+    constructor(arena, epoch, driver, other, count) {
+        this._arena = arena;
+        this._epoch = epoch;
+        this._driver = driver;
+        this._other = other;
+        this._count = count;
+    }
+
+    _live() {
+        if (this._arena._joinEpoch !== this._epoch) {
+            throw new Error(
+                'lite-arena: stale join() plan read. A later join() on this arena superseded ' +
+                'it -- the plan is a single-use scratch; read driver/other/count (or run your ' +
+                'loop) before calling join() again. (checked mode.)');
+        }
+    }
+
+    get driver() { this._live(); return this._driver; }
+    get other()  { this._live(); return this._other; }
+    get count()  { this._live(); return this._count; }
 }
