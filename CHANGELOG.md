@@ -54,6 +54,14 @@ this is pure single-thread ECS ergonomics. See
 - The six hot methods (`spawn` / `despawn` / `add` / `has` / `remove` / `idx`)
   are byte-for-byte identical to 1.8.0.
 
+### Demo (not shipped -- `demo/` is excluded from the npm tarball)
+
+- The gravity-well demo's gold-ring highlight now runs a live `joinN` query,
+  `Sparkle AND Position, NOT Faded`, in both arena-family backends: a particle is
+  tagged `Faded` once it passes its half-life, and the NOT clause drops it from
+  the ring mid-life -- the 1.9.0 exclusion join doing visible work every frame.
+  A HUD row shows the live match count. Demo-only; no version change.
+
 ## [1.8.0] - 2026-07-29
 
 Transferable-`ArrayBuffer` round-trip -- the cross-thread half of the S-track,

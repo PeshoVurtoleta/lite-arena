@@ -2,8 +2,12 @@
 <html lang="en">
 <head>
     <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>@zakkster/lite-arena — 50,000 particles</title>
     <style>
+        /* Hex is the universal fallback (below); browsers that support oklch()
+           get the wide-gamut, perceptually-even palette via the @supports block.
+           Values are the exact oklch equivalents of these hex colors. */
         :root {
             --bg: #0a0e14;
             --fg: #d8dee9;
@@ -12,6 +16,18 @@
             --accent2: #ebcb8b;
             --bad: #bf616a;
             --good: #a3be8c;
+        }
+
+        @supports (color: oklch(0% 0 0)) {
+            :root {
+                --bg: oklch(16.2% 0.014 258.4);
+                --fg: oklch(89.9% 0.016 262.7);
+                --dim: oklch(45.2% 0.035 264.1);
+                --accent: oklch(77.5% 0.062 217.5);
+                --accent2: oklch(85.5% 0.089 84.1);
+                --bad: oklch(60.6% 0.121 15.3);
+                --good: oklch(76.8% 0.075 131.1);
+            }
         }
 
         * {
@@ -32,16 +48,22 @@
         canvas {
             display: block;
             cursor: crosshair;
+            /* Pointer drags steer gravity; stop the browser stealing the
+               gesture for scroll/zoom on touch devices. */
+            touch-action: none;
         }
 
         #ui {
             position: fixed;
-            top: 16px;
-            left: 16px;
+            top: clamp(8px, 2vw, 16px);
+            left: clamp(8px, 2vw, 16px);
+            /* Width tracks the viewport instead of a fixed 280px block: narrow
+               on phones, capped on desktop so it never hogs the canvas. */
+            width: clamp(210px, 24vw, 320px);
+            max-width: calc(100vw - 2 * clamp(8px, 2vw, 16px));
             background: rgba(10, 14, 20, 0.85);
             border: 1px solid var(--dim);
-            padding: 16px 18px;
-            min-width: 280px;
+            padding: clamp(10px, 1.6vw, 16px) clamp(12px, 1.7vw, 18px);
             backdrop-filter: blur(8px);
         }
 
@@ -129,6 +151,7 @@
         <div class="row"><span class="label">Backend</span><span class="val" id="s-backend">lite-arena</span></div>
         <div class="row"><span class="label">Physics</span><span class="val" id="s-physics">main thread</span></div>
         <div class="row"><span class="label">Particles</span><span class="val" id="s-count">0</span></div>
+        <div class="row"><span class="label">joinN match</span><span class="val" id="s-query">—</span></div>
         <div class="row"><span class="label">FPS</span><span class="val" id="s-fps">—</span></div>
         <div class="row"><span class="label">Frame budget</span><span class="val" id="s-budget">—</span></div>
         <div class="row"><span class="label">JS heap (MB)</span><span class="val" id="s-heap">—</span></div>
@@ -148,7 +171,10 @@
             <button id="b-clear">clear</button>
         </div>
     </div>
-    <div id="info">Drag mouse to move gravity. Scroll to adjust strength.</div>
+    <div id="info">Drag (mouse or touch) to move gravity. Scroll to adjust strength.<br>
+        Gold rings = joinN(Sparkle AND Pos, NOT Faded): a sparkle keeps its ring
+        for the first half of its life, then loses it once it passes the
+        half-life and the NOT clause excludes it.</div>
 </div>
 
 <script type="module">
@@ -160,6 +186,21 @@
 
     const MAX = 100_000;
 
+    // Canvas fillStyle has no @supports mechanism: assigning an unsupported
+    // oklch() string is silently IGNORED (the previous color stays -- a
+    // fail-OPEN wrong paint). So pick the palette form ONCE, fail closed: oklch
+    // where the browser supports it, the exact hex equivalent otherwise. These
+    // mirror the CSS :root palette (accent/accent2/good/bad) plus the Worker
+    // backend's teal.
+    const OKLCH = window.CSS && CSS.supports('color', 'oklch(0% 0 0)');
+    const COL = {
+        accent:  OKLCH ? 'oklch(77.5% 0.062 217.5)' : '#88c0d0',
+        accent2: OKLCH ? 'oklch(85.5% 0.089 84.1)'  : '#ebcb8b',
+        good:    OKLCH ? 'oklch(76.8% 0.075 131.1)' : '#a3be8c',
+        bad:     OKLCH ? 'oklch(60.6% 0.121 15.3)'  : '#bf616a',
+        worker:  OKLCH ? 'oklch(76.3% 0.048 194.5)' : '#8fbcbb',
+    };
+
     function makeArenaBackend() {
         const arena = new Arena(MAX);
         const Pos = arena.registerComponent({x: Float32Array, y: Float32Array});
@@ -168,8 +209,21 @@
         // 1.3.0: a zero-size TAG component. ~3% of particles are "sparkling".
         // It carries no data -- membership only -- so it costs one dense array.
         const Sparkle = arena.registerTag();
+        // 1.9.0: a second tag, added ONCE when a particle passes its half-life
+        // (t > 4.0 of the 8.0 death age). The highlight excludes it -- a NOT
+        // clause you can watch remove a sparkle from the ring mid-life.
+        const Faded = arena.registerTag();
+        // joinN inputs, hoisted ONCE per backend (never per frame): the highlight
+        // is "Sparkle AND Pos, NOT Faded". draw() reads these arrays; it never
+        // rebuilds them, so the call stays allocation-free.
+        const REQ = [Sparkle, Pos];
+        const EXC = [Faded];
+        let matched = 0;
         return {
             name: 'lite-arena',
+            get matched() {
+                return matched;
+            },
             spawn(x, y, vx, vy) {
                 try {
                     const e = arena.spawn();
@@ -206,6 +260,9 @@
                     px[i] += vx[i] * dt;
                     py[i] += vy[i] * dt;
                     lt[i] += dt;
+                    // Cross into Faded once, at the half-life. Tagging a separate
+                    // set does not disturb this walk over Pos.
+                    if (lt[i] > 4.0 && !Faded.has(Pos.dense[i])) Faded.add(Pos.dense[i]);
                 }
                 // Pass 2: despawn aged-out particles. Walk backward; swap-and-pop
                 // moves the tail in, but tail is already processed for this frame.
@@ -217,7 +274,7 @@
                 const n = Pos.count;
                 const px = Pos.data.x, py = Pos.data.y;
                 const lt = Life.data.t;
-                ctx.fillStyle = '#88c0d0';
+                ctx.fillStyle = COL.accent;
                 for (let i = 0; i < n; i++) {
                     const a = 1 - lt[i] / 8.0;
                     ctx.globalAlpha = a > 0 ? a : 0;
@@ -225,20 +282,31 @@
                 }
                 ctx.globalAlpha = 1;
 
-                // 1.3.0: rarest-first JOIN. Highlight every sparkling particle
-                // that still has a Position. join() hands back the smaller of
-                // the two sets as the driver (always Sparkle here, since it is a
-                // subset of Pos) plus the other set to has()-check -- it does
-                // NOT iterate. We write the tight loop; it allocates nothing.
-                const j = arena.join(Sparkle, Pos);
-                const drv = j.driver, oth = j.other, m = j.count;
-                ctx.fillStyle = '#ebcb8b';
+                // 1.9.0: rarest-first joinN with a live NOT clause. Highlight
+                // every sparkling particle that still has a Position and has NOT
+                // yet passed its half-life (Faded). joinN picks the GLOBAL-min
+                // set as the driver (Sparkle, the rarest here), hands back the
+                // other required sets to has()-check and the excluded sets to
+                // !has()-check -- it does NOT iterate. We write the tight loop; it
+                // allocates nothing. (join(a, b) is the 2-way special case of
+                // this: joinN([a], []) -- one required, none excluded.)
+                const p = arena.joinN(REQ, EXC);
+                const drv = p.driver, m = p.count;
+                const oth = p.others, no = p.othersCount;
+                const ex = p.excl, nx = p.exclCount;
+                let hit = 0;
+                ctx.fillStyle = COL.accent2;
                 for (let i = 0; i < m; i++) {
                     const e = drv.dense[i];
-                    if (!oth.has(e)) continue;      // gone this frame -> skip
-                    const pi = oth.idx(e);
+                    let ok = true;
+                    for (let k = 0; k < no; k++) if (!oth[k].has(e)) { ok = false; break; }
+                    if (ok) for (let k = 0; k < nx; k++) if (ex[k].has(e)) { ok = false; break; }
+                    if (!ok) continue;              // missing a required, or excluded -> skip
+                    const pi = Pos.idx(e);
                     ctx.fillRect((px[pi] | 0) - 1, (py[pi] | 0) - 1, 4, 4);
+                    hit++;
                 }
+                matched = hit;
             },
             get count() {
                 return Pos.count;
@@ -275,7 +343,7 @@
                 }
             },
             draw(ctx) {
-                ctx.fillStyle = '#ebcb8b';
+                ctx.fillStyle = COL.accent2;
                 for (let i = 0; i < arr.length; i++) {
                     const p = arr[i];
                     const a = 1 - p.t / 8.0;
@@ -319,7 +387,7 @@
                 for (const id of dead) m.delete(id);
             },
             draw(ctx) {
-                ctx.fillStyle = '#bf616a';
+                ctx.fillStyle = COL.bad;
                 for (const p of m.values()) {
                     const a = 1 - p.t / 8.0;
                     ctx.globalAlpha = a > 0 ? a : 0;
@@ -356,6 +424,12 @@
         const Vel = arena.registerComponent({vx: Float32Array, vy: Float32Array});
         const Life = arena.registerComponent({t: Float32Array});
         const Sparkle = arena.registerTag();
+        // 1.9.0: same half-life NOT-clause tag as the main-thread backend.
+        const Faded = arena.registerTag();
+        // joinN inputs, hoisted once (see makeArenaBackend): Sparkle AND Pos, NOT Faded.
+        const REQ = [Sparkle, Pos];
+        const EXC = [Faded];
+        let matched = 0;
         const worker = new Worker('./worker.js', {type: 'module'});
         let roundtrips = 0;
         // Return leg: the four buffers are home again — re-adopt them. Partial,
@@ -386,6 +460,9 @@
             get roundtrips() {
                 return roundtrips;
             },
+            get matched() {
+                return matched;
+            },
             spawn(x, y, vx, vy) {
                 if (!home()) return -1;
                 try {
@@ -411,7 +488,11 @@
                 if (!home()) return;
                 const n = Pos.count;
                 const lt = Life.data.t;
-                for (let i = 0; i < n; i++) lt[i] += dt;
+                for (let i = 0; i < n; i++) {
+                    lt[i] += dt;
+                    // Half-life crossing -> Faded, exactly as the main-thread backend.
+                    if (lt[i] > 4.0 && !Faded.has(Pos.dense[i])) Faded.add(Pos.dense[i]);
+                }
                 for (let i = n - 1; i >= 0; i--) {
                     if (lt[i] > 8.0) arena.despawn(Pos.dense[i]);
                 }
@@ -422,7 +503,7 @@
                 if (!home()) return;
                 const n = Pos.count;
                 const px = Pos.data.x, py = Pos.data.y, lt = Life.data.t;
-                ctx.fillStyle = '#8fbcbb';
+                ctx.fillStyle = COL.worker;
                 for (let i = 0; i < n; i++) {
                     const a = 1 - lt[i] / 8.0;
                     ctx.globalAlpha = a > 0 ? a : 0;
@@ -430,16 +511,26 @@
                 }
                 ctx.globalAlpha = 1;
 
-                // Same rarest-first JOIN highlight as the main-thread backend.
-                const j = arena.join(Sparkle, Pos);
-                const drv = j.driver, oth = j.other, m = j.count;
-                ctx.fillStyle = '#ebcb8b';
+                // Same rarest-first joinN highlight as the main-thread backend:
+                // Sparkle AND Pos, NOT Faded. Buffers are HOME here (draw only
+                // runs when home()), so the join reads live Pos data.
+                const p = arena.joinN(REQ, EXC);
+                const drv = p.driver, m = p.count;
+                const oth = p.others, no = p.othersCount;
+                const ex = p.excl, nx = p.exclCount;
+                let hit = 0;
+                ctx.fillStyle = COL.accent2;
                 for (let i = 0; i < m; i++) {
                     const e = drv.dense[i];
-                    if (!oth.has(e)) continue;
-                    const pi = oth.idx(e);
+                    let ok = true;
+                    for (let k = 0; k < no; k++) if (!oth[k].has(e)) { ok = false; break; }
+                    if (ok) for (let k = 0; k < nx; k++) if (ex[k].has(e)) { ok = false; break; }
+                    if (!ok) continue;
+                    const pi = Pos.idx(e);
                     ctx.fillRect((px[pi] | 0) - 1, (py[pi] | 0) - 1, 4, 4);
+                    hit++;
                 }
+                matched = hit;
             },
             // Hand the payload off for the NEXT integration step — AFTER drawing
             // this frame's home state. Zero-copy transfer; buffers go detached
@@ -482,12 +573,28 @@
     let gravityX = innerWidth / 2, gravityY = innerHeight / 2;
     let gravityStr = 8000;
 
-    cv.addEventListener('mousemove', (e) => {
-        if (e.buttons === 1) {
-            gravityX = e.clientX;
-            gravityY = e.clientY;
-        }
+    // Pointer events unify mouse, touch, and pen -- so drag-to-steer works on
+    // phones and tablets, not just with a mouse button held. Capture the pointer
+    // so a drag that slides off the canvas keeps moving the well.
+    let dragging = false;
+    cv.addEventListener('pointerdown', (e) => {
+        dragging = true;
+        cv.setPointerCapture(e.pointerId);
+        gravityX = e.clientX;
+        gravityY = e.clientY;
     });
+    cv.addEventListener('pointermove', (e) => {
+        if (!dragging) return;
+        gravityX = e.clientX;
+        gravityY = e.clientY;
+    });
+    const endDrag = (e) => {
+        dragging = false;
+        if (cv.hasPointerCapture(e.pointerId)) cv.releasePointerCapture(e.pointerId);
+    };
+    cv.addEventListener('pointerup', endDrag);
+    cv.addEventListener('pointercancel', endDrag);
+    // Wheel still adjusts gravity strength on desktop (no-op where absent).
     cv.addEventListener('wheel', (e) => {
         gravityStr = Math.max(500, Math.min(40_000, gravityStr - e.deltaY * 20));
         e.preventDefault();
@@ -541,6 +648,7 @@
     const sBudget = document.getElementById('s-budget');
     const sHeap = document.getElementById('s-heap');
     const sPhysics = document.getElementById('s-physics');
+    const sQuery = document.getElementById('s-query');
 
     function loop(now) {
         const dt = Math.min(0.05, (now - lastT) / 1000);
@@ -575,7 +683,7 @@
         const t1 = performance.now();
 
         // Gravity-well marker.
-        ctx.strokeStyle = '#a3be8c';
+        ctx.strokeStyle = COL.good;
         ctx.lineWidth = 1;
         ctx.beginPath();
         ctx.arc(gravityX, gravityY, 8, 0, Math.PI * 2);
@@ -594,6 +702,10 @@
             sPhysics.textContent = backend.offthread
                 ? 'Worker thread (' + backend.roundtrips.toLocaleString() + ' round-trips)'
                 : 'main thread';
+            // joinN highlight count -- only the arena-family backends run it.
+            sQuery.textContent = backend.matched !== undefined
+                ? backend.matched.toLocaleString()
+                : '—';
         }
         sCount.textContent = backend.count.toLocaleString();
 

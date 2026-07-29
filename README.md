@@ -532,6 +532,13 @@ Controls:
 | `+1k` / `+10k` / `clear` | Add particles, or reset the active backend |
 | Mode buttons | Switch between lite-arena / lite-arena + Worker / Array / Map backends |
 
+The gold rings mark a live `joinN` query running every frame in the arena-family
+backends: **Sparkle AND Position, NOT Faded**. Roughly 3% of particles are tagged
+`Sparkle` and gain a ring; once a particle passes its half-life it is tagged
+`Faded`, and the exclusion (`NOT Faded`) drops it from the ring for the rest of
+its life. The `joinN match` HUD row is that query's live count — the 1.9.0
+N-way / exclusion join doing visible work, not a stat you have to trust.
+
 ---
 
 ## Browser & engine compatibility
