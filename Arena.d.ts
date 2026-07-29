@@ -64,6 +64,28 @@ export interface JoinPlan {
     count: number;
 }
 
+/**
+ * The scratch object returned by {@link Arena.joinN} -- the k-way generalization
+ * of {@link JoinPlan}. `driver` is the rarest of the `required` sets (iterate its
+ * `dense[0..count)`); `others[0..othersCount)` are the remaining required sets to
+ * `has()`-check; `excl[0..exclCount)` are the excluded sets to `!has()`-check.
+ *
+ * `others` and `excl` are grow-once scratch arrays reused across calls: loop to
+ * `othersCount`/`exclCount`, NEVER `others.length` (a larger prior call may leave
+ * a stale tail). Like {@link JoinPlan}, the whole object is reused -- consume it
+ * before the next `join()`/`joinN()` on the same arena; never retain it. In
+ * checked mode, reading any field after a later `join()`/`joinN()` superseded it
+ * throws (both share one epoch).
+ */
+export interface JoinNPlan {
+    driver: SparseSet<any>;
+    count: number;
+    others: SparseSet<any>[];
+    othersCount: number;
+    excl: SparseSet<any>[];
+    exclCount: number;
+}
+
 export class Arena {
     /** Hard cap on total entities, as passed to the constructor. */
     readonly capacity: number;
@@ -184,6 +206,27 @@ export class Arena {
      * @returns The reused {@link JoinPlan}: `{ driver, other, count }`.
      */
     join(a: SparseSet<any>, b: SparseSet<any>): JoinPlan;
+
+    /**
+     * Cold-path planner for a k-way join with exclusions: "entities in every
+     * `required` set AND in none of the `excluded` sets". The k-input
+     * generalization of {@link Arena.join}; the two-set `join` is untouched.
+     * Returns references (not an iterator) so the caller writes the tight loop;
+     * picks the rarest `required` set as `driver` (ties favour the first).
+     * Allocates nothing in steady state -- the returned object and its `others`/
+     * `excl` arrays are reused scratch (the arrays grow once to their high-water
+     * mark). Consume before the next `join()`/`joinN()`.
+     *
+     * Fail-closed: throws if `required` is empty or null (there is no honest
+     * result for zero required sets). `excluded` omitted or null is the empty
+     * list. A set that is both required and excluded yields the empty match (and
+     * throws in checked mode).
+     *
+     * @param required Non-empty; entities must be in ALL of these.
+     * @param excluded Entities must be in NONE of these (default: empty).
+     * @returns The reused {@link JoinNPlan}.
+     */
+    joinN(required: SparseSet<any>[], excluded?: SparseSet<any>[]): JoinNPlan;
 
     /**
      * Explicit, opt-in capacity growth -- the ONLY way the universe grows.

@@ -798,6 +798,224 @@ test('Arena: join > handles empty and equal components without special-casing', 
 });
 
 // -----------------------------------------------------------------
+// Arena: joinN -- k-way AND + exclusion planner (S7, 1.9.0)
+// -----------------------------------------------------------------
+
+// Runs the canonical joinN loop against a plan and returns the matched
+// entities as a sorted array -- the exact loop shape the docs bless.
+function runJoinN(p) {
+    const drv = p.driver, n = p.count;
+    const oth = p.others, no = p.othersCount;
+    const ex = p.excl, nx = p.exclCount;
+    const got = [];
+    for (let i = 0; i < n; i++) {
+        const e = drv.dense[i];
+        let ok = true;
+        for (let k = 0; k < no; k++) if (!oth[k].has(e)) { ok = false; break; }
+        if (ok) for (let k = 0; k < nx; k++) if (ex[k].has(e)) { ok = false; break; }
+        if (ok) got.push(e);
+    }
+    return got.sort((x, y) => x - y);
+}
+
+test('Arena: joinN > k-way AND matches every required set (oracle)', () => {
+    const arena = new Arena(64);
+    const A = arena.registerTag();
+    const B = arena.registerTag();
+    const C = arena.registerComponent({ v: Float32Array });
+
+    const ents = [];
+    for (let i = 0; i < 30; i++) {
+        const e = arena.spawn();
+        ents.push(e);
+        A.add(e);                    // A: all 30
+        if (i % 2 === 0) B.add(e);   // B: 15
+        if (i % 3 === 0) C.add(e);   // C: 10  (rarest required)
+    }
+
+    const oracle = ents.filter((e) => A.has(e) && B.has(e) && C.has(e))
+        .sort((x, y) => x - y);
+    const p = arena.joinN([A, B, C]);
+    assert.equal(p.driver, C, 'the globally rarest required set must drive');
+    assert.equal(p.count, C.count);
+    assert.deepEqual(runJoinN(p), oracle);
+});
+
+test('Arena: joinN > exclusion removes entities in any excluded set (oracle)', () => {
+    const arena = new Arena(64);
+    const A = arena.registerTag();
+    const B = arena.registerTag();
+    const D = arena.registerTag();   // excluded
+
+    const ents = [];
+    for (let i = 0; i < 30; i++) {
+        const e = arena.spawn();
+        ents.push(e);
+        A.add(e);
+        if (i % 2 === 0) B.add(e);
+        if (i % 5 === 0) D.add(e);   // 0,5,10,15,20,25 excluded
+    }
+
+    const oracle = ents.filter((e) => A.has(e) && B.has(e) && !D.has(e))
+        .sort((x, y) => x - y);
+    const p = arena.joinN([A, B], [D]);
+    assert.deepEqual(runJoinN(p), oracle);
+});
+
+test('Arena: joinN > multiple exclusions: NONE of the excluded sets may contain e', () => {
+    const arena = new Arena(64);
+    const A = arena.registerTag();
+    const D1 = arena.registerTag();
+    const D2 = arena.registerTag();
+
+    const ents = [];
+    for (let i = 0; i < 24; i++) {
+        const e = arena.spawn();
+        ents.push(e);
+        A.add(e);
+        if (i % 3 === 0) D1.add(e);
+        if (i % 4 === 0) D2.add(e);
+    }
+
+    const oracle = ents.filter((e) => A.has(e) && !D1.has(e) && !D2.has(e))
+        .sort((x, y) => x - y);
+    const p = arena.joinN([A], [D1, D2]);
+    assert.deepEqual(runJoinN(p), oracle);
+});
+
+test('Arena: joinN > driver is the global min; ties favour the first required set', () => {
+    const arena = new Arena(32);
+    const A = arena.registerTag();
+    const B = arena.registerTag();
+    const C = arena.registerTag();
+    const e = arena.spawn(), f = arena.spawn(), g = arena.spawn();
+    // A: 3, B: 2, C: 2 (B and C tie for min; B appears first)
+    A.add(e); A.add(f); A.add(g);
+    B.add(e); B.add(f);
+    C.add(e); C.add(f);
+    assert.equal(arena.joinN([A, B, C]).driver, B, 'min-count, ties favour first');
+    assert.equal(arena.joinN([A, C, B]).driver, C, 'reorder -> the earlier tied set drives');
+    assert.equal(arena.joinN([A]).driver, A, 'single required set drives itself');
+});
+
+test('Arena: joinN > excluded omitted is the empty NOT list', () => {
+    const arena = new Arena(16);
+    const A = arena.registerTag();
+    const e = arena.spawn(), f = arena.spawn();
+    A.add(e); A.add(f);
+    const p = arena.joinN([A]);
+    assert.equal(p.exclCount, 0);
+    assert.equal(p.othersCount, 0);
+    assert.equal(p.count, 2);
+    assert.deepEqual(runJoinN(p), [e, f].sort((x, y) => x - y));
+});
+
+test('Arena: joinN > fail-closed: empty or null required throws (null is not zero)', () => {
+    const arena = new Arena(8);
+    const A = arena.registerTag();
+    assert.throws(() => arena.joinN([]), /at least one required set/);
+    assert.throws(() => arena.joinN(null), /at least one required set/);
+    assert.throws(() => arena.joinN(undefined), /at least one required set/);
+    // A valid single-set join still works (guards do not over-fire).
+    arena.joinN([A]);
+});
+
+test('Arena: joinN > contradiction (set both required and excluded) yields empty in production', () => {
+    const arena = new Arena(32);
+    const A = arena.registerTag();
+    const B = arena.registerTag();
+    for (let i = 0; i < 10; i++) { const e = arena.spawn(); A.add(e); B.add(e); }
+    // B is required AND excluded -> every driver element is excluded -> empty.
+    const p = arena.joinN([A, B], [B]);
+    assert.deepEqual(runJoinN(p), []);
+});
+
+test('Arena: joinN > returned object is a reused scratch, not a fresh allocation', () => {
+    const arena = new Arena(8);
+    const A = arena.registerTag();
+    const B = arena.registerTag();
+    const r1 = arena.joinN([A, B]);
+    const r2 = arena.joinN([A, B]);
+    assert.equal(r1, r2, 'unchecked joinN() must hand back the one reused scratch');
+});
+
+test('Arena: joinN > scratch arrays carry a stale tail; only othersCount/exclCount is live', () => {
+    const arena = new Arena(16);
+    const A = arena.registerTag();
+    const B = arena.registerTag();
+    const C = arena.registerTag();
+    const D = arena.registerTag();
+    // A larger call grows the scratch high-water mark...
+    const big = arena.joinN([A, B, C], [D]);
+    assert.equal(big.othersCount, 2);
+    assert.equal(big.exclCount, 1);
+    // ...a smaller call reuses the SAME arrays with a shorter live prefix.
+    const small = arena.joinN([A]);
+    assert.equal(small.othersCount, 0);
+    assert.equal(small.exclCount, 0);
+    assert.equal(small.others, big.others, 'same reused backing array');
+    assert.ok(small.others.length >= 2, 'stale tail is retained, not reallocated');
+});
+
+test('Arena: joinN > checked mode: plan read after a later join/joinN throws', () => {
+    const arena = new Arena(16, { checked: true });
+    const A = arena.registerTag();
+    const B = arena.registerTag();
+    const e = arena.spawn(); A.add(e); B.add(e);
+
+    const p1 = arena.joinN([A, B]);
+    arena.joinN([A]);                          // supersede via joinN
+    assert.throws(() => p1.count, /stale joinN/);
+    assert.throws(() => p1.driver, /stale joinN/);
+    assert.throws(() => p1.others, /stale joinN/);
+
+    const p2 = arena.joinN([A, B]);
+    arena.join(A, B);                          // supersede via the 2-way join (shared epoch)
+    assert.throws(() => p2.count, /stale joinN/);
+});
+
+test('Arena: joinN > checked mode: foreign set throws', () => {
+    const arena = new Arena(16, { checked: true });
+    const A = arena.registerTag();
+    const other = new Arena(16, { checked: true });
+    const foreign = other.registerTag();
+    assert.throws(() => arena.joinN([A, foreign]), /foreign SparseSet/);
+    assert.throws(() => arena.joinN([A], [foreign]), /foreign SparseSet/);
+});
+
+test('Arena: joinN > checked mode: set both required and excluded throws', () => {
+    const arena = new Arena(16, { checked: true });
+    const A = arena.registerTag();
+    const B = arena.registerTag();
+    assert.throws(() => arena.joinN([A, B], [B]), /both required and excluded/);
+});
+
+test('Arena: joinN > checked mode OFF by default hands back the reused scratch', () => {
+    const arena = new Arena(16);   // no { checked: true }
+    const A = arena.registerTag();
+    const B = arena.registerTag();
+    arena.spawn();
+    const j1 = arena.joinN([A, B]);
+    const j2 = arena.joinN([A, B]);
+    assert.equal(j1, j2, 'unchecked joinN() must hand back the one reused scratch');
+});
+
+test('Arena: joinN > two-way join() is untouched: same shape and numbers as before', () => {
+    const arena = new Arena(32);
+    const A = arena.registerComponent({ v: Float32Array });
+    const B = arena.registerTag();
+    const ents = [];
+    for (let i = 0; i < 10; i++) ents.push(arena.spawn());
+    for (let i = 0; i < 10; i++) A.add(ents[i]);
+    for (let i = 0; i < 3; i++) B.add(ents[i]);
+    const j = arena.join(A, B);
+    assert.equal(j.driver, B);
+    assert.equal(j.other, A);
+    assert.equal(j.count, 3);
+    assert.equal(j.others, undefined, 'legacy join() plan has no joinN fields');
+});
+
+// -----------------------------------------------------------------
 // Arena: NON-GOALS -- no query language, no callback iteration (1.3.0)
 // -----------------------------------------------------------------
 

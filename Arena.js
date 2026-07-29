@@ -252,6 +252,20 @@ export class Arena {
         // call. Mutated in place and returned; see join() for the reuse contract.
         this._joinResult = { driver: null, other: null, count: 0 };
 
+        // Reused scratch for joinN() (S7). Same zero-alloc contract as join():
+        // the result object and its two backing arrays are allocated ONCE and
+        // reused across calls. `_joinNOthers` / `_joinNExcl` are GROWN ONCE to
+        // their high-water mark the first time a larger join appears, then never
+        // reallocated -- callers read `othersCount` / `exclCount`, never `.length`,
+        // so any stale tail beyond the live count is unobservable. See joinN().
+        this._joinNOthers = [];
+        this._joinNExcl = [];
+        this._joinNResult = {
+            driver: null, count: 0,
+            others: this._joinNOthers, othersCount: 0,
+            excl: this._joinNExcl, exclCount: 0,
+        };
+
         // Optional development-mode assertions (AR-09 / AR-11). OFF by default and
         // never consulted on any production hot path. When on: join() hands back a
         // staleness-checked plan and every SparseSet gets a validating idx().
@@ -481,6 +495,109 @@ export class Arena {
         if (this._checked) {
             this._joinEpoch = (this._joinEpoch + 1) | 0;
             return new CheckedJoinPlan(this, this._joinEpoch, r.driver, r.other, r.count);
+        }
+        return r;
+    }
+
+    /**
+     * Cold-path planner for a k-way join with exclusions (S7): "entities with
+     * every set in `required` AND none in `excluded`" -- e.g. "Renderable AND
+     * Position AND Visible, but NOT Culled". The k-input generalization of
+     * `join(a, b)`: it reads every count, hands back the SMALLEST `required` set
+     * as the `driver` (so you iterate the globally rarest set), the remaining
+     * required sets to `has()`-check, and the excluded sets to `!has()`-check.
+     * `join(a, b)` is untouched and remains the fast two-set path.
+     *
+     * Like `join`, this does NOT iterate and allocates NOTHING on a call: the
+     * returned object and its `others` / `excl` arrays are arena-owned scratch,
+     * reused across calls. The two arrays grow ONCE to their high-water mark the
+     * first time a larger join appears, then never reallocate -- so steady state
+     * is zero-alloc. Read the fields (or run the loop) BEFORE the next
+     * `join` / `joinN` on this arena; do not retain the object across calls.
+     * Loop to `othersCount` / `exclCount`, NEVER `others.length` -- the arrays
+     * may carry a stale tail from a larger prior call.
+     *
+     * Fail-closed: `required` null or empty throws (no driver, no honest result;
+     * null is not zero). `excluded` null is the empty list. A set that appears in
+     * both `required` and `excluded` is a contradiction whose only honest answer
+     * is the empty set -- production yields it naturally (every driver element is
+     * excluded, so every `!has` fails), checked mode throws to flag the bug.
+     * A foreign set (not registered with this arena) is trusted in production
+     * exactly as `join` trusts its inputs; checked mode validates and throws.
+     *
+     * @param {SparseSet[]} required  Non-empty; entities must be in ALL of these.
+     * @param {SparseSet[]} [excluded]  Entities must be in NONE of these.
+     * @returns {{ driver: SparseSet, count: number,
+     *             others: SparseSet[], othersCount: number,
+     *             excl: SparseSet[], exclCount: number }}
+     *
+     * @example
+     *   const REQ = [Renderable, Position, Visible], EXC = [Culled];  // hoist once
+     *   const p = arena.joinN(REQ, EXC);
+     *   const drv = p.driver, n = p.count;
+     *   const oth = p.others, no = p.othersCount;
+     *   const ex = p.excl, nx = p.exclCount;
+     *   for (let i = 0; i < n; i++) {
+     *       const e = drv.dense[i];
+     *       let ok = true;
+     *       for (let k = 0; k < no; k++) if (!oth[k].has(e)) { ok = false; break; }
+     *       if (ok) for (let k = 0; k < nx; k++) if (ex[k].has(e)) { ok = false; break; }
+     *       if (!ok) continue;
+     *       // ... e has every required set and no excluded set ...
+     *   }
+     */
+    joinN(required, excluded) {
+        // Fail closed: no required set means no driver and no honest result. An
+        // empty match must be requested explicitly, never inferred from nothing.
+        if (required == null || required.length === 0) {
+            throw new Error(
+                'lite-arena: joinN() needs at least one required set; got ' +
+                (required == null ? 'null/undefined' : 'an empty array') +
+                '. There is no driver and no honest result for zero required sets.');
+        }
+
+        // Pick the global-min-count driver among the required sets. Ties favour
+        // the earlier set, matching join()'s "ties favour a".
+        const rn = required.length;
+        let driver = required[0];
+        let best = driver.count;
+        for (let i = 1; i < rn; i++) {
+            const c = required[i].count;
+            if (c < best) { best = c; driver = required[i]; }
+        }
+
+        // Fill the reused `others` scratch with every required set EXCEPT the one
+        // chosen as driver. Skip the driver exactly once (a set may legitimately
+        // be repeated in `required`; only the single driver instance is removed).
+        const others = this._joinNOthers;
+        let oc = 0, skipped = false;
+        for (let i = 0; i < rn; i++) {
+            const s = required[i];
+            if (!skipped && s === driver) { skipped = true; continue; }
+            others[oc++] = s;
+        }
+
+        // Fill the reused `excl` scratch. `excluded` null is the empty list.
+        const excl = this._joinNExcl;
+        let xc = 0;
+        if (excluded != null) {
+            const xn = excluded.length;
+            for (let i = 0; i < xn; i++) excl[xc++] = excluded[i];
+        }
+
+        const r = this._joinNResult;
+        r.driver = driver;
+        r.count = driver.count;
+        r.othersCount = oc;
+        r.exclCount = xc;
+
+        // Production: hand back the reused scratch, zero allocation. Checked mode:
+        // stamp a fresh, staleness-guarded plan (AR-09) that also validates every
+        // set is registered here and that no set is both required and excluded.
+        if (this._checked) {
+            this._joinEpoch = (this._joinEpoch + 1) | 0;
+            return new CheckedJoinNPlan(
+                this, this._joinEpoch, required, excluded, driver, driver.count, others, oc, excl, xc);
         }
         return r;
     }
@@ -1005,4 +1122,83 @@ class CheckedJoinPlan {
     get driver() { this._live(); return this._driver; }
     get other()  { this._live(); return this._other; }
     get count()  { this._live(); return this._count; }
+}
+
+/**
+ * Checked-mode wrapper for a `joinN()` plan (S7 / AR-09). Only ever constructed
+ * when the arena was created with `{ checked: true }`; production `joinN()`
+ * returns the plain reused scratch and never allocates one of these. Beyond the
+ * shared-epoch staleness guard (a later `join` OR `joinN` supersedes it), it
+ * validates at construction the two mistakes production trusts the caller not to
+ * make: a set not registered with this arena (foreign set), and a set that is
+ * both required and excluded (a contradiction).
+ *
+ * Structurally a `{ driver, count, others, othersCount, excl, exclCount }`, so
+ * it is a drop-in for the production scratch at every call site.
+ */
+class CheckedJoinNPlan {
+    constructor(arena, epoch, required, excluded, driver, count, others, othersCount, excl, exclCount) {
+        // Foreign-set validation: every required and excluded set must be one of
+        // this arena's registered components. Production skips this (zero cost,
+        // exactly as join() trusts its inputs); checked mode fails closed.
+        const reg = arena.components;
+        const inReg = (s) => {
+            for (let i = 0; i < reg.length; i++) if (reg[i] === s) return true;
+            return false;
+        };
+        for (let i = 0; i < required.length; i++) {
+            if (!inReg(required[i])) {
+                throw new Error(
+                    'lite-arena: joinN() required set #' + i + ' is not registered with this ' +
+                    'arena (foreign SparseSet). (checked mode.)');
+            }
+        }
+        if (excluded != null) {
+            for (let i = 0; i < excluded.length; i++) {
+                if (!inReg(excluded[i])) {
+                    throw new Error(
+                        'lite-arena: joinN() excluded set #' + i + ' is not registered with this ' +
+                        'arena (foreign SparseSet). (checked mode.)');
+                }
+            }
+        }
+        // Contradiction: a set that is both required and excluded can never match.
+        // Production yields the empty set naturally; checked mode names the bug.
+        if (excluded != null) {
+            for (let i = 0; i < required.length; i++) {
+                for (let j = 0; j < excluded.length; j++) {
+                    if (required[i] === excluded[j]) {
+                        throw new Error(
+                            'lite-arena: joinN() set appears in both required and excluded -- the ' +
+                            'match is always empty. Remove it from one list. (checked mode.)');
+                    }
+                }
+            }
+        }
+
+        this._arena = arena;
+        this._epoch = epoch;
+        this._driver = driver;
+        this._count = count;
+        this._others = others;
+        this._othersCount = othersCount;
+        this._excl = excl;
+        this._exclCount = exclCount;
+    }
+
+    _live() {
+        if (this._arena._joinEpoch !== this._epoch) {
+            throw new Error(
+                'lite-arena: stale joinN() plan read. A later join()/joinN() on this arena ' +
+                'superseded it -- the plan is a single-use scratch; read its fields (or run your ' +
+                'loop) before calling join()/joinN() again. (checked mode.)');
+        }
+    }
+
+    get driver()      { this._live(); return this._driver; }
+    get count()       { this._live(); return this._count; }
+    get others()      { this._live(); return this._others; }
+    get othersCount() { this._live(); return this._othersCount; }
+    get excl()        { this._live(); return this._excl; }
+    get exclCount()   { this._live(); return this._exclCount; }
 }

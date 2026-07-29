@@ -73,6 +73,20 @@ for (let i = 0; i < n; i++) {
   // ...
 }
 
+// k-way join with exclusions: "every REQ, none of EXC" (cold planner, S7).
+const p = arena.joinN([Pos, Frozen, Visible], [Culled]);  // driver = rarest REQ
+const d = p.driver, m = p.count;
+const oths = p.others, no = p.othersCount;    // REQ minus driver -> has()-check
+const exs = p.excl, nx = p.exclCount;         // EXC -> must NOT have
+for (let i = 0; i < m; i++) {
+  const e = d.dense[i];
+  let ok = true;
+  for (let k = 0; k < no; k++) if (!oths[k].has(e)) { ok = false; break; }
+  if (ok) for (let k = 0; k < nx; k++) if (exs[k].has(e)) { ok = false; break; }
+  if (!ok) continue;                    // e has every REQ and no EXC
+  // ...
+}
+
 // Hot loop (the canonical pattern):
 const n = Pos.count;
 const x = Pos.data.x;       // hoist the typed-array ref
@@ -113,8 +127,10 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
   observed via the counter, never a callback: there is deliberately no `onRetire`
   (see decisions/0004-retirement-observability-and-clear.md).
 - Checked mode (`new Arena(n, { checked: true })`) is OFF by default and zero-cost
-  in production. When on: reading a `join()` plan after a later `join()` throws,
-  and `idx()` on a dead/non-member entity throws. The checked `idx` shadows the
+  in production. When on: reading a `join()`/`joinN()` plan after a later
+  `join()`/`joinN()` throws (they share one epoch), a `joinN()` foreign set or a
+  set that is both required and excluded throws, and `idx()` on a dead/non-member
+  entity throws. The checked `idx` shadows the
   prototype method as an own property, so the production `idx()` fast path is
   byte-for-byte unchanged.
 - `idx()` skips validation; only call inside loops where validity is guaranteed.
@@ -137,6 +153,16 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
   smaller-count set); it allocates nothing and is called once per system, cold.
   It is a planner, not an iterator -- there is deliberately no `query()` or
   `forEach()`. Consume the result before the next `join()` on the same arena.
+- `joinN(required, excluded)` generalizes `join` to k required sets plus a NOT
+  list ("A AND B AND C, WITHOUT D"). It returns a REUSED scratch
+  `{driver, count, others, othersCount, excl, exclCount}` -- driver = the rarest
+  required set (ties favour the first), `others` = the remaining required sets to
+  `has()`-check, `excl` = the excluded sets to `!has()`-check. Loop to
+  `othersCount`/`exclCount`, never `.length` (the arrays are grow-once scratch
+  with a possible stale tail), and consume before the next `join()`/`joinN()`.
+  Fail-closed: empty/null `required` throws; `excluded` null is the empty list; a
+  set in BOTH lists yields the empty match (throws in checked mode). `join(a, b)`
+  is untouched -- the fast two-set path stays exactly as it was.
 - The arena NEVER auto-grows. `spawn()` at capacity throws; growth happens only
   through an explicit, between-frames `reserve(newCap)`. `reserve()` reallocates
   every backing buffer (copying live contents; all handles/memberships/dense

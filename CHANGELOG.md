@@ -5,6 +5,55 @@ All notable changes to `@zakkster/lite-arena` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.0] - 2026-07-29
+
+N-way / exclusion joins. `join(a, b)` is a two-input driver-picker; real systems
+match on k components and often on an ABSENCE ("Renderable AND Position AND
+Visible, but NOT Culled"). 1.9.0 adds `joinN(required, excluded)` -- the k-input
+generalization -- while leaving `join(a, b)` byte-identical.
+
+Additive and cold-path only: it is a new planner, not a change to any hot method.
+The six hot methods are proven unchanged, and `joinN` allocates nothing in steady
+state (its reused scratch's two arrays grow once to a high-water mark, then never
+reallocate) -- so, like S5/S6, it is a minor. No thread/COI/transfer surface;
+this is pure single-thread ECS ergonomics. See
+[decisions/0008](decisions/0008-nway-exclusion-joins.md).
+
+### Added
+
+- `Arena.joinN(required, excluded)` -- cold planner for "entities in every
+  `required` set AND in none of the `excluded` sets". Picks the globally rarest
+  `required` set as `driver` (ties favour the first), and hands back a REUSED
+  scratch `{ driver, count, others, othersCount, excl, exclCount }`: `others` are
+  the remaining required sets to `has()`-check, `excl` the excluded sets to
+  `!has()`-check. It plans, it does not iterate -- the caller writes the loop and
+  fuses the match into their own pass. Loop to `othersCount`/`exclCount`, never
+  `.length` (the arrays are grow-once scratch with a possible stale tail); consume
+  before the next `join()`/`joinN()`.
+- `joinN` fail-closed contract: empty or null `required` throws (no driver, no
+  honest result -- null is not zero); `excluded` omitted or null is the empty NOT
+  list; a set that is both required and excluded yields the empty match in
+  production (every driver element is excluded) and throws in checked mode.
+- Checked-mode `CheckedJoinNPlan`: shares the arena's join epoch with `join`, so a
+  stale plan of either kind throws once a later `join()`/`joinN()` supersedes it,
+  and additionally rejects a foreign set (not registered with this arena) and a
+  required/excluded contradiction.
+- `joinN` unit suite (14 tests: k-way oracle, single/multi exclusion, global-min
+  driver + ties, empty-NOT-list, reused-scratch identity, stale-tail semantics,
+  fail-closed empties, production contradiction -> empty, checked staleness /
+  foreign / contradiction, and `join(a, b)` unchanged).
+- Torture Phase I -- the S7 gate: `joinN` called `HOT_OPS_MIN` times with the
+  canonical k-way + exclusion match loop, gated at `maxMajor:0` and checked
+  against a brute-force oracle. Control `ARENA_TORTURE_JLEAK=1` retains a per-call
+  allocation and MUST trip the gate.
+
+### Unchanged (proven)
+
+- `join(a, b)` -- same signature, same reused scratch, same numbers. The two-set
+  fast path is untouched.
+- The six hot methods (`spawn` / `despawn` / `add` / `has` / `remove` / `idx`)
+  are byte-for-byte identical to 1.8.0.
+
 ## [1.8.0] - 2026-07-29
 
 Transferable-`ArrayBuffer` round-trip -- the cross-thread half of the S-track,

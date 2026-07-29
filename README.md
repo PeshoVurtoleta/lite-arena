@@ -330,6 +330,7 @@ Throws if `maxEntities` is out of range or non-integer.
 | `registerComponent(schema)` | `SparseSet` | Mounts a new SoA component. Schema: `{ key: TypedArrayConstructor }`. **Validated at registration** (a cold path): every field type must be one of the nine numeric TypedArray constructors, or it throws a library error naming the offending key (see [Schema validation](#schema-validation)). |
 | `registerTag()` | `SparseSet` | Zero-size tag component (membership only). `registerComponent({})` with intent. `data` is an empty null-prototype object. |
 | `join(a, b)` | `{ driver, other, count }` | Cold-path join planner. Returns a **reused** scratch with the smaller-count set as `driver`; allocates nothing. Not an iterator — you write the loop. In [checked mode](#checked-mode-development-only) it returns a plan that throws if read after the next `join()`. |
+| `joinN(required, excluded?)` | `{ driver, count, others, othersCount, excl, exclCount }` | Cold-path **k-way + exclusion** planner: "in every `required` set AND in none of `excluded`". The k-input sibling of `join` (which is untouched). Picks the rarest `required` set as `driver` (ties favour the first); `others`/`excl` are **grow-once reused** scratch arrays — loop to `othersCount`/`exclCount`, never `.length`. Zero-alloc steady-state. Fail-closed: empty/null `required` throws; a set in both lists is empty (throws in checked mode). |
 | `reserve(newCap)` | `boolean` | **Explicit, between-frames capacity growth** — the only way the arena grows. Reallocates every backing buffer (all handles/data preserved); `false` no-op if `newCap <= capacity`. Invalidates hoisted refs — re-read `data.x` after. |
 | `clear()` | `void` | Resets the arena to empty **without reallocating** — rebuilds the free list, bumps every generation, revives every retired slot, zeroes each component's `count`. O(capacity), allocates nothing. **Every handle minted before `clear()` is invalid afterward.** |
 
@@ -468,7 +469,7 @@ Two zero-allocation cases require `--expose-gc`; without it they skip (`node --t
 npm run torture          # node --expose-gc test/torture.mjs
 ```
 
-The unit tests prove behaviour; the torture gate proves the *guarantees*. It prints exactly `ok` (exit 0) or fails loudly (non-zero), across six phases: retention (create/dispose 4096 cycles, cross-checked by an external leak tracker), GC budget (`maxMajor: 0` over a 200k-op hot tick), join zero-alloc, reserve-then-hot, a handle-space sign-bit sweep, and a retirement soak that asserts the conservation law `activeCount + retiredCount + freeListLength === capacity` after every operation. Each phase is its own control — the gate can fail. (`ARENA_TORTURE_LEAK=1 npm run torture` forces the retention phase to leak and exit non-zero, proving the gate bites.)
+The unit tests prove behaviour; the torture gate proves the *guarantees*. It prints exactly `ok` (exit 0) or fails loudly (non-zero), across nine phases: retention (create/dispose 4096 cycles, cross-checked by an external leak tracker), GC budget (`maxMajor: 0` over a 200k-op hot tick), `join` zero-alloc, reserve-then-hot, a handle-space sign-bit sweep, a retirement soak that asserts the conservation law `activeCount + retiredCount + freeListLength === capacity` after every operation, caller-supplied-buffer parity, the transferable detach/rebind round-trip, and `joinN` zero-alloc against a brute-force oracle. Each phase is its own control — the gate can fail. (`ARENA_TORTURE_LEAK=1 npm run torture` forces the retention phase to leak and exit non-zero; `ARENA_TORTURE_HLEAK=1` and `ARENA_TORTURE_JLEAK=1` do the same for the transfer and `joinN` phases — proving the gate bites.)
 
 ### 3. Benchmark — "does it perform as claimed?"
 
@@ -634,6 +635,26 @@ for (let i = 0; i < n; i++) {
 ```
 
 `join()` is a **cold-path planner**, called once per system per frame: it returns a *reused* scratch object (so it allocates nothing) and it does **not** iterate — that keeps your loop hot and allocation-free. This is what every ECS does under the hood; a full `query()` API would only add overhead. For deeply heterogeneous queries, archetype-based ECSes (bitecs, etc.) win — but they're an order of magnitude more code. Note: consume the returned object (or start your loop) before the next `join()` call on the same arena; it is reused, not fresh.
+
+**More than two components, or an exclusion?** `arena.joinN(required, excluded)` (1.9.0) generalizes `join` to *k* required sets plus a NOT list — *"every `required`, none of `excluded`"* — and picks the **globally rarest** required set as the driver, so you iterate the smallest set even with three or four constraints:
+
+```js
+const REQ = [Renderable, Position, Visible], EXC = [Culled]; // hoist once per system
+const p = arena.joinN(REQ, EXC);
+const drv = p.driver, n = p.count;
+const oth = p.others, no = p.othersCount;   // required minus driver -> has()-check
+const ex  = p.excl,   nx = p.exclCount;     // excluded -> must NOT have
+for (let i = 0; i < n; i++) {
+  const e = drv.dense[i];
+  let ok = true;
+  for (let k = 0; k < no; k++) if (!oth[k].has(e)) { ok = false; break; }
+  if (ok) for (let k = 0; k < nx; k++) if (ex[k].has(e)) { ok = false; break; }
+  if (!ok) continue;
+  // e has every required set and no excluded set
+}
+```
+
+Same discipline as `join`: it plans, you write the loop. The `others`/`excl` arrays are **grow-once reused scratch** — loop to `othersCount`/`exclCount`, never `.length` (a larger prior call can leave a stale tail), and consume before the next `join()`/`joinN()`. `join(a, b)` itself is unchanged.
 
 **Can I run component work on a Web Worker?**
 Yes, two ways. **(1) Transferable round-trip (1.8.0, recommended, works anywhere).** `detach()` a component's backing buffer, `postMessage(buf, [buf])` it to a Worker, and `rebind()` it on return — zero copy, no shared memory, no cross-origin isolation. This is the path that runs **inside a Twitch extension iframe**, which cannot be cross-origin isolated and therefore has no `SharedArrayBuffer`. **(2) SharedArrayBuffer payload (1.7.0).** Pass `{ buffers }` with a `SharedArrayBuffer` you own and a Worker can read/write `data.*` over a range you hand it by `postMessage`; but browser SAB requires cross-origin isolation (`COOP`/`COEP`), so it's for SAB-capable targets (Node `worker_threads`, Electron, isolated same-origin apps), *not* a Twitch iframe. In neither case can a Worker *iterate* the set — `count`/`dense` aren't shared — so hand it the live range `n`. See [SharedArrayBuffer / Workers](#sharedarraybuffer--workers) above, [decisions/0007](decisions/0007-transferable-roundtrip.md), and [decisions/0006](decisions/0006-caller-supplied-buffers.md).

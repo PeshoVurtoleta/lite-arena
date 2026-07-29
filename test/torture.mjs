@@ -81,15 +81,27 @@
  *     measureOps window, so the arrayBuffers channel, not maxMajor, is the
  *     load-bearing rule). Its control is ARENA_TORTURE_HLEAK=1 (below).
  *
+ *   Phase I (joinN zero-alloc + oracle) -- the S7 (1.9.0) gate. Calls
+ *     joinN(REQ, EXC) HOT_OPS_MIN times over a fixed population and runs the
+ *     canonical k-way + exclusion match loop each call. joinN is a cold planner
+ *     that hands back a REUSED scratch (result object + two grow-once arrays), so
+ *     the window must be zero-major, gated at RULES (maxMajor:0) exactly like
+ *     Phase C guards join(). Correctness rides along: the per-call match count is
+ *     asserted against a brute-force oracle computed once, and the driver must
+ *     always be the globally rarest required set. Its control is
+ *     ARENA_TORTURE_JLEAK=1 (below).
+ *
  * A pass means something only if the gate can fail. Run
  *
  *     ARENA_TORTURE_LEAK=1 node --expose-gc test/torture.mjs    (Phase A/retention)
  *     ARENA_TORTURE_HLEAK=1 node --expose-gc test/torture.mjs   (Phase H/transfer)
+ *     ARENA_TORTURE_JLEAK=1 node --expose-gc test/torture.mjs   (Phase I/joinN)
  *
  * ARENA_TORTURE_LEAK skips every despawn: the retention oracles stay non-zero and
  * the process exits non-zero. ARENA_TORTURE_HLEAK injects a retained per-frame
- * allocation into Phase H's hand-off loop, tripping maxMajor. Either is the
- * control -- see CHANGELOG.md and the DONE-WHEN.
+ * allocation into Phase H's hand-off loop, tripping maxArrayBuffersGrowth.
+ * ARENA_TORTURE_JLEAK retains a per-call allocation in Phase I's join loop,
+ * tripping maxMajor. Each is a control -- see CHANGELOG.md and the DONE-WHEN.
  *
  * Peers are devDependencies, never runtime deps: Arena.js has zero deps.
  *
@@ -653,6 +665,95 @@ function phaseH() {
     return checkNoGc(res.summary, RULES_SAB);
 }
 
+// --- Phase I: joinN zero-alloc + oracle (the S7 / 1.9.0 gate) -----------------
+
+// joinN() is the k-way generalization of join(): a cold planner that hands back
+// a REUSED scratch (the result object plus two grow-once arrays), so calling it
+// in a hot loop must allocate nothing once the scratch is at its high-water
+// mark. This phase calls joinN(REQ, EXC) HOT_OPS_MIN times, runs the blessed
+// match loop on every call, and gates the window at maxMajor:0 -- if joinN ever
+// regressed to allocating per call (building the others/excl arrays fresh, say),
+// this window would light up, exactly like Phase C guards join(). It also proves
+// CORRECTNESS against a brute-force oracle computed ONCE: the per-call match
+// count must equal the oracle on every iteration, and the driver must always be
+// the globally rarest required set.
+//
+// Control: ARENA_TORTURE_JLEAK=1 retains a Float64Array per call into jSink; the
+// growing heap forces a major GC and maxMajor:0 trips -- proving the phase is
+// load-bearing, exactly as LEAK proves Phase A and HLEAK proves Phase H.
+const JLEAK = process.env.ARENA_TORTURE_JLEAK === '1';
+const jSink = [];         // retains the control's per-call allocations
+
+async function phaseI() {
+    const arena = new Arena(CAP);
+    const A = arena.registerComponent({ x: Float32Array }); // required, largest
+    const B = arena.registerTag();                          // required, half
+    const C = arena.registerTag();                          // required, rarest -> driver
+    const D = arena.registerTag();                          // excluded
+
+    for (let i = 0; i < CAP; i++) {
+        const e = arena.spawn();
+        A.add(e);                        // A: every entity
+        if ((i & 1) === 0) B.add(e);     // B: half
+        if ((i & 63) === 0) C.add(e);    // C: sparse -> the consistent driver
+        if ((i & 127) === 0) D.add(e);   // D: sparser still, excluded
+    }
+
+    const REQ = [A, B, C];   // hoisted ONCE, as a real system would
+    const EXC = [D];
+
+    // Brute-force oracle, computed ONCE outside the measured loop: walk the
+    // rarest required set and count those in every required set and no excluded.
+    let expected = 0;
+    for (let i = 0; i < C.count; i++) {
+        const e = C.dense[i];
+        if (A.has(e) && B.has(e) && !D.has(e)) expected++;
+    }
+
+    globalThis.gc();
+    globalThis.gc();
+
+    const gc = new GcProfiler(256, { heap: true }).start();
+    gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
+
+    // HOT-ish loop: plan with joinN and run the canonical k-way + exclusion match
+    // every call. joinN hands back reused scratch, so this must allocate nothing.
+    let acc = 0;
+    let driverAlwaysRare = true;
+    for (let n = 0; n < HOT_OPS_MIN; n++) {
+        const p = arena.joinN(REQ, EXC);
+        if (p.driver !== C) driverAlwaysRare = false;
+        const drv = p.driver, cnt = p.count;
+        const oth = p.others, no = p.othersCount;
+        const ex = p.excl, nx = p.exclCount;
+        let matched = 0;
+        for (let i = 0; i < cnt; i++) {
+            const e = drv.dense[i];
+            let ok = true;
+            for (let k = 0; k < no; k++) if (!oth[k].has(e)) { ok = false; break; }
+            if (ok) for (let k = 0; k < nx; k++) if (ex[k].has(e)) { ok = false; break; }
+            if (ok) matched++;
+        }
+        acc = acc + matched;
+        if (JLEAK) jSink.push(new Float64Array(4096)); // control: retained per-call alloc
+    }
+
+    const mu = process.memoryUsage();
+    gc.sampleHeap(performance.now(), mu.heapUsed, mu);
+
+    await gc.settle();
+    const summary = gc.summary();
+    gc.stop();
+
+    if (!driverAlwaysRare) die('phaseI: joinN did not drive the globally rarest required set');
+    if (acc !== expected * HOT_OPS_MIN) {
+        die('phaseI: joinN match miscounted (acc=' + acc +
+            ' expected=' + (expected * HOT_OPS_MIN) + ')');
+    }
+
+    return { report: checkNoGc(summary, RULES), summary };
+}
+
 // --- gate --------------------------------------------------------------------
 
 async function main() {
@@ -671,6 +772,7 @@ async function main() {
     const f = phaseF();
     const g = phaseG();
     const h = phaseH();
+    const iRes = await phaseI();
 
     const retentionOk = a.activeCount === 0 && a.trackerSize === 0;
     const budgetOk = b.report.ok;
@@ -680,8 +782,9 @@ async function main() {
     const conservationOk = f.ok;
     const sabOk = g.ok;
     const transferOk = h.ok;
+    const joinNOk = iRes.report.ok;
 
-    if (retentionOk && budgetOk && joinOk && reserveOk && sweepOk && conservationOk && sabOk && transferOk) {
+    if (retentionOk && budgetOk && joinOk && reserveOk && sweepOk && conservationOk && sabOk && transferOk && joinNOk) {
         process.stdout.write('ok\n');
         process.exit(0);
     }
@@ -730,7 +833,15 @@ async function main() {
             ' checked=' + JSON.stringify(h.checked) +
             ' (rules ' + JSON.stringify(RULES_SAB) + ')\n');
     }
-    die('gate rejected' + (LEAK || HLEAK ? ' (leaky control -- expected)' : ''));
+    if (!joinNOk) {
+        const gc = iRes.summary.gc;
+        process.stderr.write(
+            'torture: joinN -- verdict=' + iRes.report.verdict +
+            ' source=' + iRes.summary.source +
+            ' major=' + gc.major + ' maxMs=' + gc.maxMs.toFixed(3) +
+            ' (rules ' + JSON.stringify(RULES) + ')\n');
+    }
+    die('gate rejected' + (LEAK || HLEAK || JLEAK ? ' (leaky control -- expected)' : ''));
 }
 
 main();
