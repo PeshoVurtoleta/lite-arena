@@ -192,7 +192,12 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
 - [bench/bench.js](bench/bench.js): Benchmark harness comparing against
   `Map<id, object>`, `Array<Object>`, and a no-ECS manual SoA.
 - [demo/demo.html](demo/demo.html): 50,000-particle gravity-well demo,
-  toggleable backend, live FPS / heap stats.
+  toggleable backend, live FPS / heap stats. One backend, "lite-arena + Worker",
+  runs the physics off-thread via the 1.8.0 transferable round-trip
+  ([demo/worker.js](demo/worker.js)): detach -> transfer -> integrate -> transfer
+  back -> rebind, plain `ArrayBuffer`, no cross-origin isolation. Module workers
+  do not load over `file://`, so that backend needs a plain static server (no
+  COOP/COEP headers); the other three backends run straight from `file://`.
 
 ## Headline performance
 

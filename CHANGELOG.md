@@ -62,6 +62,14 @@ apps). See [decisions/0007](decisions/0007-transferable-roundtrip.md).
   tying it to `package.json` and `/release` taught a fourth sync place first.
 - Unit suite: 111 cases (98 + 12 transfer unit + 1 cross-thread transfer; 2
   zero-alloc cases still need `--expose-gc`). Torture gate is now Phases A-H.
+- Demo (repo only, NOT in the npm tarball): `demo/demo.html` gains a fourth
+  backend, **lite-arena + Worker**, that runs the physics off the main thread via
+  this release's transferable round-trip (`detach` -> transfer -> integrate in
+  `demo/worker.js` -> transfer back -> `rebind`). Plain `ArrayBuffer`, no
+  cross-origin isolation, no COOP/COEP headers -- so it needs only a static file
+  server (module workers do not load over `file://`; the other three backends
+  still do). The visible proof that the transferable path runs where
+  `SharedArrayBuffer` cannot.
 
 ## [1.7.0] - 2026-07-28
 

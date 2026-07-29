@@ -490,7 +490,7 @@ Reproduces the [headline numbers](#headline-result). On any 2020+ machine you sh
 open demo/demo.html
 ```
 
-A 50,000-particle gravity simulation. Drag to move the gravity well; observe constant-time frame stats in the corner. If you toggle the mode buttons to "Array<Object>" or "Map" you'll see the framerate halve and GC stutter appear in the stats graph.
+A 50,000-particle gravity simulation. Drag to move the gravity well; observe constant-time frame stats in the corner. If you toggle the mode buttons to "Array<Object>" or "Map" you'll see the framerate halve and GC stutter appear in the stats graph. The **lite-arena + Worker** backend runs the physics off the main thread via the 1.8.0 transferable round-trip (`detach` -> transfer -> integrate -> transfer back -> `rebind`) — plain `ArrayBuffer` transfers, no cross-origin isolation, the same path that runs inside a Twitch Extension iframe.
 
 ### Quick `npm run` reference
 
@@ -506,11 +506,21 @@ A 50,000-particle gravity simulation. Drag to move the gravity well; observe con
 
 ## Running the demo
 
+No build step. The three single-thread backends (lite-arena / Array / Map) run
+straight from `file://` — a relative ESM import from `../Arena.js`, no server:
+
 ```
 demo/demo.html
 ```
 
-No build step. No server needed if you open over `file://` — it uses a relative ESM import from `../Arena.js`.
+The **lite-arena + Worker** backend loads `demo/worker.js` as an ES module
+worker, and browsers do not allow module workers over `file://` — so to try that
+one, serve the folder over any plain static server (**no** COOP/COEP headers, no
+cross-origin isolation — that is the whole point of the transferable path):
+
+```bash
+python3 -m http.server 8000    # then open http://localhost:8000/demo/demo.html
+```
 
 Controls:
 
@@ -518,8 +528,8 @@ Controls:
 |---|---|
 | Mouse drag | Move the gravity well |
 | Mouse wheel | Adjust gravity strength |
-| `+` / `-` | Spawn / despawn 1000 particles |
-| Mode buttons | Switch between lite-arena / Array / Map backends |
+| `+1k` / `+10k` / `clear` | Add particles, or reset the active backend |
+| Mode buttons | Switch between lite-arena / lite-arena + Worker / Array / Map backends |
 
 ---
 

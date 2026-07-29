@@ -127,6 +127,7 @@
     <h1>lite-arena · 50k particle test</h1>
     <div id="stats">
         <div class="row"><span class="label">Backend</span><span class="val" id="s-backend">lite-arena</span></div>
+        <div class="row"><span class="label">Physics</span><span class="val" id="s-physics">main thread</span></div>
         <div class="row"><span class="label">Particles</span><span class="val" id="s-count">0</span></div>
         <div class="row"><span class="label">FPS</span><span class="val" id="s-fps">—</span></div>
         <div class="row"><span class="label">Frame budget</span><span class="val" id="s-budget">—</span></div>
@@ -136,6 +137,7 @@
         <div class="group">
             <span class="label">Backend</span>
             <button id="b-arena" class="active">lite-arena</button>
+            <button id="b-worker">lite-arena + Worker</button>
             <button id="b-array">Array&lt;Object&gt;</button>
             <button id="b-map">Map&lt;id, Object&gt;</button>
         </div>
@@ -332,6 +334,136 @@
     }
 
     // ─────────────────────────────────────────────────────────────────
+    // 1.8.0: physics on a Worker thread via the transferable round-trip.
+    // Same arena, same integration — but each frame the Position/Velocity
+    // payload buffers are TRANSFERRED to demo/worker.js (zero copy), mutated
+    // there, and transferred back. detach() hands off, rebind() re-adopts,
+    // isDetached() is the truthful once-per-frame guard for the in-flight
+    // window. No SharedArrayBuffer, no COI, no COOP/COEP headers — the exact
+    // path that runs inside a Twitch Extension iframe.
+    //
+    // A transferred buffer lives on exactly ONE thread at a time, and the
+    // round-trip is async, so the frame cannot block on it. The discipline:
+    // draw the payload while it is HOME, THEN hand it off; on the rare frame
+    // it is still away, isDetached() says skip and the fade holds the last
+    // paint. Main-thread work drops to draw + bookkeeping — the integration
+    // loop is gone from this thread. That freed budget is the whole point.
+    // ─────────────────────────────────────────────────────────────────
+
+    function makeWorkerBackend() {
+        const arena = new Arena(MAX);
+        const Pos = arena.registerComponent({x: Float32Array, y: Float32Array});
+        const Vel = arena.registerComponent({vx: Float32Array, vy: Float32Array});
+        const Life = arena.registerComponent({t: Float32Array});
+        const Sparkle = arena.registerTag();
+        const worker = new Worker('./worker.js', {type: 'module'});
+        let roundtrips = 0;
+        // Return leg: the four buffers are home again — re-adopt them. Partial,
+        // fail-closed rebind; a wrong-sized buffer would throw here, never
+        // silently corrupt the component. A completed round-trip (not a wall
+        // clock, which COI-less pages clamp to near zero) is the honest liveness
+        // signal: the ping-pong is running.
+        worker.onmessage = (ev) => {
+            const m = ev.data;
+            Pos.rebind({x: m.x, y: m.y});
+            Vel.rebind({vx: m.vx, vy: m.vy});
+            roundtrips++;
+        };
+        // Surface a worker failure loudly instead of silently freezing on a
+        // detached buffer (the payload would never come home).
+        worker.onerror = (e) => console.error('[lite-arena demo] worker error:', e.message || e);
+        worker.onmessageerror = (e) => console.error('[lite-arena demo] worker messageerror:', e);
+
+        // Only mutate the payload while it is HOME. Detached == in flight; a
+        // write to a detached field is a caller bug, so fail closed and skip.
+        function home() {
+            return !Pos.isDetached('x');
+        }
+
+        return {
+            name: 'lite-arena + Worker',
+            offthread: true,
+            get roundtrips() {
+                return roundtrips;
+            },
+            spawn(x, y, vx, vy) {
+                if (!home()) return -1;
+                try {
+                    const e = arena.spawn();
+                    Pos.add(e);
+                    Vel.add(e);
+                    Life.add(e);
+                    if (Math.random() < 0.03) Sparkle.add(e);
+                    const pi = Pos.idx(e), vi = Vel.idx(e), li = Life.idx(e);
+                    Pos.data.x[pi] = x;
+                    Pos.data.y[pi] = y;
+                    Vel.data.vx[vi] = vx;
+                    Vel.data.vy[vi] = vy;
+                    Life.data.t[li] = 0;
+                    return e;
+                } catch {
+                    return -1;
+                }
+            },
+            // Main-thread bookkeeping only: advance lifetimes, despawn aged-out.
+            // Physics happens on the Worker. Runs only while buffers are home.
+            update(dt) {
+                if (!home()) return;
+                const n = Pos.count;
+                const lt = Life.data.t;
+                for (let i = 0; i < n; i++) lt[i] += dt;
+                for (let i = n - 1; i >= 0; i--) {
+                    if (lt[i] > 8.0) arena.despawn(Pos.dense[i]);
+                }
+            },
+            draw(ctx) {
+                // In-flight (rare): nothing home to paint — the frame fade holds
+                // the last image. The truthful guard, once per frame.
+                if (!home()) return;
+                const n = Pos.count;
+                const px = Pos.data.x, py = Pos.data.y, lt = Life.data.t;
+                ctx.fillStyle = '#8fbcbb';
+                for (let i = 0; i < n; i++) {
+                    const a = 1 - lt[i] / 8.0;
+                    ctx.globalAlpha = a > 0 ? a : 0;
+                    ctx.fillRect(px[i] | 0, py[i] | 0, 2, 2);
+                }
+                ctx.globalAlpha = 1;
+
+                // Same rarest-first JOIN highlight as the main-thread backend.
+                const j = arena.join(Sparkle, Pos);
+                const drv = j.driver, oth = j.other, m = j.count;
+                ctx.fillStyle = '#ebcb8b';
+                for (let i = 0; i < m; i++) {
+                    const e = drv.dense[i];
+                    if (!oth.has(e)) continue;
+                    const pi = oth.idx(e);
+                    ctx.fillRect((px[pi] | 0) - 1, (py[pi] | 0) - 1, 4, 4);
+                }
+            },
+            // Hand the payload off for the NEXT integration step — AFTER drawing
+            // this frame's home state. Zero-copy transfer; buffers go detached
+            // until the worker transfers them back (see onmessage). Skipped while
+            // already in flight, so a slow round-trip never double-posts.
+            handoff(dt, gx, gy, gstr) {
+                if (!home()) return;
+                const [xb, yb] = Pos.detach(['x', 'y']);
+                const [vxb, vyb] = Vel.detach(['vx', 'vy']);
+                worker.postMessage(
+                    {x: xb, y: yb, vx: vxb, vy: vyb, n: Pos.count, dt, gx, gy, gstr},
+                    [xb, yb, vxb, vyb],
+                );
+            },
+            get count() {
+                return Pos.count;
+            },
+            dispose() {
+                worker.terminate();
+            },
+        };
+    }
+
+    // ─────────────────────────────────────────────────────────────────
     // Render / interaction loop
     // ─────────────────────────────────────────────────────────────────
 
@@ -362,13 +494,17 @@
     }, {passive: false});
 
     function setBackend(b, btn) {
+        if (backend && backend.dispose) backend.dispose();   // terminate an old Worker
         backend = b;
         document.querySelectorAll('#controls button').forEach(x => x.classList.remove('active'));
         if (btn) btn.classList.add('active');
         document.getElementById('s-backend').textContent = backend.name;
+        document.getElementById('s-physics').textContent =
+            backend.offthread ? 'Worker thread' : 'main thread';
     }
 
     document.getElementById('b-arena').onclick = (e) => setBackend(makeArenaBackend(), e.target);
+    document.getElementById('b-worker').onclick = (e) => setBackend(makeWorkerBackend(), e.target);
     document.getElementById('b-array').onclick = (e) => setBackend(makeArrayBackend(), e.target);
     document.getElementById('b-map').onclick = (e) => setBackend(makeMapBackend(), e.target);
 
@@ -389,6 +525,7 @@
     document.getElementById('b-10k').onclick = () => burst(10000);
     document.getElementById('b-clear').onclick = () => setBackend(
         backend.name === 'lite-arena' ? makeArenaBackend()
+            : backend.name === 'lite-arena + Worker' ? makeWorkerBackend()
             : backend.name === 'Array<Object>' ? makeArrayBackend()
             : makeMapBackend(),
         document.querySelector('#controls button.active')
@@ -403,6 +540,7 @@
     const sCount = document.getElementById('s-count');
     const sBudget = document.getElementById('s-budget');
     const sHeap = document.getElementById('s-heap');
+    const sPhysics = document.getElementById('s-physics');
 
     function loop(now) {
         const dt = Math.min(0.05, (now - lastT) / 1000);
@@ -422,8 +560,18 @@
         ctx.fillRect(0, 0, cv.width, cv.height);
 
         const t0 = performance.now();
-        backend.update(dt, gravityX, gravityY, gravityStr);
-        backend.draw(ctx);
+        if (backend.offthread) {
+            // Off-thread physics: bookkeep, paint the home state, THEN hand the
+            // payload off for the next step. Physics is NOT on this thread, so
+            // this measured span is draw + bookkeeping only -- watch the frame
+            // budget drop versus the main-thread arena.
+            backend.update(dt);
+            backend.draw(ctx);
+            backend.handoff(dt, gravityX, gravityY, gravityStr);
+        } else {
+            backend.update(dt, gravityX, gravityY, gravityStr);
+            backend.draw(ctx);
+        }
         const t1 = performance.now();
 
         // Gravity-well marker.
@@ -443,6 +591,9 @@
             sBudget.textContent = frameBudget.toFixed(2) + ' ms / 16.67';
             sBudget.style.color = frameBudget < 4 ? 'var(--good)' : frameBudget < 10 ? 'var(--accent2)' : 'var(--bad)';
             if (performance.memory) sHeap.textContent = (performance.memory.usedJSHeapSize / 1048576).toFixed(1);
+            sPhysics.textContent = backend.offthread
+                ? 'Worker thread (' + backend.roundtrips.toLocaleString() + ' round-trips)'
+                : 'main thread';
         }
         sCount.textContent = backend.count.toLocaleString();
 
