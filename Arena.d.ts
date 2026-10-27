@@ -90,6 +90,16 @@ export interface JoinNPlan {
     othersCount: number;
     excl: SparseSet<any>[];
     exclCount: number;
+    /** The `reqMask` passed to `joinN()`, normalised `| 0` (omitted -> 0). */
+    reqMask: number;
+    /** The `excMask` passed to `joinN()`, normalised `| 0` (omitted -> 0). */
+    excMask: number;
+    /**
+     * `arena.flags` at plan time; `null` without `registerFlags()`. `reserve()` replaces
+     * the flag row and refreshes the production plan's `flags`, but a hoisted `row`
+     * (and a checked plan) keeps the pre-reserve row -- re-read after growing.
+     */
+    flags: Int32Array | null;
 }
 
 export class Arena {
@@ -254,11 +264,27 @@ export class Arena {
      * list. A set that is both required and excluded yields the empty match (and
      * throws in checked mode).
      *
+     * Flag masks (M-4, optional): both are normalised `| 0` (omitted -> 0) and
+     * carried on the plan with a `flags` reference, so the caller's loop does ONE
+     * `flags[e & arena.indexMask]` read per candidate and tests
+     * `(w & rm) === rm && (w & xm) === 0`. A non-zero mask on an arena without
+     * `registerFlags()` throws before any state write (M-10); an empty `required`
+     * still throws the required-set error first (M-11 -- a flags-only scan is a
+     * caller loop over `arena.flags`, O(capacity)). `reqMask & excMask` != 0
+     * matches nothing in production and throws in checked mode (M-13). Checked
+     * mode also throws when a SUPPLIED mask is not a 32-bit integer (M-20),
+     * including a supplied-but-`undefined` one (a misspelled `F.tpyo`, M-25); a
+     * truly omitted mask is 0. Production stays a plain `| 0`: there a misspelled
+     * mask reads 0 and fails open (matches as if no mask). NOMINAL: a mask outside [-2^30, 2^30 - 1]
+     * may be a heap number on pointer-compressed engines; hoist it into a local.
+     *
      * @param required Non-empty; entities must be in ALL of these.
      * @param excluded Entities must be in NONE of these (default: empty).
+     * @param reqMask Every bit must be set in the entity's flag word (default 0).
+     * @param excMask No bit may be set in the entity's flag word (default 0).
      * @returns The reused {@link JoinNPlan}.
      */
-    joinN(required: SparseSet<any>[], excluded?: SparseSet<any>[]): JoinNPlan;
+    joinN(required: SparseSet<any>[], excluded?: SparseSet<any>[], reqMask?: number, excMask?: number): JoinNPlan;
 
     /**
      * Explicit, opt-in capacity growth -- the ONLY way the universe grows.
@@ -321,7 +347,7 @@ export class Arena {
      *   non-string name, a non-plain options object, or any options key. A throw
      *   leaves `flags` null.
      */
-    registerFlags(names?: readonly string[], options?: {} | null): Readonly<Record<string, number>>;
+    registerFlags(names?: readonly string[], options?: Record<string, never> | null): Readonly<Record<string, number>>;
 
     /**
      * O(1): ORs `mask | 0` into the entity's flag word (0x80000000 works).

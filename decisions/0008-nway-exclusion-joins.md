@@ -109,4 +109,26 @@ required/excluded-overlap checks above.
 - No new thread/COI/transfer surface -- this is pure single-thread ECS ergonomics,
   orthogonal to S5/S6.
 
+## Amendment (2026-10-27): flag masks in 1.10.0
+
+`joinN` now takes two optional trailing masks:
+`joinN(required, excluded, reqMask, excMask)`. The sets, driver choice and
+scratch arrays are as above; the plan additionally carries `reqMask`, `excMask`
+(both `| 0`, omitted -> 0) and `flags` (`arena.flags`, null without
+`registerFlags()`; `reserve()` refreshes the production plan's `flags`, a hoisted
+row keeps the old one). See 0010 "joinN masks".
+
+Check order in production (Arena.js joinN): (1) null / empty `required` throws
+the required-set error (M-11) -- this fires first; (2) masks are normalised
+`| 0`, and a non-zero mask with `arena.flags === null` throws (M-10), before
+any scratch write or epoch bump; (3) the plan is built. Checked mode (Arena.js checkedJoinN / checkJoinNSets),
+all before any scratch write or epoch bump (M-22), in this order: (1) null /
+empty `required` -> the required-set error (M-11; masks are not inspected);
+(2) each mask argument that is present (`arguments.length`; a supplied
+`undefined` throws, M-25) must be a 32-bit integer (M-20); an omitted mask is 0;
+(3) a non-zero mask with no flag row -> the no-flags error (M-10); (4) foreign
+set (a non-SparseSet entry gets this error too), set in both lists, and the M-13
+shared-mask-bit throw. Only then does the prototype `joinN` run, so a throw
+leaves earlier plans valid.
+
 MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>

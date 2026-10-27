@@ -332,7 +332,7 @@ Throws if `maxEntities` is out of range or non-integer.
 | `registerComponent(schema)` | `SparseSet` | Mounts a new SoA component. Schema: `{ key: TypedArrayConstructor }`. **Validated at registration** (a cold path): every field type must be one of the nine numeric TypedArray constructors, or it throws a library error naming the offending key (see [Schema validation](#schema-validation)). |
 | `registerTag()` | `SparseSet` | Zero-size tag component (membership only). `registerComponent({})` with intent. `data` is an empty null-prototype object. |
 | `join(a, b)` | `{ driver, other, count }` | Cold-path join planner. Returns a **reused** scratch with the smaller-count set as `driver`; allocates nothing. Not an iterator — you write the loop. In [checked mode](#checked-mode-development-only) it returns a plan that throws if read after the next `join()`. |
-| `joinN(required, excluded?)` | `{ driver, count, others, othersCount, excl, exclCount }` | Cold-path **k-way + exclusion** planner: "in every `required` set AND in none of `excluded`". The k-input sibling of `join` (which is untouched). Picks the rarest `required` set as `driver` (ties favour the first); `others`/`excl` are **grow-once reused** scratch arrays — loop to `othersCount`/`exclCount`, never `.length`. Zero-alloc steady-state. Fail-closed: empty/null `required` throws; a set in both lists is empty (throws in checked mode). |
+| `joinN(required, excluded?, reqMask?, excMask?)` | `{ driver, count, others, othersCount, excl, exclCount, reqMask, excMask, flags }` | Cold-path **k-way + exclusion** planner: "in every `required` set AND in none of `excluded`". The k-input sibling of `join` (which is untouched). Picks the rarest `required` set as `driver` (ties favour the first); `others`/`excl` are **grow-once reused** scratch arrays — loop to `othersCount`/`exclCount`, never `.length`. Zero-alloc steady-state. Fail-closed: empty/null `required` throws; a set in both lists is empty (throws in checked mode). Optional **flag masks** (1.10.0): `reqMask` bits must all be set and `excMask` bits all clear in the entity's flag word; the plan carries both (normalised `\| 0`) plus `flags` (`arena.flags`, `null` without `registerFlags()`; `reserve()` refreshes the production plan's `flags`, a hoisted row keeps the old one). See [Entity flags](#entity-flags). |
 | `registerFlags(names?, options?)` | frozen `{ name: bit }` | Cold, once: allocates `arena.flags` and returns name i -> `1 << i`. Throws on a second call, > 32 names, a duplicate / empty / non-string name, or any options key. See [Entity flags](#entity-flags). |
 | `setFlags(e, mask)` / `clearFlags(e, mask)` | `boolean` | O(1). Set / clear bits in the entity's flag word; `false` (nothing written) if `e` is dead. |
 | `hasFlags(e, required, excluded = 0)` | `boolean` | O(1). Alive, every `required` bit set, no `excluded` bit set. |
@@ -384,10 +384,10 @@ for (let i = 0, n = Pos.count; i < n; i++) {
 - A dead handle: `setFlags` / `clearFlags` return `false` and write nothing; `hasFlags` returns `false`.
 - `despawn()` zeroes the slot's word and `clear()` zeroes every word, so a respawned slot starts with no flags.
 - Calling the flag methods before `registerFlags()` on a live handle (a dead handle returns false first) throws a native `TypeError` (the row is `null`): a documented precondition.
-- **Production fails open on a typo.** `F.tpyo` is `undefined`, `undefined | 0` is `0`, so `setFlags(e, F.tpyo)` is a silent no-op that returns `true` and `hasFlags(e, F.tpyo)` is `true`. Use [checked mode](#checked-mode-development-only) in development: it throws on a mask that is not a 32-bit integer (it does not reject unregistered bits).
+- **Production fails open on a typo.** `F.tpyo` is `undefined`, `undefined | 0` is `0`, so `setFlags(e, F.tpyo)` is a silent no-op that returns `true` and `hasFlags(e, F.tpyo)` is `true`. Use [checked mode](#checked-mode-development-only) in development: it throws on a mask that is not a 32-bit integer (it does not reject unregistered bits). The same holds for the optional `joinN` masks, with one difference: a `joinN` mask that is supplied but `undefined` (a misspelled `F.tpyo`) throws in checked mode, while a truly omitted mask is 0; in production a misspelled `joinN` mask is a plain `| 0`, reads 0 and fails open (it matches as if no mask were given) (M-20 / M-25).
 - Bits 30 and 31 are outside the 31-bit Smi range on pointer-compressed engines (e.g. Chrome), so such a value held in a JS variable may be a heap number; inside the Int32Array it is a plain int32. Nominal: Node cannot observe it.
 
-`joinN` does not take flag masks yet. Rationale and alternatives: [decisions/0010-flags.md](decisions/0010-flags.md).
+`joinN` takes flag masks since 1.10.0 (masked-loop example in the `joinN` section below). Rationale and alternatives: [decisions/0010-flags.md](decisions/0010-flags.md).
 
 **Structural comparison** (no timings were measured; these are counts derived from the code):
 
@@ -396,7 +396,7 @@ for (let i = 0, n = Pos.count; i < n; i++) {
 | Bytes per slot | 4 B for all 32 flags (one Int32 word) | 8 B per tag (`sparse` Uint32Array + `dense` Int32Array, each `capacity` long) | 1 bit per flag (4 B per 32 flags), in your own `Uint32Array`s |
 | Membership test | `isAlive` + one row read (`hasFlags`), or one read in a hoisted loop | `has(e)` | your own index + mask; no liveness check |
 | Iterate the flagged entities | scan `arena.flags`, O(capacity) | dense list, O(count) | scan your words, O(capacity / 32) words |
-| `joinN` participation | no (not yet) | yes | no |
+| `joinN` participation | yes (1.10.0: `reqMask` / `excMask`) | yes | no |
 | Cleared on despawn | yes (word zeroed) | yes (cascade remove) | no, you must do it |
 | Use when | many boolean states, mostly tested not iterated | the set is small and iterated or joined | you need a bitmap outside the arena |
 
@@ -421,7 +421,7 @@ A lying schema used to silently produce a polymorphic `Array` or a boxed `Number
 
 ### Checked mode (development only)
 
-`new Arena(n, { checked: true })` turns on assertions that catch silent API misuse: a stale `join()` plan, a misused `idx()`, and a flag mask that is not a 32-bit integer. All are **off by default and byte-for-byte zero-cost in production** — the production `join()` scratch, the prototype `idx()` and the prototype flag methods are unaffected by the flag (the checked versions are own properties that shadow them). Turn it on in tests, off in shipping builds.
+`new Arena(n, { checked: true })` turns on assertions that catch silent API misuse: a stale `join()` plan, a misused `idx()`, and a flag mask (or `joinN` mask) that is not a 32-bit integer (a supplied-but-`undefined` `joinN` mask included). All are **off by default and byte-for-byte zero-cost in production** — the production `join()` scratch, the prototype `idx()` and the prototype flag methods are unaffected by the flag (the checked versions are own properties that shadow them). Turn it on in tests, off in shipping builds.
 
 ```js
 const arena = new Arena(1000, { checked: true });
@@ -440,6 +440,22 @@ comp.idx(deadOrUnattached); // throws: idx() ... dead or does not hold this comp
 //    NaN, fractions, +-Infinity, non-numbers and values outside int32/uint32 throw;
 //    0x80000000 is accepted. hasFlags may omit `excluded`.
 arena.setFlags(e, F.tpyo); // throws here; in production a silent no-op returning true
+
+// 4. joinN() masks: a SUPPLIED reqMask / excMask must be a 32-bit integer (M-20),
+//    and a supplied-but-undefined one (F.tpyo) throws too (M-25); an OMITTED
+//    mask is 0. (reqMask & excMask) !== 0 throws (M-13); in production it
+//    matches nothing, and a misspelled mask reads 0 (fails open).
+const REQ = [Pos, Vel], EXC = [Frozen];
+arena.joinN(REQ, EXC, 1.5);           // throws: the required mask must be a 32-bit integer
+arena.joinN(REQ, EXC, F.tpyo);        // throws: ... must be a 32-bit integer, got undefined
+
+// 5. A throwing joinN() validates BEFORE any scratch write or epoch bump (M-22), so
+//    plans taken earlier stay valid. A foreign set, a set in both lists, shared mask
+//    bits (M-13) or a bad mask all throw first; so does a non-SparseSet entry in
+//    `required` (the foreign-set error, not a TypeError).
+const keep = arena.joinN(REQ, EXC);
+try { arena.joinN([foreignSet], EXC); } catch (err) { /* expected */ }
+keep.count;                           // still valid
 ```
 
 In production those same calls take the fast path: `join()` returns the reused scratch, `idx()` returns `sparse[index]` with no checks, and a typo'd flag mask is read as 0. (See [decisions/0004](decisions/0004-retirement-observability-and-clear.md).)
@@ -500,7 +516,7 @@ Four levels of verification, depending on how deep you want to go.
 npm test
 ```
 
-Runs **184 test cases** (182 pass, 2 skipped without `--expose-gc`) under `node --test`, covering:
+Runs **280 test cases** (278 pass, 2 skipped without `--expose-gc`) under `node --test`, covering:
 
 | Group | What's tested |
 |---|---|
@@ -514,7 +530,7 @@ Runs **184 test cases** (182 pass, 2 skipped without `--expose-gc`) under `node 
 | Retirement budget | deterministic generation-retirement counts (`test/budget.test.js`): `capacity x 4095`, `clear()` 4094 refill, `reserve()` growth, Arena(1000) workloads |
 | Free-slot flag | a free slot's next handle is not alive; census `aliveCount === activeCount`; generation-stream parity (`test/free-slot.test.js`) |
 | Retirement observability | `remainingCapacity()` exactness, exhaustion message names full vs. retired, `clear()` resets + revives + invalidates prior handles |
-| Checked mode | stale `join()` plan throws; `idx()` on dead/non-member throws; non-32-bit-integer flag masks throw; prototype `idx()` untouched |
+| Checked mode | stale `join()` plan throws; `idx()` on dead/non-member throws; non-32-bit-integer flag or `joinN` masks throw, `joinN` `(reqMask & excMask) !== 0` throws; a throwing checked `joinN` leaves earlier plans valid; a non-SparseSet `required` entry gets the foreign-set error; prototype `idx()` untouched |
 | Entity flags | register / set / clear / has semantics, 32nd-bit mask, dead handles (`test/flags.test.js`); checked-mode mask validation (`test/flags-checked.test.js`) |
 | `remove()` allocation | scavenge-count gate per 500,000 swapping removes: 1-col, 4-col and tag sets <= noop + 1, must-fail control (`test/remove-alloc.test.js`) |
 | `remove()` parity | a seeded 7,000-op trace (reserve, transfer-while-detached, rebind, caller-backed) hashes to the sha256 pinned on e675a64 and matches a plain-JS model (`test/remove-parity.test.js`) |
@@ -523,7 +539,7 @@ Runs **184 test cases** (182 pass, 2 skipped without `--expose-gc`) under `node 
 | Randomized churn | 1000 random ops vs. Set/Map oracle |
 | Zero-allocation guarantee | 100k spawn/despawn → < 1 MB heap (requires `--expose-gc`) |
 
-Two zero-allocation cases require `--expose-gc`; without it they skip (`node --test` -> `182 passed, 2 skipped`, or `184 passed` under `node --expose-gc --test`). Suitable for CI.
+Two zero-allocation cases require `--expose-gc`; without it they skip (`node --test` -> `278 passed, 2 skipped`, or `280 passed` under `node --expose-gc --test`). Suitable for CI.
 
 ### 2. Torture gate — "does zero-GC actually hold under stress?"
 
@@ -531,7 +547,7 @@ Two zero-allocation cases require `--expose-gc`; without it they skip (`node --t
 npm run torture          # node --expose-gc test/torture.mjs
 ```
 
-The unit tests prove behaviour; the torture gate proves the *guarantees*. It prints exactly `ok` on stdout (plus one reported stderr line) (exit 0) or fails loudly (non-zero), across eleven phases: retention (create/dispose 4096 cycles, cross-checked by an external leak tracker), GC budget (`maxMajor: 0` over a 200k-op hot tick), `join` zero-alloc, reserve-then-hot, a handle-space sign-bit sweep, a retirement soak that asserts the conservation law `activeCount + retiredCount + freeListLength === capacity` after every operation (plus a liveness census: `aliveCount === activeCount` at start, after each retirement and after `clear()`), caller-supplied-buffer parity, the transferable detach/rebind round-trip, `joinN` zero-alloc against a brute-force oracle, and lifecycle churn (200,000 spawn/add/despawn on `Arena(4096)`, zero major and zero minor GC; pause reported, not gated), and entity flags (528,384 row-read / hasFlags / churn ops at zero GC, counts checked every frame against an independent mirror, retention leg back to 0). Each phase is its own control — the gate can fail. (`ARENA_TORTURE_LEAK=1 npm run torture` forces the retention phase to leak and exit non-zero; `ARENA_TORTURE_HLEAK=1` and `ARENA_TORTURE_JLEAK=1` do the same for the transfer and `joinN` phases, `ARENA_TORTURE_SLEAK=1` for the churn phase, and `ARENA_TORTURE_FLEAK=1` for the flags phase — proving the gate bites.)
+The unit tests prove behaviour; the torture gate proves the *guarantees*. It prints exactly `ok` on stdout (plus one reported stderr line; exit 0) or fails loudly (non-zero), across twelve phases: retention (create/dispose 4096 cycles, cross-checked by an external leak tracker), GC budget (`maxMajor: 0` over a 200k-op hot tick), `join` zero-alloc, reserve-then-hot, a handle-space sign-bit sweep, a retirement soak that asserts the conservation law `activeCount + retiredCount + freeListLength === capacity` after every operation (plus a liveness census: `aliveCount === activeCount` at start, after each retirement and after `clear()`), caller-supplied-buffer parity, the transferable detach/rebind round-trip, `joinN` zero-alloc against a brute-force oracle, and lifecycle churn (200,000 spawn/add/despawn on `Arena(4096)`, zero major and zero minor GC; pause reported, not gated), entity flags (528,384 row-read / hasFlags / churn ops at zero GC, counts checked every frame against an independent mirror, retention leg back to 0), and masked `joinN` (Phase L: 200,000 `joinN(REQ, EXC, f0|f31, f5)` calls at zero major and zero minor GC, every per-call count equal to a brute-force `hasFlags` oracle; a 4,096-cycle retention leg back to 0, then `reserve(8192)` leaves the old flag row unreachable). Each phase is its own control -- the gate can fail. (`ARENA_TORTURE_LEAK=1 npm run torture` forces the retention phase to leak and exit non-zero; `ARENA_TORTURE_HLEAK=1` and `ARENA_TORTURE_JLEAK=1` do the same for the transfer and `joinN` phases, `ARENA_TORTURE_SLEAK=1` for the churn phase, `ARENA_TORTURE_FLEAK=1` for the flags phase, and `ARENA_TORTURE_MLEAK=1` for the masked `joinN` phase -- proving the gate bites.)
 
 ### 3. Benchmark — "does it perform as claimed?"
 
@@ -559,7 +575,7 @@ A 50,000-particle gravity simulation. Drag to move the gravity well; observe con
 
 | Command | What it does |
 |---|---|
-| `npm test` | Run the unit suite (184 cases) under `node --test` |
+| `npm test` | Run the unit suite (280 cases) under `node --test` |
 | `npm run test:watch` | Re-run on save |
 | `npm run torture` | Run the zero-GC torture gate (`node --expose-gc test/torture.mjs`) |
 | `npm run bench` | Run the Node benchmark, write `bench/bench-results.json` |
@@ -660,7 +676,7 @@ worker.onmessage = ({ data: vxBuf }) => Vel.rebind({ vx: vxBuf });   // data.vx 
 - **A free slot's next handle is not alive.** Free slots carry a FREE flag in `generations` (spawn strips it, despawn sets it), so `isAlive`, `add` and `despawn` reject a handle for a slot that is not currently spawned, including one persisted from another run or arena (handles are not unique across arenas). See [decisions/0009-free-slot-flag.md](decisions/0009-free-slot-flag.md).
 - **Flag typos fail open in production; a dead handle is `false`.** `setFlags(e, F.tpyo)` (undefined mask) is a silent no-op returning `true`, and `hasFlags(e, F.tpyo)` is `true`; checked mode throws. `setFlags` / `clearFlags` / `hasFlags` on a dead handle return `false` and write nothing. See [Entity flags](#entity-flags).
 - **`despawn()` cascades to every registered component.** You never need to manually `pos.remove(e); vel.remove(e); sprite.remove(e); arena.despawn(e)` — just `arena.despawn(e)`.
-- **`remove()` allocates nothing, within a limit.** It walks a per-set cached column array (no `for...in`); measured 0 scavenges per 500,000 swapping removes for 1-col and tag sets, 0-1 for 4-col (7 runs, Node 26.8.2, darwin, 2026-10-27; gated <= noop + 1 in test/remove-alloc.test.js). That holds while the whole app's components use <= 4 distinct TypedArray kinds at the shared swap site (V8 polymorphic limit); above that each Float32/Float64 column boxes 16 B per swapping remove (6 kinds: 16 scavenges per 500,000 in all 7 runs, REPORTED). Replace a column only via `rebind()`; assigning `comp.data[key] = ...` directly is unsupported and `remove()` will not honour it.
+- **`remove()` allocates nothing, within a limit.** It walks a per-set cached column array (no `for...in`); measured 0 scavenges per 500,000 swapping removes for 1-col and tag sets, 0-1 for 4-col (7 runs, Node 26.8.2, darwin, 2026-10-27; gated <= noop + 1 in test/remove-alloc.test.js). That holds while the whole app's components use <= 4 distinct TypedArray kinds at the shared swap site (V8 polymorphic limit); above that each Float32/Float64 column boxes 16 B per swapping remove (6 kinds: 16 scavenges per 500,000 in all 7 runs, REPORTED). 16 B is Node's HeapNumber (12 B pointer-compressed, NOMINAL); a Uint32 value >= 2^31 boxes too once past 4 kinds; `despawn()` inherits the limit through `remove()`; "allocates nothing" means after warm-up. Replace a column only via `rebind()`; assigning `comp.data[key] = ...` directly is unsupported and `remove()` will not honour it.
 - **`remove()` does not zero the SoA tail.** After swap-and-pop, indices `[count, capacity)` contain stale data. Iterate `[0, count)` and you're fine. Don't read past `count` — there's no defined value there.
 - **`idx()` is unsafe by design.** It skips both the alive check and the membership check. Use it inside loops where you've just iterated `dense[0..count)` or just called `has()`. Calling `idx()` on a dead handle returns whatever `sparse[index]` happens to hold — garbage.
 - **`add()` is idempotent.** Calling `add(e)` twice returns the same dense index both times; the second call is a no-op.
@@ -708,7 +724,7 @@ for (let i = 0; i < n; i++) {
 
 `join()` is a **cold-path planner**, called once per system per frame: it returns a *reused* scratch object (so it allocates nothing) and it does **not** iterate — that keeps your loop hot and allocation-free. This is what every ECS does under the hood; a full `query()` API would only add overhead. For deeply heterogeneous queries, archetype-based ECSes (bitecs, etc.) win — but they're an order of magnitude more code. Note: consume the returned object (or start your loop) before the next `join()` call on the same arena; it is reused, not fresh.
 
-**More than two components, or an exclusion?** `arena.joinN(required, excluded)` (1.9.0) generalizes `join` to *k* required sets plus a NOT list — *"every `required`, none of `excluded`"* — and picks the **globally rarest** required set as the driver, so you iterate the smallest set even with three or four constraints:
+**More than two components, or an exclusion?** `arena.joinN(required, excluded, reqMask?, excMask?)` (1.9.0; masks 1.10.0) generalizes `join` to *k* required sets plus a NOT list — *"every `required`, none of `excluded`"* — and picks the **globally rarest** required set as the driver, so you iterate the smallest set even with three or four constraints:
 
 ```js
 const REQ = [Renderable, Position, Visible], EXC = [Culled]; // hoist once per system
@@ -725,6 +741,23 @@ for (let i = 0; i < n; i++) {
   // e has every required set and no excluded set
 }
 ```
+
+**Flag masks (1.10.0).** `joinN(required, excluded, reqMask, excMask)` also carries two flag masks on the plan, so the same loop adds ONE row read per candidate (`F = arena.registerFlags([...])` first):
+
+```js
+const p = arena.joinN(REQ, EXC, F.visible, F.culled);
+const row = p.flags, m = arena.indexMask, rm = p.reqMask, xm = p.excMask; // hoist
+// ... drv / n / oth / no / ex / nx hoisted as above ...
+for (let i = 0; i < n; i++) {
+  const e = drv.dense[i];
+  const w = row[e & m];                                // flag word FIRST: one read rejects early
+  if ((w & rm) !== rm || (w & xm) !== 0) continue;
+  // ... then the others / excl has() checks as above ...
+  // e has every required set, no excluded set, every reqMask bit and no excMask bit
+}
+```
+
+The driver is still the smallest required **set**; masks never change the plan's sets. `p.flags` is `null` on an arena without `registerFlags()`; a non-zero mask there throws before any state write (M-10), and an empty `required` still throws the required-set error first (M-11). `(reqMask & excMask) !== 0` matches nothing in production and throws in checked mode (M-13). In checked mode a supplied-but-`undefined` mask (a misspelled `F.tpyo`) throws; in production it reads 0 and fails open (M-25). `reserve()` replaces `arena.flags` and refreshes the production plan's `flags` to the new row, but a hoisted `row` (and a checked plan) keeps the pre-reserve row: re-read after growing. There is no flags-only join: a scan with no required set is a caller loop over `arena.flags`, O(capacity) (M-11). Nominal: a mask outside [-2^30, 2^30 - 1] may be a heap number on pointer-compressed engines; hoist it into a local as above (Node cannot measure it).
 
 Same discipline as `join`: it plans, you write the loop. The `others`/`excl` arrays are **grow-once reused scratch** — loop to `othersCount`/`exclCount`, never `.length` (a larger prior call can leave a stale tail), and consume before the next `join()`/`joinN()`. `join(a, b)` itself is unchanged.
 
@@ -747,7 +780,7 @@ Call `arena.clear()`. It empties the arena and every registered component in pla
 `arena.remainingCapacity()` returns how many more entities you can spawn right now. It normally equals `capacity - activeCount`, but it dips lower as slots retire (fail-closed rollover; every slot retires after 4095 despawns of it) — `arena.retiredCount` counts those. If `spawn()` throws while `activeCount` is well under `capacity`, retirement is why, and the throw message says so. Check `remainingCapacity()` between frames to grow (via `reserve()`) before you hit the wall. Until slots retire, `retiredCount` is `0` and `remainingCapacity()` is just the free-slot count; see the despawn budget under Generational rollover.
 
 **How do I catch API misuse in development?**
-Construct with `new Arena(n, { checked: true })` in your tests. It makes silent mistakes loud: reading a `join()` plan after the next `join()` (the scratch is single-use), calling `idx()` on a dead or unattached entity (it's an unchecked fast path), and passing a flag mask that is not a 32-bit integer (a misspelled flag name). All are off and zero-cost in production — see [Checked mode](#checked-mode-development-only).
+Construct with `new Arena(n, { checked: true })` in your tests. It makes silent mistakes loud: reading a `join()` plan after the next `join()` (the scratch is single-use), calling `idx()` on a dead or unattached entity (it's an unchecked fast path), and passing a flag mask (or `joinN` mask) that is not a 32-bit integer or is `undefined` (a misspelled flag name). All are off and zero-cost in production -- see [Checked mode](#checked-mode-development-only).
 
 ---
 

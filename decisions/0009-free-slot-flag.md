@@ -72,6 +72,10 @@ for the cold paths (constructor, `reserve`, `clear`).
   `spawn`; that change's A/B must count it.
 - Handles are not unique across arenas.
 
-Amendment (2026-10-27): torture Phase J renamed "lifecycle churn zero-GC"; it
-now also gates maxMinor: 0 (remove() allocates nothing for <= 4 TypedArray
-kinds, M-19) and reports, not gates, its pause.
+## Amendments
+
+- 2026-10-27: torture Phase J renamed "lifecycle churn zero-GC"; it
+now also gates maxMinor: 0 (remove() allocates nothing after warm-up for <= 4
+TypedArray kinds, M-19; despawn() inherits it through remove(); above 4 kinds a
+Float32/Float64 swap boxes a HeapNumber, 16 B on Node, 12 B pointer-compressed,
+NOMINAL; Uint32 >= 2^31 boxes too) and reports, not gates, its pause.

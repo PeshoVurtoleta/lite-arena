@@ -58,8 +58,8 @@ arena.clear();                          // reset in place (no realloc); ALL prio
 // Component ops on SparseSet<T>:
 Pos.add(e): number;        // returns dense index, or -1 if dead
 Pos.has(e): boolean;       // O(1), validates liveness + membership
-Pos.remove(e): boolean;    // O(1) swap-and-pop; allocates nothing (<= 4 TypedArray kinds app-wide)
-Pos.idx(e): number;        // UNSAFE fast-path — no checks; use only after has()
+Pos.remove(e): boolean;    // O(1) swap-and-pop; allocates nothing after warm-up (<= 4 TypedArray kinds app-wide)
+Pos.idx(e): number;        // UNSAFE fast-path -- no checks; use only after has()
 
 // Tag components (zero-size membership markers):
 const Frozen = arena.registerTag();     // SparseSet, empty null-proto data
@@ -85,6 +85,23 @@ for (let i = 0; i < m; i++) {
   for (let k = 0; k < no; k++) if (!oths[k].has(e)) { ok = false; break; }
   if (ok) for (let k = 0; k < nx; k++) if (exs[k].has(e)) { ok = false; break; }
   if (!ok) continue;                    // e has every REQ and no EXC
+  // ...
+}
+
+// Masked variant (1.10.0): same plan plus ONE flag-row read per candidate.
+// F2 = this arena's ONE registerFlags() map (a 2nd call throws), e.g. with 'visible' / 'culled'.
+const q = arena.joinN([Pos, Frozen], [Culled], F2.visible, F2.culled);
+const qrow = q.flags, im = arena.indexMask, rm = q.reqMask, xm = q.excMask;
+const qd = q.driver, qn = q.count, qo = q.others, qno = q.othersCount;
+const qx = q.excl, qnx = q.exclCount;
+for (let i = 0; i < qn; i++) {
+  const e = qd.dense[i];
+  const w = qrow[e & im];                            // flag word FIRST
+  if ((w & rm) !== rm || (w & xm) !== 0) continue;   // e has every reqMask bit, no excMask bit
+  let ok = true;
+  for (let k = 0; k < qno; k++) if (!qo[k].has(e)) { ok = false; break; }
+  if (ok) for (let k = 0; k < qnx; k++) if (qx[k].has(e)) { ok = false; break; }
+  if (!ok) continue;
   // ...
 }
 
@@ -165,6 +182,12 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
   set that is both required and excluded throws, and `idx()` on a dead/non-member
   entity throws, and setFlags/clearFlags/hasFlags throw unless every mask is a
   32-bit integer (0x80000000 ok; NaN, fractions, +-Infinity, non-numbers throw).
+  joinN() masks: a SUPPLIED reqMask / excMask must be a 32-bit integer (M-20), and a
+  supplied-but-undefined one (a misspelled F.tpyo) throws too (M-25); an OMITTED mask
+  is 0. PRODUCTION stays a plain `| 0`: there a misspelled joinN mask reads 0 and fails
+  open (matches as if no mask). (reqMask & excMask) !== 0 throws (M-13). A throwing
+  checked joinN validates before any scratch write or epoch bump, so earlier plans
+  stay valid (M-22); a non-SparseSet `required` entry gets the foreign-set error.
   The checked `idx` shadows the prototype method as an own property, so the production `idx()` fast path is
   byte-for-byte unchanged.
 - Flags: `registerFlags(names)` once (<= 32 distinct non-empty strings; name i ->
@@ -175,8 +198,10 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
 - `despawn()` automatically removes the entity from every registered component.
 - Replace a column only via `rebind()` (`reserve()` replaces all columns); never
   assign `comp.data[key]` -- `remove()` walks a cached column array and will not
-  see it. `remove()` allocates nothing while the app uses <= 4 distinct TypedArray
-  kinds; above that each Float32/Float64 column boxes 16 B per swapping remove.
+  see it. `remove()` allocates nothing (after warm-up) while the app uses <= 4 distinct
+  TypedArray kinds; above that each Float32/Float64 column boxes 16 B per swapping
+  remove (Node HeapNumber; 12 B pointer-compressed, NOMINAL), Uint32 values >= 2^31
+  box too, and `despawn()` inherits the limit through `remove()`.
 - `registerComponent(schema)` validates the schema at registration (a cold path):
   every field type must be one of the nine numeric TypedArray constructors
   (Int8/Uint8/Uint8Clamped/Int16/Uint16/Int32/Uint32/Float32/Float64Array), or
@@ -195,16 +220,25 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
   smaller-count set); it allocates nothing and is called once per system, cold.
   It is a planner, not an iterator -- there is deliberately no `query()` or
   `forEach()`. Consume the result before the next `join()` on the same arena.
-- `joinN(required, excluded)` generalizes `join` to k required sets plus a NOT
+- `joinN(required, excluded, reqMask, excMask)` generalizes `join` to k required sets plus a NOT
   list ("A AND B AND C, WITHOUT D"). It returns a REUSED scratch
-  `{driver, count, others, othersCount, excl, exclCount}` -- driver = the rarest
+  `{driver, count, others, othersCount, excl, exclCount, reqMask, excMask, flags}` -- driver = the rarest
   required set (ties favour the first), `others` = the remaining required sets to
   `has()`-check, `excl` = the excluded sets to `!has()`-check. Loop to
   `othersCount`/`exclCount`, never `.length` (the arrays are grow-once scratch
   with a possible stale tail), and consume before the next `join()`/`joinN()`.
   Fail-closed: empty/null `required` throws; `excluded` null is the empty list; a
-  set in BOTH lists yields the empty match (throws in checked mode). `join(a, b)`
-  is untouched -- the fast two-set path stays exactly as it was.
+  set in BOTH lists yields the empty match (throws in checked mode). Optional
+  flag masks (1.10.0, M-4): `reqMask` bits must all be set and `excMask` bits all
+  clear in the entity's flag word; masks are normalised `| 0`, and the plan
+  carries them plus `flags` (= `arena.flags`, null without `registerFlags()`,
+  `reserve()` refreshes the production plan's `flags`, but a hoisted row or a checked
+  plan keeps the pre-reserve row -- re-read after growing). A non-zero mask
+  without `registerFlags()` throws (M-10); empty `required` still throws first
+  (M-11: a flags-only scan is a caller loop over `arena.flags`, O(capacity));
+  `(reqMask & excMask) !== 0` matches nothing (throws in checked mode, M-13).
+  NOMINAL: a mask outside [-2^30, 2^30 - 1] may be a heap number on
+  pointer-compressed engines. `join(a, b)` is untouched -- the fast two-set path stays exactly as it was.
 - The arena NEVER auto-grows. `spawn()` at capacity throws; growth happens only
   through an explicit, between-frames `reserve(newCap)`. `reserve()` reallocates
   every backing buffer (copying live contents; all handles/memberships/dense

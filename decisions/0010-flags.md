@@ -44,7 +44,7 @@ allocate the row and return a frozen `{}`.
 | Bytes per slot | 4 B for 32 flags | 8 B per tag | 1 bit per flag (4 B per 32 flags), caller-owned |
 | Test | `isAlive` + one row read | `has(e)` | caller index + mask |
 | Iterate | scan O(capacity) | dense list O(count) | scan O(capacity / 32) words |
-| `joinN` | not yet | yes | no |
+| `joinN` | yes (1.10.0, M-4 / M-10..M-13) | yes | no |
 | Cleanup on despawn | built in | cascade | caller's job |
 
 Tags stay the right tool for sets that are small, iterated or joined. A column
@@ -60,7 +60,9 @@ No timings were measured for this decision; the table is structural.
 - Bit 31 is the Int32 sign bit: the 32nd flag reads as `-2147483648`. Bits 30-31
   are outside the 31-bit Smi range on pointer-compressed engines (e.g. Chrome), so
   such a value held in a JS variable may be a heap number; inside the Int32Array
-  it is a plain int32. NOMINAL: Node cannot observe it.
+  it is a plain int32. NOMINAL: Node cannot observe it. For `joinN` masks the
+  same applies: a mask outside [-2^30, 2^30 - 1] may be a heap number on
+  pointer-compressed engines (NOMINAL; Node cannot measure it).
 - Precondition (M-6): calling a flag method before `registerFlags()` on a live handle (a dead handle returns false first) throws a
   native TypeError (the row is null). Documented, not guarded: a guard would cost
   bytes in three methods.
@@ -76,3 +78,31 @@ No timings were measured for this decision; the table is structural.
 - Options (M-17): `registerFlags` options must be a plain object or null /
   undefined; any own key throws (no options exist in 1.10.0).
 - Gates: `test/flags.test.js`, `test/flags-checked.test.js`.
+
+## joinN masks (M-4, M-10..M-13, M-20; 1.10.0)
+
+`joinN(required, excluded, reqMask, excMask)` (see 0008 amendment). The caller's
+loop does one row read per candidate: `w = row[e & indexMask]`, match when
+`(w & rm) === rm && (w & xm) === 0`.
+
+- M-4: masks are optional, normalised `| 0` (omitted -> 0). The driver is still
+  the smallest required SET; masks never change the plan's sets.
+- M-10: a non-zero mask without `registerFlags()` throws before any state write.
+- M-11: `required = []` still throws (there is no driver). A flags-only scan is a
+  caller loop over `arena.flags`, O(capacity); it is not an API here.
+- M-12: the plan carries `reqMask`, `excMask` and `flags` (null without
+  `registerFlags()`). `reserve()` replaces the row and refreshes the production plan's `flags`; a
+  hoisted `row` (and a checked plan) keeps the pre-reserve row, so re-read after
+  `reserve()`.
+- M-13: `(reqMask & excMask) !== 0` matches nothing in production; checked mode
+  throws.
+- M-20 / M-25: checked mode throws when a SUPPLIED mask is not a 32-bit integer,
+  including a supplied-but-undefined one (`F.tpyo`: "must be a 32-bit integer,
+  got undefined"); a truly omitted mask is 0. Production stays `| 0`, so a
+  misspelled joinN mask reads 0 and fails open there (it matches as if no mask),
+  as for `setFlags`.
+- Bits 30-31: NOMINAL -- a mask outside [-2^30, 2^30 - 1] may be a heap number
+  on pointer-compressed engines; hoist it into a local once per system. Node
+  cannot measure it.
+- Gates: `test/joinN-masks.test.js`, `test/joinN-checked.test.js`,
+  `test/joinN-parity.test.js` (no-mask golden).

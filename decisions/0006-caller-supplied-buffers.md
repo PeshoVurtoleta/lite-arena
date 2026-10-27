@@ -112,3 +112,10 @@ Amendment (2026-10-27, 1.10.0): `remove()` now swaps through a per-set `_cols`
 column cache (see the 0003 amendment), so its body is no longer byte-identical
 to 1.6.1 and every set carries `_cols`; an own-allocated set still never
 carries `_callerBacked`.
+
+Amendment (2026-10-27, 1.10.0, M-23): `validateBufferTypeAndSize` brand-checks a
+caller-supplied buffer by calling the intrinsic `ArrayBuffer.prototype.byteLength`
+getter (and `SharedArrayBuffer`'s where it exists), captured once at module load.
+A prototype fake or a Proxy is rejected; a cross-realm buffer (a vm context's
+ArrayBuffer) is accepted; the size check uses the length the getter returned, so
+an own `byteLength` property cannot pass a wrong-sized buffer. Cold path only.

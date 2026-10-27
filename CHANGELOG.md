@@ -18,12 +18,25 @@ Target 1.10.0 (not cut). Groups A + B + D + E.
   place after `_grow` (`reserve()`) and `rebind()`. Scavenges per 500,000
   swapping removes (Node 26.8.2, `--trace-gc`, 1 MiB semi-space, deterministic
   gate in test/remove-alloc.test.js): 1 Float32-class column 22-23 -> 0; 4
-  columns (Float32, Float64, Int32, Uint8) 45-46 -> 0-1; tag set 0 -> 0 (2026-10-27, darwin, 7 runs after 20,000 warm-up ops; gate <= noop + 1).
-  Limit (maintainer decision M-19): remove() allocates nothing only while the
-  whole app's components use <= 4 distinct TypedArray kinds at the shared swap
-  site (V8 polymorphic limit). Above that each Float32/Float64 column still
-  boxes 16 B per swapping remove (pre-existing); REPORTED, 6 kinds: 76
-  scavenges before, 16 now (same 7 runs).
+  columns (Float32, Float64, Int32, Uint8) 45-46 -> 0-1; tag set 0 -> 0 (2026-10-27, darwin, 7 runs after 20,000
+  warm-up ops; gate <= noop + 1).
+  Limit (maintainer decision M-19): after warm-up, remove() allocates nothing
+  only while the whole app's components use <= 4 distinct TypedArray kinds at
+  the shared swap site (V8 polymorphic limit). Above that each Float32/Float64
+  column still boxes 16 B per swapping remove (pre-existing; Node's
+  HeapNumber, 12 B pointer-compressed, NOMINAL) and a Uint32 value >= 2^31
+  boxes too; despawn() inherits the limit through remove(). REPORTED, 6 kinds:
+  76 scavenges before, 16 now (7 runs on E).
+- Checked `joinN` (M-22): a throwing call (foreign set, set in both lists,
+  shared mask bits M-13, bad mask) now validates before any scratch write or
+  epoch bump, so earlier plans stay valid. A direct
+  `Arena.prototype.joinN.call(checkedArena, ...)` bypassing the wrapper still
+  fails closed (earlier plans go stale).
+- Caller-supplied buffers (`registerComponent` buffers / `rebind`, M-23) are
+  brand-checked via the intrinsic ArrayBuffer / SharedArrayBuffer `byteLength`
+  getters: prototype fakes and Proxies are rejected, cross-realm buffers (vm
+  contexts) are accepted, and the size check uses the real length (an own
+  `byteLength` shadow cannot pass).
 - Behaviour change: assigning `comp.data[key] = ...` directly was never
   supported and is now NOT honoured by `remove()` (the cache keeps the old
   view). Replace a column only via `rebind()`; `reserve()` replaces every
@@ -54,6 +67,31 @@ Target 1.10.0 (not cut). Groups A + B + D + E.
 
 ### Added
 
+- `joinN` flag masks (M-4): `joinN(required, excluded, reqMask, excMask)`.
+  Masks are normalised `| 0` (omitted -> 0); the caller's loop does ONE
+  `flags[e & arena.indexMask]` read per candidate and tests
+  `(w & rm) === rm && (w & xm) === 0`. The driver is still the smallest required
+  set. M-10: a non-zero mask on an arena without `registerFlags()` throws before
+  any state write. M-11: empty / null `required` still throws the required-set
+  error first; a flags-only scan is a caller loop over `arena.flags`,
+  O(capacity). M-13: `(reqMask & excMask) !== 0` matches nothing in production and
+  throws in checked mode. M-12: the plan carries `reqMask`, `excMask` and
+  `flags` (`arena.flags`, null without `registerFlags()`); `reserve()` replaces
+  the row and refreshes the production plan's `flags`, but a hoisted row (and a
+  checked plan) keeps the pre-reserve row: re-read after growing. With no masks the plan and loop
+  are unchanged. NOMINAL: a mask outside [-2^30, 2^30 - 1] may be a heap number
+  on pointer-compressed engines.
+- Checked mode (M-20 / M-25): a SUPPLIED `joinN` mask must be a 32-bit integer,
+  and a supplied-but-undefined one (a misspelled `F.tpyo`) throws "must be a
+  32-bit integer, got undefined"; a truly omitted mask is 0. The throw fires
+  before any state write. Production stays a plain `| 0` (a misspelled `joinN`
+  mask reads 0 and fails open); the prototype `joinN` is byte-identical.
+  In checked mode a non-SparseSet entry in `required` now gets the foreign-set
+  error instead of a TypeError.
+- `test/joinN-parity.test.js` with `test/golden/joinN-nomask.json`: a
+  1,200-record no-mask golden parity test against the pre-program build;
+  `test/joinN-masks.test.js` (flag-mask semantics); `test/joinN-checked.test.js`
+  (checked-mode mask guard).
 - Entity flags: `arena.registerFlags(names?, options?)` (once; allocates
   `arena.flags`, an Int32Array of one word per slot, and returns a frozen
   null-prototype `{ name: bit }` map, name i -> `1 << i`, name #32 ->
@@ -82,8 +120,12 @@ Target 1.10.0 (not cut). Groups A + B + D + E.
 - `test/torture.mjs`: Phase F liveness census, Phase J lifecycle churn
   zero-GC (`{ maxMajor: 0, maxMinor: 0 }`, pause reported, not gated; 200,000
   spawn/add/despawn on `Arena(4096)`), Phase K entity flags (528,384 ops, zero
-  GC, mirror oracle, retention leg), controls `ARENA_TORTURE_SLEAK=1` /
-  `ARENA_TORTURE_FLEAK=1`.
+  GC, mirror oracle, retention leg), Phase L masked joinN (Phase I's population,
+  32 registered flags, 200,000 `joinN(REQ, EXC, f0|f31, f5)` calls, per-call
+  count == brute-force hasFlags oracle, `{ maxMajor: 0, maxMinor: 0 }`; retention
+  leg 4,096 cycles back to 0; after `reserve(8192)` the old flag row is
+  unreachable (WeakRef) and `p.flags === arena.flags`), controls
+  `ARENA_TORTURE_SLEAK=1` / `ARENA_TORTURE_FLEAK=1` / `ARENA_TORTURE_MLEAK=1`.
 
 ### Docs
 
@@ -96,7 +138,7 @@ Target 1.10.0 (not cut). Groups A + B + D + E.
   platforms (pointer compression) for generations 1024..3071. Nominal.
 - Source line counts removed (package.json description, llms.txt, README).
 - `despawn()` documented as O(registered components), not O(1).
-- Test counts: 184 tests (182 pass, 2 skipped without `--expose-gc`). Files added this cycle: test/flags.test.js, test/flags-checked.test.js, test/remove-alloc.test.js, test/remove-parity.test.js, test/rebind-atomic.test.js.
+- Test counts: 280 tests (278 pass, 2 skipped without `--expose-gc`; 280 pass with it). Files added this cycle: test/flags.test.js, test/flags-checked.test.js, test/remove-alloc.test.js, test/remove-parity.test.js, test/rebind-atomic.test.js, test/joinN-parity.test.js, test/joinN-masks.test.js, test/joinN-checked.test.js.
 
 ## [1.9.0] - 2026-07-29
 
