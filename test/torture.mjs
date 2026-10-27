@@ -123,6 +123,20 @@
  *     activeCount and the sum of every flag word must all return to 0. Its
  *     control is ARENA_TORTURE_FLEAK=1 (below).
  *
+ *   Phase L (masked joinN zero-GC + oracle) -- the 1.10.0 flag-mask gate.
+ *     Phase I's population on an arena with 32 registered flags, planned with
+ *     joinN(REQ, EXC, f0|f31, f5) HOT_OPS_MIN times; each call runs the masked
+ *     loop (has() checks + ONE hoisted row read `row[e & m]` per candidate) and
+ *     its match count must equal a brute-force hasFlags() oracle (itself checked
+ *     against the harness's own flag words; non-degenerate: 0 < masked <
+ *     unmasked). Gated at RULES_L (maxMajor:0, maxMinor:0). A retention leg runs
+ *     4096 cycles x 64 spawn / setFlags / lite-leak track / masked joinN, then
+ *     untrack / despawn: tracker.size(), activeCount and the flag-word sum must
+ *     return to 0. Then reserve(8192): after two awaited gc() passes a WeakRef to
+ *     the old flag row must deref to undefined (the joinN scratch drops it) and a
+ *     fresh plan's p.flags must be the new arena.flags. Its control is
+ *     ARENA_TORTURE_MLEAK=1 (below).
+ *
  * A pass means something only if the gate can fail. Run
  *
  *     ARENA_TORTURE_LEAK=1 node --expose-gc test/torture.mjs    (Phase A/retention)
@@ -130,16 +144,18 @@
  *     ARENA_TORTURE_JLEAK=1 node --expose-gc test/torture.mjs   (Phase I/joinN)
  *     ARENA_TORTURE_SLEAK=1 node --expose-gc test/torture.mjs   (Phase J/churn)
  *     ARENA_TORTURE_FLEAK=1 node --expose-gc test/torture.mjs   (Phase K/flags)
+ *     ARENA_TORTURE_MLEAK=1 node --expose-gc test/torture.mjs   (Phase L/masked joinN)
  *
  * ARENA_TORTURE_LEAK skips every despawn: the retention oracles stay non-zero and
- * the process exits non-zero (Phase A, and Phase K's retention leg).
+ * the process exits non-zero (Phase A, and the Phase K / Phase L retention legs).
  * ARENA_TORTURE_HLEAK injects a retained per-frame
  * allocation into Phase H's hand-off loop, tripping maxArrayBuffersGrowth.
  * ARENA_TORTURE_JLEAK retains a per-call allocation in Phase I's join loop,
  * tripping maxMajor. ARENA_TORTURE_SLEAK retains a per-iteration allocation in
  * Phase J's churn loop, tripping maxMajor. ARENA_TORTURE_FLEAK retains 4,096
- * Float64Array(4096) inside Phase K's window, tripping RULES_K. Each is a
- * control -- see CHANGELOG.md and the DONE-WHEN.
+ * Float64Array(4096) inside Phase K's window, tripping RULES_K. ARENA_TORTURE_MLEAK
+ * retains a per-call allocation in Phase L's masked joinN loop, tripping RULES_L.
+ * Each is a control -- see CHANGELOG.md and the DONE-WHEN.
  *
  * Phase F runs FIRST, before Phase A, so its liveness census sees a fresh
  * process (no earlier phase's code warmed or shaped the arena paths it probes).
@@ -1075,6 +1091,244 @@ async function phaseK() {
     };
 }
 
+// --- Phase L: masked joinN is zero-GC and agrees with an oracle (1.10.0) ---------
+
+// Phase I's population (same construction) on an arena with 32 registered flags,
+// planned with joinN(REQ, EXC, L_RQ, L_XQ) HOT_OPS_MIN times. Every call runs the
+// documented masked loop -- the others / excl has() checks plus ONE flag-row read
+// `row[e & m]` per candidate (row = p.flags, m = arena.indexMask, rm = p.reqMask,
+// xm = p.excMask, hoisted per call) -- and its match count must equal, EVERY call,
+// a brute-force oracle taken once outside the window with arena.hasFlags(), itself
+// cross-checked against the harness's own flag words (lFlagWord, never read back).
+// The window is gated at RULES_L: zero major AND zero minor GC. The flag words
+// split the unmasked matches into every (f0, f31, f5) combination, so a loop that
+// ignores either mask bit, or the excluded mask, miscounts.
+//
+// Retention leg: L_CYCLES cycles x L_CHURN spawn / setFlags / lite-leak track /
+// masked joinN (count checked against the harness's words), then untrack /
+// despawn. tracker.size(), activeCount and the sum of every flag word must return
+// to 0. ARENA_TORTURE_LEAK=1 skips the release here too. Then reserve(8192) on that
+// arena: after two awaited gc() passes the OLD flag row must be unreachable (a
+// WeakRef to it derefs to undefined -- the joinN scratch must not retain it), and a
+// fresh plan's p.flags must be the new arena.flags.
+//
+// Control: ARENA_TORTURE_MLEAK=1 retains a per-call allocation inside the window
+// (lSink); RULES_L trips.
+const MLEAK = process.env.ARENA_TORTURE_MLEAK === '1';
+const L_CYCLES = 4096;     // retention cycles
+const L_CHURN = 64;        // entities spawned / tracked / released per cycle
+const L_GROW = 8192;       // reserve() target after the retention leg
+const L_RQ = 1 | (1 << 31);  // F.f0 | F.f31 (bit 31 = -2147483648): -2147483647
+const L_XQ = 1 << 5;         // F.f5
+const RULES_L = { maxMajor: 0, maxMinor: 0 };
+const lSink = [];          // retains the control's per-call allocations
+
+function lNames() {
+    const names = [];
+    for (let i = 0; i < 32; i++) names.push('f' + i);
+    return names;
+}
+
+// The flag word the harness gives population entity i (Phase I's index). f3 on
+// odd i is noise; bit 9 of i withholds f0, bit 7 withholds f31, bit 8 adds f5. On
+// the C-driven candidates (i = 64j) those are bits 3, 1, 2 of j: independent, so
+// of the 32 unmasked matches (j odd) exactly 4 pass both masks.
+function lFlagWord(i) {
+    let w = 0;
+    if (((i >> 9) & 1) === 0) w |= 1;          // f0
+    if ((i & 1) !== 0) w |= 1 << 3;            // f3 (noise)
+    if (((i >> 7) & 1) === 0) w |= 1 << 31;    // f31
+    if (((i >> 8) & 1) !== 0) w |= 1 << 5;     // f5
+    return w;
+}
+
+// Retention leg + reserve (synchronous, so no local of this frame -- the old row,
+// a plan, a hoisted `row` -- survives into the caller's awaited gc passes). Returns
+// the WeakRef to the pre-reserve row plus the counts; never a strong row ref.
+function lRetention() {
+    const ra = new Arena(CAP);
+    const rA = ra.registerComponent({ x: Float32Array });
+    const rD = ra.registerTag();
+    const F = ra.registerFlags(lNames());
+    if ((F.f0 | F.f31) !== L_RQ || F.f5 !== L_XQ) die('phaseL: retention flag map bits wrong');
+    const REQ = [rA], EXC = [rD];
+    const tracker = createLeakTracker({ name: 'arena-masked-join-retention' });
+    const leakHandles = new Array(CAP).fill(null);
+    const live = new Int32Array(L_CHURN);
+    const st = new Int32Array(3); // [0] LCG state, [1] first bad cycle + 1, [2] its count
+    st[0] = 0x1F123BB5;
+    let rng = st[0];
+    let joins = 0;
+    for (let cycle = 0; cycle < L_CYCLES; cycle++) {
+        let n = 0, want = 0;
+        for (let i = 0; i < L_CHURN; i++) {
+            if (ra.activeCount >= CAP) break; // LEAK control fills the arena: stop, do not throw
+            const e = ra.spawn();
+            rA.add(e);
+            const excluded = (i & 7) === 0;
+            if (excluded) rD.add(e);
+            rng = (Math.imul(rng, 1664525) + 1013904223) | 0;
+            if (!ra.setFlags(e, rng)) die('phaseL: setFlags false on a live entity');
+            if (!excluded && (rng & L_RQ) === L_RQ && (rng & L_XQ) === 0) want++;
+            const slot = e & INDEX_MASK;
+            leakHandles[slot] = tracker.track({ slot }, NOOP, slot);
+            live[n++] = e;
+        }
+        if (LEAK) continue; // control: skip the plan and the release entirely
+        const p = ra.joinN(REQ, EXC, L_RQ, L_XQ);
+        const drv = p.driver, cnt = p.count;
+        const ex = p.excl, nx = p.exclCount;
+        const row = p.flags, m = ra.indexMask, rm = p.reqMask, xm = p.excMask;
+        let got = 0;
+        for (let i = 0; i < cnt; i++) {
+            const e = drv.dense[i];
+            let ok = true;
+            for (let k = 0; k < nx; k++) if (ex[k].has(e)) { ok = false; break; }
+            if (!ok) continue;
+            const w = row[e & m];
+            if ((w & rm) !== rm || (w & xm) !== 0) continue;
+            got++;
+        }
+        joins++;
+        if (got !== want && st[1] === 0) { st[1] = cycle + 1; st[2] = got - want; }
+        for (let i = 0; i < n; i++) {
+            const e = live[i];
+            const slot = e & INDEX_MASK;
+            tracker.untrack(leakHandles[slot]);
+            leakHandles[slot] = null;
+            ra.despawn(e);
+        }
+    }
+    if (st[1] !== 0) die('phaseL: retention cycle ' + (st[1] - 1) + ' masked joinN count off by ' + st[2]);
+    if (!LEAK && joins !== L_CYCLES) die('phaseL: retention ran ' + joins + ' masked plans, expected ' + L_CYCLES);
+    let flagSum = 0;
+    const rrow = ra.flags;
+    for (let i = 0; i < CAP; i++) flagSum += rrow[i];
+    const trackerSize = tracker.size();
+    const activeCount = ra.activeCount;
+
+    // reserve() replaces arena.flags; take the WeakRef BEFORE, holding no strong ref.
+    const wr = new WeakRef(ra.flags);
+    if (!ra.reserve(L_GROW)) die('phaseL: reserve(' + L_GROW + ') failed');
+    if (ra.flags.length !== L_GROW) die('phaseL: flag row length ' + ra.flags.length + ' after reserve');
+    return { ra, REQ, EXC, wr, trackerSize, activeCount, flagSum };
+}
+
+function lTick() {
+    return new Promise(function (r) { setTimeout(r, 0); });
+}
+
+async function phaseL() {
+    const arena = new Arena(CAP);
+    const A = arena.registerComponent({ x: Float32Array }); // required, largest
+    const B = arena.registerTag();                          // required, half
+    const C = arena.registerTag();                          // required, rarest -> driver
+    const D = arena.registerTag();                          // excluded
+    const F = arena.registerFlags(lNames());
+    if ((F.f0 | F.f31) !== L_RQ || F.f5 !== L_XQ) die('phaseL: flag map bits wrong');
+
+    for (let i = 0; i < CAP; i++) {
+        const e = arena.spawn();
+        A.add(e);                        // A: every entity
+        if ((i & 1) === 0) B.add(e);     // B: half
+        if ((i & 63) === 0) C.add(e);    // C: sparse -> the consistent driver
+        if ((i & 127) === 0) D.add(e);   // D: sparser still, excluded
+        if (!arena.setFlags(e, lFlagWord(i))) die('phaseL: setFlags false on a live entity');
+    }
+
+    const REQ = [A, B, C];   // hoisted ONCE, as a real system would
+    const EXC = [D];
+
+    // Brute-force oracle, ONCE outside the window: the C-driven candidates in A and
+    // B and not D (the unmasked count), and of those the ones arena.hasFlags()
+    // accepts. Cross-checked against the harness's own words (slot === i here: a
+    // fresh arena hands out slots 0..CAP-1 in order).
+    let unmasked = 0, expected = 0, mirror = 0, failReq = 0, failExc = 0;
+    for (let i = 0; i < C.count; i++) {
+        const e = C.dense[i];
+        if (!(A.has(e) && B.has(e) && !D.has(e))) continue;
+        unmasked++;
+        if (arena.hasFlags(e, L_RQ, L_XQ)) expected++;
+        if (!arena.hasFlags(e, L_RQ, 0)) failReq++;
+        if (!arena.hasFlags(e, 0, L_XQ)) failExc++;
+        const w = lFlagWord(e & INDEX_MASK);
+        if ((w & L_RQ) === L_RQ && (w & L_XQ) === 0) mirror++;
+    }
+    if (expected !== mirror) die('phaseL: hasFlags oracle ' + expected + ' != harness words ' + mirror);
+    if (!(expected > 0) || !(expected < unmasked) || !(failReq > 0) || !(failExc > 0)) {
+        die('phaseL: degenerate oracle (masked=' + expected + ' unmasked=' + unmasked +
+            ' failReq=' + failReq + ' failExc=' + failExc + ')');
+    }
+
+    // [0] first call whose driver was not C + 1, [1] first miscounting call + 1,
+    // [2] that call's count. Preallocated: the window writes ints only.
+    const lst = new Int32Array(3);
+
+    globalThis.gc();
+    globalThis.gc();
+
+    const gc = new GcProfiler(256, { heap: true }).start();
+    gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
+
+    let acc = 0;
+    for (let n = 0; n < HOT_OPS_MIN; n++) {
+        const p = arena.joinN(REQ, EXC, L_RQ, L_XQ);
+        if (p.driver !== C && lst[0] === 0) lst[0] = n + 1;
+        const drv = p.driver, cnt = p.count;
+        const oth = p.others, no = p.othersCount;
+        const ex = p.excl, nx = p.exclCount;
+        const row = p.flags, m = arena.indexMask, rm = p.reqMask, xm = p.excMask;
+        let matched = 0;
+        for (let i = 0; i < cnt; i++) {
+            const e = drv.dense[i];
+            let ok = true;
+            for (let k = 0; k < no; k++) if (!oth[k].has(e)) { ok = false; break; }
+            if (ok) for (let k = 0; k < nx; k++) if (ex[k].has(e)) { ok = false; break; }
+            if (!ok) continue;
+            const w = row[e & m];
+            if ((w & rm) !== rm || (w & xm) !== 0) continue;
+            matched++;
+        }
+        if (matched !== expected && lst[1] === 0) { lst[1] = n + 1; lst[2] = matched; }
+        acc = acc + matched;
+        if (MLEAK) lSink.push(new Array(32)); // control: retained per-call alloc
+    }
+
+    const mu = process.memoryUsage();
+    gc.sampleHeap(performance.now(), mu.heapUsed, mu);
+
+    await gc.settle();
+    const summary = gc.summary();
+    gc.stop();
+
+    if (lst[0] !== 0) die('phaseL: masked joinN did not drive C at call ' + (lst[0] - 1));
+    if (lst[1] !== 0) {
+        die('phaseL: masked joinN match miscounted at call ' + (lst[1] - 1) + ' (got ' + lst[2] +
+            ' expected ' + expected + ', unmasked ' + unmasked + ')');
+    }
+    if (acc !== expected * HOT_OPS_MIN) die('phaseL: masked match total ' + acc + ' != ' + (expected * HOT_OPS_MIN));
+    lSink.length = 0;
+
+    // Retention leg + reserve (unmeasured), then the old-row reachability check.
+    const r = lRetention();
+    await lTick();
+    globalThis.gc();
+    await lTick();
+    globalThis.gc();
+    await lTick();
+    if (r.wr.deref() !== undefined) {
+        die('phaseL: the pre-reserve flag row is still reachable after reserve(' + L_GROW +
+            ') + 2 gc passes (the joinN scratch retains it)');
+    }
+    const q = r.ra.joinN(r.REQ, r.EXC, L_RQ, L_XQ);
+    if (q.flags !== r.ra.flags) die('phaseL: a fresh plan after reserve() does not carry arena.flags');
+
+    return {
+        report: checkNoGc(summary, RULES_L), summary, ops: HOT_OPS_MIN, expected, unmasked,
+        trackerSize: r.trackerSize, activeCount: r.activeCount, flagSum: r.flagSum,
+    };
+}
+
 // --- gate --------------------------------------------------------------------
 
 async function main() {
@@ -1097,14 +1351,17 @@ async function main() {
     const iRes = await phaseI();
     const j = await phaseJ();
     const k = await phaseK();
+    const l = await phaseL();
 
     // REPORTED, never gated: Phase J's wall-clock pause (host noise), plus the
-    // Phase J / K counts for the run log. stderr, so stdout stays exactly "ok".
+    // Phase J / K / L counts for the run log. stderr, so stdout stays exactly "ok".
     process.stderr.write(
         'torture: phaseJ major=' + j.summary.gc.major + ' minor=' + j.summary.gc.minor +
         ' maxPauseMs=' + j.summary.gc.maxMs.toFixed(3) + ' (pause reported, not gated)' +
         ' | phaseK ops=' + k.ops + ' major=' + k.summary.gc.major +
-        ' minor=' + k.summary.gc.minor + ' maxPauseMs=' + k.summary.gc.maxMs.toFixed(3) + '\n');
+        ' minor=' + k.summary.gc.minor + ' maxPauseMs=' + k.summary.gc.maxMs.toFixed(3) +
+        ' | phaseL ops=' + l.ops + ' major=' + l.summary.gc.major +
+        ' minor=' + l.summary.gc.minor + ' maxPauseMs=' + l.summary.gc.maxMs.toFixed(3) + '\n');
 
     const retentionOk = a.activeCount === 0 && a.trackerSize === 0;
     const budgetOk = b.report.ok;
@@ -1118,9 +1375,11 @@ async function main() {
     const churnOk = j.report.ok;
     const flagsOk = k.report.ok;
     const flagsRetentionOk = k.trackerSize === 0 && k.activeCount === 0 && k.flagSum === 0;
+    const maskedOk = l.report.ok;
+    const maskedRetentionOk = l.trackerSize === 0 && l.activeCount === 0 && l.flagSum === 0;
 
     if (retentionOk && budgetOk && joinOk && reserveOk && sweepOk && conservationOk && sabOk && transferOk &&
-        joinNOk && churnOk && flagsOk && flagsRetentionOk) {
+        joinNOk && churnOk && flagsOk && flagsRetentionOk && maskedOk && maskedRetentionOk) {
         process.stdout.write('ok\n');
         process.exit(0);
     }
@@ -1199,7 +1458,20 @@ async function main() {
             'torture: flags-retention -- trackerSize=' + k.trackerSize +
             ' activeCount=' + k.activeCount + ' flagSum=' + k.flagSum + ' (all must be 0)\n');
     }
-    die('gate rejected' + (LEAK || HLEAK || JLEAK || SLEAK || FLEAK ? ' (leaky control -- expected)' : ''));
+    if (!maskedOk) {
+        const gc = l.summary.gc;
+        process.stderr.write(
+            'torture: masked-joinN (phaseL) -- verdict=' + l.report.verdict +
+            ' source=' + l.summary.source +
+            ' major=' + gc.major + ' minor=' + gc.minor + ' maxMs=' + gc.maxMs.toFixed(3) +
+            ' (rules ' + JSON.stringify(RULES_L) + ')\n');
+    }
+    if (!maskedRetentionOk) {
+        process.stderr.write(
+            'torture: masked-joinN-retention (phaseL) -- trackerSize=' + l.trackerSize +
+            ' activeCount=' + l.activeCount + ' flagSum=' + l.flagSum + ' (all must be 0)\n');
+    }
+    die('gate rejected' + (LEAK || HLEAK || JLEAK || SLEAK || FLEAK || MLEAK ? ' (leaky control -- expected)' : ''));
 }
 
 main();
