@@ -71,3 +71,7 @@ for the cold paths (constructor, `reserve`, `clear`).
 - A per-instance `GEN_MASK` means a per-instance FREE, which is one more load in
   `spawn`; that change's A/B must count it.
 - Handles are not unique across arenas.
+
+Amendment (2026-10-27): torture Phase J renamed "lifecycle churn zero-GC"; it
+now also gates maxMinor: 0 (remove() allocates nothing for <= 4 TypedArray
+kinds, M-19) and reports, not gates, its pause.

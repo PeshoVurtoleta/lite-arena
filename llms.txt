@@ -58,7 +58,7 @@ arena.clear();                          // reset in place (no realloc); ALL prio
 // Component ops on SparseSet<T>:
 Pos.add(e): number;        // returns dense index, or -1 if dead
 Pos.has(e): boolean;       // O(1), validates liveness + membership
-Pos.remove(e): boolean;    // O(1) swap-and-pop
+Pos.remove(e): boolean;    // O(1) swap-and-pop; allocates nothing (<= 4 TypedArray kinds app-wide)
 Pos.idx(e): number;        // UNSAFE fast-path — no checks; use only after has()
 
 // Tag components (zero-size membership markers):
@@ -165,8 +165,7 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
   set that is both required and excluded throws, and `idx()` on a dead/non-member
   entity throws, and setFlags/clearFlags/hasFlags throw unless every mask is a
   32-bit integer (0x80000000 ok; NaN, fractions, +-Infinity, non-numbers throw).
-  The checked `idx` shadows the
-  prototype method as an own property, so the production `idx()` fast path is
+  The checked `idx` shadows the prototype method as an own property, so the production `idx()` fast path is
   byte-for-byte unchanged.
 - Flags: `registerFlags(names)` once (<= 32 distinct non-empty strings; name i ->
   `1 << i`, #32 -> -2147483648); a second call or any options key throws.
@@ -174,6 +173,10 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
   starts with no flags. See decisions/0010-flags.md.
 - `idx()` skips validation; only call inside loops where validity is guaranteed.
 - `despawn()` automatically removes the entity from every registered component.
+- Replace a column only via `rebind()` (`reserve()` replaces all columns); never
+  assign `comp.data[key]` -- `remove()` walks a cached column array and will not
+  see it. `remove()` allocates nothing while the app uses <= 4 distinct TypedArray
+  kinds; above that each Float32/Float64 column boxes 16 B per swapping remove.
 - `registerComponent(schema)` validates the schema at registration (a cold path):
   every field type must be one of the nine numeric TypedArray constructors
   (Int8/Uint8/Uint8Clamped/Int16/Uint16/Int32/Uint32/Float32/Float64Array), or

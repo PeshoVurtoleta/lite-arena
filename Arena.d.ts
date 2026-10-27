@@ -139,8 +139,7 @@ export class Arena {
      *   assertions -- a stale {@link Arena.join} plan and a misused
      *   {@link SparseSet.idx} throw, and setFlags / clearFlags / hasFlags throw
      *   unless every mask is a 32-bit integer (non-number, NaN, fraction, +-Infinity
-     *   or a value outside both int32 and uint32 throws; 0x80000000 is accepted),
-     *   -- that are OFF and
+     *   or a value outside both int32 and uint32 throws; 0x80000000 is accepted) -- that are OFF and
      *   zero-cost in production.
      *   The production hot paths are byte-for-byte unaffected by this flag.
      * @throws Error when `maxEntities` is not an integer in that range.
@@ -369,7 +368,9 @@ export class SparseSet<T extends Record<string, TypedArrayConstructor>> {
 
     /**
      * The parallel SoA payload data. Each key is a TypedArray of the
-     * declared type, indexable from 0 to `count - 1`.
+     * declared type, indexable from 0 to `count - 1`. Replace a column only
+     * via `rebind()`; `reserve()` replaces every column -- re-read after.
+     * Never assign `data[key]` directly (`remove()` will not honour it).
      */
     readonly data: ComponentData<T>;
 

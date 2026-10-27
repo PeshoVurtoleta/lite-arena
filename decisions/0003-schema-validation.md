@@ -53,6 +53,11 @@ longer has an inherited setter to hijack. The `for...in` in `remove()` walks a
 shorter (empty) prototype chain, so if anything it is marginally faster -- the
 hot body is byte-for-byte unchanged; only the object it iterates changed shape.
 
+Amendment (2026-10-27, 1.10.0): `remove()` no longer uses `for...in` (it
+allocated on every swapping remove over the dictionary-mode `data` bag). It
+walks the per-set `_cols` cache of column views, kept in step by `syncCols()`
+after `_grow` and `rebind`. AR-04 (null-prototype `data`) is unchanged.
+
 `data` is built from `Object.keys(schema)` -- own, enumerable, string keys only.
 Two footguns fail closed rather than silently dropping a field:
 

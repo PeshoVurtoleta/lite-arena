@@ -1564,7 +1564,8 @@ function bufFor(Ctor, capacity) {
 test('Arena: caller buffers > no options is byte-identical own-allocation (no _callerBacked own prop)', () => {
     const arena = new Arena(4);
     const c = arena.registerComponent({ x: Float32Array });
-    // The production default keeps the exact 1.6.1 instance shape: no own flag.
+    // The production default carries no own _callerBacked flag (since 1.10.0 a set
+    // also carries the internal `_cols` column cache, but still no own flag).
     assert.equal(Object.prototype.hasOwnProperty.call(c, '_callerBacked'), false);
     assert.equal(c._callerBacked, undefined);
     // And an empty options object (no buffers key) is still own-allocation.

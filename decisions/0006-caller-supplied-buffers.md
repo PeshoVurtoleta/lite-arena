@@ -107,3 +107,8 @@ mechanism that actually exists; S5 should not invent one it does not need.
   Worker cannot iterate yet, and the docs say so plainly. That is S6.
 - Related: this opens the S-track. [[0005-docs-drift-guard]] keeps the README
   and llms.txt honest about exactly what shipped here and what did not.
+
+Amendment (2026-10-27, 1.10.0): `remove()` now swaps through a per-set `_cols`
+column cache (see the 0003 amendment), so its body is no longer byte-identical
+to 1.6.1 and every set carries `_cols`; an own-allocated set still never
+carries `_callerBacked`.

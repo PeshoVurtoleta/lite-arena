@@ -922,6 +922,22 @@ export class Arena {
     }
 }
 
+/**
+ * COLD PATH (E1): re-point `set._cols` at the current `set.data` views after
+ * `_grow` or `rebind` replaced one or more of them. Overwrites the existing
+ * slots in place (same length, same key order as the constructor built them;
+ * `data` never gains or loses a key), so the array keeps its elements kind and
+ * never grows. A module function, not a prototype method, so the public method
+ * surface is unchanged.
+ *
+ * @param {SparseSet} set
+ */
+function syncCols(set) {
+    const keys = Object.keys(set.data);
+    const cols = set._cols;
+    for (let i = 0; i < keys.length; i++) cols[i] = set.data[keys[i]];
+}
+
 export class SparseSet {
     /**
      * Construct a sparse-set-backed component pool. Prefer
@@ -983,12 +999,22 @@ export class SparseSet {
         this.dense = new Int32Array(maxEntities);
 
         // AR-04: null-prototype bag. A schema key of `toString` / `constructor`
-        // now lands in a clean own slot instead of colliding with an inherited
-        // Object.prototype member, and the `for...in` in remove() walks a shorter
-        // chain. `data` is built only from own, enumerable, string keys, already
-        // validated by validateSchema() above.
+        // lands in a clean own slot instead of colliding with an inherited
+        // Object.prototype member. `data` is built only from own, enumerable,
+        // string keys, already validated by validateSchema() above. Nothing on a
+        // hot path enumerates it: remove() swaps through `_cols` (below).
         /** @type {Object<string, ArrayBufferView>} Parallel SoA payload arrays. */
         this.data = Object.create(null);
+
+        // E1: the same column views as a dense array, in `data` key order (a tag
+        // set has none). remove()'s swap walks this by index: a `for...in` over
+        // the dictionary-mode null-prototype `data` has no enum cache and
+        // allocated on a swapping remove until tier-up. Every write to a `data` slot
+        // (`_grow`, `rebind`) is followed by syncCols(), which rewrites these
+        // slots in place. Assigned right after `data`, so arena / count / sparse /
+        // dense / data keep their in-object offsets.
+        /** @type {ArrayBufferView[]} */
+        this._cols = [];
         const keys = Object.keys(schema);
         for (let i = 0; i < keys.length; i++) {
             const key = keys[i];
@@ -999,12 +1025,14 @@ export class SparseSet {
             this.data[key] = callerBacked
                 ? new TypedArrayConstructor(buffers[key], 0, maxEntities)
                 : new TypedArrayConstructor(maxEntities);
+            this._cols.push(this.data[key]);
         }
 
         // S5: mark caller-backed sets so reserve() can refuse to grow them (it
         // cannot resize a buffer it does not own; see decisions/0006). The flag is
         // an OWN property set ONLY on the caller path, so an own-allocated set --
-        // the production default -- keeps the exact 1.6.1 instance shape.
+        // the production default -- never carries it (its shape is the 1.6.1
+        // field set plus `_cols`).
         if (callerBacked) this._callerBacked = true;
 
         // AR-11: in checked mode only, shadow the prototype idx() with a validating
@@ -1079,9 +1107,10 @@ export class SparseSet {
             this.dense[denseIdx] = lastEntity;
             this.sparse[lastIndex] = denseIdx;
 
-            // Swap all parallel SoA data arrays.
-            for (const key in this.data) {
-                const arr = this.data[key];
+            // Swap all parallel SoA data arrays (indexed walk, no for-in).
+            const cols = this._cols;
+            for (let i = 0; i < cols.length; i++) {
+                const arr = cols[i];
                 arr[denseIdx] = arr[lastDenseIdx];
             }
         }
@@ -1130,6 +1159,7 @@ export class SparseSet {
             grown.set(old);
             this.data[key] = grown;
         }
+        syncCols(this);
     }
 
     /**
@@ -1230,8 +1260,12 @@ export class SparseSet {
         }
         const hasSAB = typeof SharedArrayBuffer === 'function';
         const capacity = this.arena.capacity;
-        // Validate EVERY supplied buffer before re-pointing anything, so a bad
-        // buffer in a multi-field rebind leaves the component untouched.
+        // Validate EVERY supplied buffer, then build EVERY view, before
+        // re-pointing anything, so a bad buffer (or a view constructor that
+        // throws) in a multi-field rebind leaves the component untouched. Each
+        // buffer is read from the map exactly ONCE: a getter cannot hand back a
+        // different value after validation.
+        const bufs = new Array(keys.length);
         for (let i = 0; i < keys.length; i++) {
             const key = keys[i];
             if (!Object.prototype.hasOwnProperty.call(this.data, key)) {
@@ -1240,16 +1274,23 @@ export class SparseSet {
                     'component schema. Every buffer must map to a declared field. ' +
                     'See decisions/0007-transferable-roundtrip.md');
             }
+            const buf = buffers[key];
+            bufs[i] = buf;
             // The field's TypedArray constructor survives detachment on the view
             // itself, so there is no need to retain the schema separately.
-            validateBufferTypeAndSize(key, buffers[key], this.data[key].constructor, capacity, hasSAB);
+            validateBufferTypeAndSize(key, buf, this.data[key].constructor, capacity, hasSAB);
         }
-        // All valid: re-point each supplied field to a fresh length-bounded view.
+        // All valid: build a fresh length-bounded view per supplied field. A
+        // throw here still leaves data and _cols untouched.
+        const views = new Array(keys.length);
         for (let i = 0; i < keys.length; i++) {
-            const key = keys[i];
-            const Ctor = this.data[key].constructor;
-            this.data[key] = new Ctor(buffers[key], 0, capacity);
+            views[i] = new (this.data[keys[i]].constructor)(bufs[i], 0, capacity);
         }
+        // Every view built: re-point the fields, then resync the column cache.
+        for (let i = 0; i < keys.length; i++) {
+            this.data[keys[i]] = views[i];
+        }
+        syncCols(this);
         this._callerBacked = true;
     }
 }

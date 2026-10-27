@@ -353,7 +353,7 @@ Throws if `maxEntities` is out of range or non-integer.
 |---|---|---|
 | `has(e)` | `boolean` | O(1). True iff alive AND attached. |
 | `add(e)` | `number` | Returns the dense index, or `-1` if dead. Idempotent on re-add. |
-| `remove(e)` | `boolean` | O(1) swap-and-pop. |
+| `remove(e)` | `boolean` | O(1) swap-and-pop. Allocates nothing while the whole app's components use <= 4 distinct TypedArray kinds (V8 polymorphic limit at the shared swap site); above that each Float32/Float64 column boxes 16 B per swapping remove. |
 | `idx(e)` | `number` | **Unsafe fast-path.** Returns the dense index without checks. Use only when you know `has(e) === true`. |
 
 ### Entity flags
@@ -500,7 +500,7 @@ Four levels of verification, depending on how deep you want to go.
 npm test
 ```
 
-Runs **138 test cases** (136 pass, 2 skipped without `--expose-gc`) under `node --test`, covering:
+Runs **184 test cases** (182 pass, 2 skipped without `--expose-gc`) under `node --test`, covering:
 
 | Group | What's tested |
 |---|---|
@@ -514,12 +514,16 @@ Runs **138 test cases** (136 pass, 2 skipped without `--expose-gc`) under `node 
 | Retirement budget | deterministic generation-retirement counts (`test/budget.test.js`): `capacity x 4095`, `clear()` 4094 refill, `reserve()` growth, Arena(1000) workloads |
 | Free-slot flag | a free slot's next handle is not alive; census `aliveCount === activeCount`; generation-stream parity (`test/free-slot.test.js`) |
 | Retirement observability | `remainingCapacity()` exactness, exhaustion message names full vs. retired, `clear()` resets + revives + invalidates prior handles |
-| Checked mode | stale `join()` plan throws; `idx()` on dead/non-member throws; prototype `idx()` untouched |
+| Checked mode | stale `join()` plan throws; `idx()` on dead/non-member throws; non-32-bit-integer flag masks throw; prototype `idx()` untouched |
+| Entity flags | register / set / clear / has semantics, 32nd-bit mask, dead handles (`test/flags.test.js`); checked-mode mask validation (`test/flags-checked.test.js`) |
+| `remove()` allocation | scavenge-count gate per 500,000 swapping removes: 1-col, 4-col and tag sets <= noop + 1, must-fail control (`test/remove-alloc.test.js`) |
+| `remove()` parity | a seeded 7,000-op trace (reserve, transfer-while-detached, rebind, caller-backed) hashes to the sha256 pinned on e675a64 and matches a plain-JS model (`test/remove-parity.test.js`) |
+| `rebind()` atomicity | each supplied buffer is read once, so a getter cannot hand in a bad buffer after validation (`test/rebind-atomic.test.js`); a bad buffer in a multi-field rebind re-points nothing (`test/Arena.test.js:1861`) |
 | Iteration patterns | dense scan covers every member exactly once |
 | Randomized churn | 1000 random ops vs. Set/Map oracle |
 | Zero-allocation guarantee | 100k spawn/despawn → < 1 MB heap (requires `--expose-gc`) |
 
-Two zero-allocation cases require `--expose-gc`; without it they skip (`node --test` → `136 passed, 2 skipped`, or `138 passed` under `node --expose-gc --test`). Suitable for CI.
+Two zero-allocation cases require `--expose-gc`; without it they skip (`node --test` -> `182 passed, 2 skipped`, or `184 passed` under `node --expose-gc --test`). Suitable for CI.
 
 ### 2. Torture gate — "does zero-GC actually hold under stress?"
 
@@ -527,7 +531,7 @@ Two zero-allocation cases require `--expose-gc`; without it they skip (`node --t
 npm run torture          # node --expose-gc test/torture.mjs
 ```
 
-The unit tests prove behaviour; the torture gate proves the *guarantees*. It prints exactly `ok` (exit 0) or fails loudly (non-zero), across ten phases: retention (create/dispose 4096 cycles, cross-checked by an external leak tracker), GC budget (`maxMajor: 0` over a 200k-op hot tick), `join` zero-alloc, reserve-then-hot, a handle-space sign-bit sweep, a retirement soak that asserts the conservation law `activeCount + retiredCount + freeListLength === capacity` after every operation (plus a liveness census: `aliveCount === activeCount` at start, after each retirement and after `clear()`), caller-supplied-buffer parity, the transferable detach/rebind round-trip, `joinN` zero-alloc against a brute-force oracle, and lifecycle churn (200,000 spawn/add/despawn on `Arena(4096)`, zero major GC). Each phase is its own control — the gate can fail. (`ARENA_TORTURE_LEAK=1 npm run torture` forces the retention phase to leak and exit non-zero; `ARENA_TORTURE_HLEAK=1` and `ARENA_TORTURE_JLEAK=1` do the same for the transfer and `joinN` phases, and `ARENA_TORTURE_SLEAK=1` for the churn phase — proving the gate bites.)
+The unit tests prove behaviour; the torture gate proves the *guarantees*. It prints exactly `ok` on stdout (plus one reported stderr line) (exit 0) or fails loudly (non-zero), across eleven phases: retention (create/dispose 4096 cycles, cross-checked by an external leak tracker), GC budget (`maxMajor: 0` over a 200k-op hot tick), `join` zero-alloc, reserve-then-hot, a handle-space sign-bit sweep, a retirement soak that asserts the conservation law `activeCount + retiredCount + freeListLength === capacity` after every operation (plus a liveness census: `aliveCount === activeCount` at start, after each retirement and after `clear()`), caller-supplied-buffer parity, the transferable detach/rebind round-trip, `joinN` zero-alloc against a brute-force oracle, and lifecycle churn (200,000 spawn/add/despawn on `Arena(4096)`, zero major and zero minor GC; pause reported, not gated), and entity flags (528,384 row-read / hasFlags / churn ops at zero GC, counts checked every frame against an independent mirror, retention leg back to 0). Each phase is its own control — the gate can fail. (`ARENA_TORTURE_LEAK=1 npm run torture` forces the retention phase to leak and exit non-zero; `ARENA_TORTURE_HLEAK=1` and `ARENA_TORTURE_JLEAK=1` do the same for the transfer and `joinN` phases, `ARENA_TORTURE_SLEAK=1` for the churn phase, and `ARENA_TORTURE_FLEAK=1` for the flags phase — proving the gate bites.)
 
 ### 3. Benchmark — "does it perform as claimed?"
 
@@ -555,7 +559,7 @@ A 50,000-particle gravity simulation. Drag to move the gravity well; observe con
 
 | Command | What it does |
 |---|---|
-| `npm test` | Run the unit suite (138 cases) under `node --test` |
+| `npm test` | Run the unit suite (184 cases) under `node --test` |
 | `npm run test:watch` | Re-run on save |
 | `npm run torture` | Run the zero-GC torture gate (`node --expose-gc test/torture.mjs`) |
 | `npm run bench` | Run the Node benchmark, write `bench/bench-results.json` |
@@ -656,6 +660,7 @@ worker.onmessage = ({ data: vxBuf }) => Vel.rebind({ vx: vxBuf });   // data.vx 
 - **A free slot's next handle is not alive.** Free slots carry a FREE flag in `generations` (spawn strips it, despawn sets it), so `isAlive`, `add` and `despawn` reject a handle for a slot that is not currently spawned, including one persisted from another run or arena (handles are not unique across arenas). See [decisions/0009-free-slot-flag.md](decisions/0009-free-slot-flag.md).
 - **Flag typos fail open in production; a dead handle is `false`.** `setFlags(e, F.tpyo)` (undefined mask) is a silent no-op returning `true`, and `hasFlags(e, F.tpyo)` is `true`; checked mode throws. `setFlags` / `clearFlags` / `hasFlags` on a dead handle return `false` and write nothing. See [Entity flags](#entity-flags).
 - **`despawn()` cascades to every registered component.** You never need to manually `pos.remove(e); vel.remove(e); sprite.remove(e); arena.despawn(e)` — just `arena.despawn(e)`.
+- **`remove()` allocates nothing, within a limit.** It walks a per-set cached column array (no `for...in`); measured 0 scavenges per 500,000 swapping removes for 1-col and tag sets, 0-1 for 4-col (7 runs, Node 26.8.2, darwin, 2026-10-27; gated <= noop + 1 in test/remove-alloc.test.js). That holds while the whole app's components use <= 4 distinct TypedArray kinds at the shared swap site (V8 polymorphic limit); above that each Float32/Float64 column boxes 16 B per swapping remove (6 kinds: 16 scavenges per 500,000 in all 7 runs, REPORTED). Replace a column only via `rebind()`; assigning `comp.data[key] = ...` directly is unsupported and `remove()` will not honour it.
 - **`remove()` does not zero the SoA tail.** After swap-and-pop, indices `[count, capacity)` contain stale data. Iterate `[0, count)` and you're fine. Don't read past `count` — there's no defined value there.
 - **`idx()` is unsafe by design.** It skips both the alive check and the membership check. Use it inside loops where you've just iterated `dense[0..count)` or just called `has()`. Calling `idx()` on a dead handle returns whatever `sparse[index]` happens to hold — garbage.
 - **`add()` is idempotent.** Calling `add(e)` twice returns the same dense index both times; the second call is a no-op.

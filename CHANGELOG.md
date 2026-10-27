@@ -7,10 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Target 1.10.0 (not cut). Groups A + B + D.
+Target 1.10.0 (not cut). Groups A + B + D + E.
 
 ### Fixed
 
+- `SparseSet.remove()` allocated on every swapping remove: its swap branch
+  walked `for (const key in this.data)` over the dictionary-mode null-prototype
+  `data` bag. Each set now caches its column views in an internal `_cols` array;
+  `remove()` walks it by index, and a module-level `syncCols()` refreshes it in
+  place after `_grow` (`reserve()`) and `rebind()`. Scavenges per 500,000
+  swapping removes (Node 26.8.2, `--trace-gc`, 1 MiB semi-space, deterministic
+  gate in test/remove-alloc.test.js): 1 Float32-class column 22-23 -> 0; 4
+  columns (Float32, Float64, Int32, Uint8) 45-46 -> 0-1; tag set 0 -> 0 (2026-10-27, darwin, 7 runs after 20,000 warm-up ops; gate <= noop + 1).
+  Limit (maintainer decision M-19): remove() allocates nothing only while the
+  whole app's components use <= 4 distinct TypedArray kinds at the shared swap
+  site (V8 polymorphic limit). Above that each Float32/Float64 column still
+  boxes 16 B per swapping remove (pre-existing); REPORTED, 6 kinds: 76
+  scavenges before, 16 now (same 7 runs).
+- Behaviour change: assigning `comp.data[key] = ...` directly was never
+  supported and is now NOT honoured by `remove()` (the cache keeps the old
+  view). Replace a column only via `rebind()`; `reserve()` replaces every
+  column (re-read `data.x` after).
+- `rebind()` is now atomic: it reads each supplied buffer once, validates, and
+  builds every view before re-pointing `data` and refreshing the cache, so a
+  throw can no longer leave `data` partly re-pointed.
 - A free slot's NEXT handle was alive. On a fresh `Arena(4)`,
   `isAlive((1 << 20) | 0)` was `true` with `activeCount` 0; `add()` on it
   succeeded and `spawn()` then returned exactly that handle already tagged. The
@@ -60,8 +80,10 @@ Target 1.10.0 (not cut). Groups A + B + D.
 - `test/free-slot.test.js` and `test/gen-stream.mjs`: census
   (`aliveCount === activeCount`) and generation-stream parity goldens.
 - `test/torture.mjs`: Phase F liveness census, Phase J lifecycle churn
-  zero-major (200,000 spawn/add/despawn on `Arena(4096)`), control
-  `ARENA_TORTURE_SLEAK=1`.
+  zero-GC (`{ maxMajor: 0, maxMinor: 0 }`, pause reported, not gated; 200,000
+  spawn/add/despawn on `Arena(4096)`), Phase K entity flags (528,384 ops, zero
+  GC, mirror oracle, retention leg), controls `ARENA_TORTURE_SLEAK=1` /
+  `ARENA_TORTURE_FLEAK=1`.
 
 ### Docs
 
@@ -74,7 +96,7 @@ Target 1.10.0 (not cut). Groups A + B + D.
   platforms (pointer compression) for generations 1024..3071. Nominal.
 - Source line counts removed (package.json description, llms.txt, README).
 - `despawn()` documented as O(registered components), not O(1).
-- Test counts: 138 tests (136 pass, 2 skipped without `--expose-gc`).
+- Test counts: 184 tests (182 pass, 2 skipped without `--expose-gc`). Files added this cycle: test/flags.test.js, test/flags-checked.test.js, test/remove-alloc.test.js, test/remove-parity.test.js, test/rebind-atomic.test.js.
 
 ## [1.9.0] - 2026-07-29
 

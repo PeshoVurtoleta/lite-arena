@@ -99,16 +99,29 @@
  *     always be the globally rarest required set. Its control is
  *     ARENA_TORTURE_JLEAK=1 (below).
  *
- *   Phase J (lifecycle churn zero-major) -- the free-slot (ADR 0009) gate.
+ *   Phase J (lifecycle churn zero-GC) -- the free-slot (ADR 0009) gate.
  *     200,000 iterations of spawn + component add + tag add + despawn on
- *     Arena(4096), recycling a 2048-handle ring, gated at RULES (maxMajor:0,
- *     maxPauseMs:4) under the same settle rules as B/C/D/I. About 100 cycles per
+ *     Arena(4096), recycling a 2048-handle ring, gated at RULES_J (maxMajor:0,
+ *     maxMinor:0) under the same settle rules as B/C/D/I. About 100 cycles per
  *     slot, far under the 4094 that would retire one, so it measures churn, not
- *     retirement (retiredCount must stay 0). It gates GC (no major, no long
- *     pause), NOT zero bytes: a component remove() that swaps runs a for-in over
- *     its data fields, which allocates per call (measured ~48 B/op on Node 26,
- *     frozen and current builds alike), so minor GCs are expected. Its control is
- *     ARENA_TORTURE_SLEAK=1 (below).
+ *     retirement (retiredCount must stay 0). Since 1.10.0 a swapping remove()
+ *     walks an indexed column cache (no for-in) and allocates nothing for <= 4
+ *     column kinds, so the lifecycle path is gated at ZERO scavenges, not just
+ *     zero majors. The wall-clock pause is REPORTED (one stderr line), never
+ *     gated: counts are deterministic, a pause is host noise. The pre-1.10.0
+ *     for-in build fails here on maxMinor. Its control is ARENA_TORTURE_SLEAK=1
+ *     (below).
+ *
+ *   Phase K (flag row zero-GC + oracle) -- the 1.10.0 entity-flags gate.
+ *     Arena(4096) full, registerFlags() with 32 names (bit 31 = -2147483648).
+ *     64 frames x (4096 hoisted row reads `row[e & m]` + 4096 hasFlags() + 64
+ *     despawn/spawn/setFlags) = 528,384 ops, gated at RULES_K (maxMajor:0,
+ *     maxMinor:0). Every frame the row-read count and the hasFlags() count must
+ *     equal an oracle count taken from the harness's own Int32Array mirror of
+ *     the flag words. A retention leg then runs 4096 cycles x 64 spawn /
+ *     setFlags(e, -1) / lite-leak track, untrack / despawn: tracker.size(),
+ *     activeCount and the sum of every flag word must all return to 0. Its
+ *     control is ARENA_TORTURE_FLEAK=1 (below).
  *
  * A pass means something only if the gate can fail. Run
  *
@@ -116,14 +129,20 @@
  *     ARENA_TORTURE_HLEAK=1 node --expose-gc test/torture.mjs   (Phase H/transfer)
  *     ARENA_TORTURE_JLEAK=1 node --expose-gc test/torture.mjs   (Phase I/joinN)
  *     ARENA_TORTURE_SLEAK=1 node --expose-gc test/torture.mjs   (Phase J/churn)
+ *     ARENA_TORTURE_FLEAK=1 node --expose-gc test/torture.mjs   (Phase K/flags)
  *
  * ARENA_TORTURE_LEAK skips every despawn: the retention oracles stay non-zero and
- * the process exits non-zero. ARENA_TORTURE_HLEAK injects a retained per-frame
+ * the process exits non-zero (Phase A, and Phase K's retention leg).
+ * ARENA_TORTURE_HLEAK injects a retained per-frame
  * allocation into Phase H's hand-off loop, tripping maxArrayBuffersGrowth.
  * ARENA_TORTURE_JLEAK retains a per-call allocation in Phase I's join loop,
  * tripping maxMajor. ARENA_TORTURE_SLEAK retains a per-iteration allocation in
- * Phase J's churn loop, tripping maxMajor. Each is a control -- see CHANGELOG.md
- * and the DONE-WHEN.
+ * Phase J's churn loop, tripping maxMajor. ARENA_TORTURE_FLEAK retains 4,096
+ * Float64Array(4096) inside Phase K's window, tripping RULES_K. Each is a
+ * control -- see CHANGELOG.md and the DONE-WHEN.
+ *
+ * Phase F runs FIRST, before Phase A, so its liveness census sees a fresh
+ * process (no earlier phase's code warmed or shaped the arena paths it probes).
  *
  * Peers are devDependencies, never runtime deps: Arena.js has zero deps.
  *
@@ -810,10 +829,11 @@ async function phaseI() {
 
 // The free-slot flag (ADR 0009) puts one XOR + one store in spawn() and an OR in
 // despawn()'s relink. This phase gates the lifecycle path itself -- not just the
-// dense tick -- at zero major GC: J_OPS iterations of spawn + component add + tag
-// add + despawn on Arena(CAP), gated at RULES (maxMajor:0, maxPauseMs:4) like the
-// other GcProfiler windows. Minor GCs are allowed and expected (the swap branch of
-// remove() allocates per call through its for-in over data; see file header).
+// dense tick -- at zero GC: J_OPS iterations of spawn + component add + tag add +
+// despawn on Arena(CAP), gated at RULES_J (maxMajor:0, maxMinor:0). Since 1.10.0
+// the swap branch of remove() walks an indexed column cache (`_cols`) and
+// allocates nothing for <= 4 column kinds, so not one scavenge is allowed. The
+// wall-clock maxPauseMs is REPORTED on stderr, never gated (see file header).
 // A ring of J_RING live handles (Int32Array, power-of-2 mask) is recycled
 // oldest-first, so the LIFO free list rotates J_RING + 1 slots:
 // each slot sees about (J_OPS + J_WARM) / (J_RING + 1) ~= 100 cycles, far under
@@ -828,16 +848,21 @@ const J_WARM = 4096;      // unmeasured warm-up iterations, same body
 const J_RING = 2048;      // live handles held while churning (power of 2)
 const J_MASK = J_RING - 1;
 const sSink = [];         // retains the control's per-iteration allocations
+// Counts only: GC events in the window are deterministic for a zero-alloc body.
+// No maxPauseMs here -- a wall-clock pause is host noise; it is reported instead.
+const RULES_J = { maxMajor: 0, maxMinor: 0 };
 
 // One churn run of `ops` iterations. ring/st are caller-owned typed arrays: st[0]
 // is the ring head, st[1] counts despawns that returned false (must stay 0).
-// Returns an integer checksum of the add() results so V8 cannot dead-code them.
+// Returns the bitwise OR of every add() result (so V8 cannot dead-code them):
+// an add() returns a dense index >= 0 or -1, so the OR is negative iff some add()
+// returned -1.
 function jChurn(arena, comp, tag, ring, st, ops, leak) {
     let acc = 0;
     let head = st[0];
     for (let n = 0; n < ops; n++) {
         const e = arena.spawn();
-        acc = (acc + comp.add(e) + tag.add(e)) | 0;
+        acc = acc | comp.add(e) | tag.add(e);
         if (!arena.despawn(ring[head])) st[1] = st[1] + 1;
         ring[head] = e;
         head = (head + 1) & J_MASK;
@@ -877,7 +902,7 @@ async function phaseJ() {
     gc.stop();
 
     if (st[1] !== 0) die('phaseJ: ' + st[1] + ' despawns of a ring handle returned false');
-    if (!(acc >= 0)) die('phaseJ: non-integer add() checksum');
+    if (!(acc >= 0)) die('phaseJ: negative add() checksum (an add() returned -1)');
     if (arena.retiredCount !== 0) die('phaseJ: churn retired ' + arena.retiredCount + ' slots');
     if (arena.activeCount !== J_RING) die('phaseJ: activeCount=' + arena.activeCount + ' expected ' + J_RING);
     if (comp.count !== J_RING || tag.count !== J_RING) {
@@ -889,7 +914,165 @@ async function phaseJ() {
         }
     }
 
-    return { report: checkNoGc(summary, RULES), summary };
+    return { report: checkNoGc(summary, RULES_J), summary };
+}
+
+// --- Phase K: entity flag row is zero-GC and agrees with an oracle (1.10.0) -------
+
+// A full Arena(CAP) with 32 registered flags (bit 31 = -2147483648). Each of
+// K_FRAMES frames runs the two documented read forms over every live entity --
+// the hoisted row read `row[e & m]` (row = arena.flags, m = arena.indexMask) and
+// arena.hasFlags(e, K_REQ, K_EXC) -- plus K_CHURN despawn / spawn / setFlags. The
+// match counts of both read forms must equal, EVERY frame, an oracle count over
+// the harness's own Int32Array mirror of the flag words (written from the masks
+// the harness chose, never read back from the arena). The window is gated at
+// RULES_K: zero major AND zero minor GC (the body allocates nothing: every value
+// is an int32, which is a Smi on Node).
+//
+// Retention leg: K_CYCLES cycles x K_CHURN spawn / setFlags(e, -1) / lite-leak
+// track, then untrack / despawn. tracker.size(), activeCount and the sum of every
+// flag word must return to 0 (despawn zeroes the word). ARENA_TORTURE_LEAK=1
+// skips the untrack/despawn here too, so this leg fails with Phase A.
+//
+// Control: ARENA_TORTURE_FLEAK=1 retains a Float64Array(4096) per churn op
+// inside the window (K_FRAMES x K_CHURN = 4,096 of them, 128 MiB); RULES_K trips.
+const FLEAK = process.env.ARENA_TORTURE_FLEAK === '1';
+const K_FRAMES = 64;
+const K_WARM = 8;          // unmeasured warm-up frames, same body
+const K_CHURN = 64;        // despawn/spawn/setFlags per frame
+const K_CYCLES = 4096;     // retention cycles
+const K_REQ = (1 << 31) | (1 << 3);   // bit 31 in the required mask: -2147483640
+const K_EXC = 1 << 5;
+const K_OPS = K_FRAMES * (CAP + CAP + K_CHURN); // 528,384
+const RULES_K = { maxMajor: 0, maxMinor: 0 };
+const kSink = [];          // retains the control's per-op allocations
+
+// One frame. hs: live handles (ring of CAP), mir: the oracle's flag mirror
+// (slot-indexed), st: [0] churn cursor, [1] LCG state, [2] first mismatching
+// frame + 1 (0 = none), [3] last row count, [4] last hasFlags count, [5] last
+// oracle count. All state lives in caller-owned Int32Arrays: no allocation.
+function kFrame(arena, hs, mir, st, frame, leak) {
+    // Churn: replace K_CHURN entities with fresh ones carrying new random masks.
+    let cur = st[0];
+    let rng = st[1];
+    for (let k = 0; k < K_CHURN; k++) {
+        const old = hs[cur];
+        arena.despawn(old);
+        mir[old & INDEX_MASK] = 0;
+        const e = arena.spawn();
+        rng = (Math.imul(rng, 1664525) + 1013904223) | 0;
+        arena.setFlags(e, rng);
+        mir[e & INDEX_MASK] = mir[e & INDEX_MASK] | rng;
+        hs[cur] = e;
+        cur = (cur + 1) & (CAP - 1);
+        if (leak) kSink.push(new Float64Array(4096)); // control: retained per-op alloc
+    }
+    st[0] = cur;
+    st[1] = rng;
+
+    // Read form 1: hoisted flag row.
+    const row = arena.flags, m = arena.indexMask;
+    let rowN = 0;
+    for (let i = 0; i < CAP; i++) {
+        const w = row[hs[i] & m];
+        if ((w & K_REQ) === K_REQ && (w & K_EXC) === 0) rowN++;
+    }
+    // Read form 2: hasFlags().
+    let hasN = 0;
+    for (let i = 0; i < CAP; i++) {
+        if (arena.hasFlags(hs[i], K_REQ, K_EXC)) hasN++;
+    }
+    // Oracle: the mirror, by the TRUE definition of a match.
+    let orN = 0;
+    for (let i = 0; i < CAP; i++) {
+        const w = mir[i];
+        if ((w & K_REQ) === K_REQ && (w & K_EXC) === 0) orN++;
+    }
+    if ((rowN !== orN || hasN !== orN) && st[2] === 0) st[2] = frame + 1;
+    st[3] = rowN; st[4] = hasN; st[5] = orN;
+}
+
+async function phaseK() {
+    const arena = new Arena(CAP);
+    const names = [];
+    for (let i = 0; i < 32; i++) names.push('f' + i);
+    const F = arena.registerFlags(names);
+    if (F.f31 !== -2147483648) die('phaseK: flag #31 is ' + F.f31 + ', expected -2147483648');
+    if (F.f31 !== (1 << 31) || F.f3 !== 8 || F.f5 !== K_EXC) die('phaseK: flag map bits wrong');
+
+    const hs = new Int32Array(CAP);
+    const mir = new Int32Array(CAP);
+    const st = new Int32Array(6);
+    st[1] = 0x2545F491;
+    let rng = st[1];
+    for (let i = 0; i < CAP; i++) {
+        const e = arena.spawn();
+        rng = (Math.imul(rng, 1664525) + 1013904223) | 0;
+        arena.setFlags(e, rng);
+        mir[e & INDEX_MASK] = rng;
+        hs[i] = e;
+    }
+    st[1] = rng;
+    if (arena.activeCount !== CAP) die('phaseK: arena not full (' + arena.activeCount + ')');
+
+    for (let f = 0; f < K_WARM; f++) kFrame(arena, hs, mir, st, f, false);
+    if (st[2] !== 0) die('phaseK: warm-up frame ' + (st[2] - 1) + ' row/hasFlags/oracle = ' +
+        st[3] + '/' + st[4] + '/' + st[5]);
+
+    globalThis.gc();
+    globalThis.gc();
+
+    const gc = new GcProfiler(256, { heap: true }).start();
+    gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
+
+    for (let f = 0; f < K_FRAMES; f++) kFrame(arena, hs, mir, st, f, FLEAK);
+
+    const mu = process.memoryUsage();
+    gc.sampleHeap(performance.now(), mu.heapUsed, mu);
+
+    await gc.settle();
+    const summary = gc.summary();
+    gc.stop();
+
+    if (st[2] !== 0) die('phaseK: frame ' + (st[2] - 1) + ' row/hasFlags/oracle counts disagree (last ' +
+        st[3] + '/' + st[4] + '/' + st[5] + ')');
+    if (!(st[5] > 0) || st[5] === CAP) die('phaseK: degenerate oracle count ' + st[5]);
+    if (arena.activeCount !== CAP) die('phaseK: activeCount drifted to ' + arena.activeCount);
+    kSink.length = 0;
+
+    // Retention leg (unmeasured): its own empty arena with a flag row.
+    const ra = new Arena(CAP);
+    ra.registerFlags(['all']);
+    const tracker = createLeakTracker({ name: 'arena-flags-retention' });
+    const leakHandles = new Array(CAP).fill(null);
+    const live = new Int32Array(K_CHURN);
+    for (let cycle = 0; cycle < K_CYCLES; cycle++) {
+        let n = 0;
+        for (let i = 0; i < K_CHURN; i++) {
+            if (ra.activeCount >= CAP) break; // LEAK control fills the arena: stop, do not throw
+            const e = ra.spawn();
+            if (!ra.setFlags(e, -1)) die('phaseK: setFlags false on a live entity');
+            const slot = e & INDEX_MASK;
+            leakHandles[slot] = tracker.track({ slot }, NOOP, slot);
+            live[n++] = e;
+        }
+        if (LEAK) continue; // control: skip release entirely
+        for (let i = 0; i < n; i++) {
+            const e = live[i];
+            const slot = e & INDEX_MASK;
+            tracker.untrack(leakHandles[slot]);
+            leakHandles[slot] = null;
+            ra.despawn(e);
+        }
+    }
+    let flagSum = 0;
+    const rrow = ra.flags;
+    for (let i = 0; i < CAP; i++) flagSum += rrow[i];
+
+    return {
+        report: checkNoGc(summary, RULES_K), summary,
+        ops: K_OPS, trackerSize: tracker.size(), activeCount: ra.activeCount, flagSum,
+    };
 }
 
 // --- gate --------------------------------------------------------------------
@@ -899,19 +1082,29 @@ async function main() {
         die('run with --expose-gc:  node --expose-gc test/torture.mjs');
     }
 
+    // Phase F first: its liveness census must see a fresh process. Phases E and F
+    // self-report via die() on any failure, so reaching the gate below means the
+    // retirement soak and the handle-space sweep both passed. Included in the
+    // gate for symmetry.
+    const f = phaseF();
     const a = phaseA();
     const b = await phaseB();
     const c = await phaseC();
     const d = await phaseD();
-    // Phases E and F self-report via die() on any failure, so reaching here means
-    // the handle-space sweep and the retirement soak both passed. Included in the
-    // gate for symmetry.
     const e = phaseE();
-    const f = phaseF();
     const g = phaseG();
     const h = phaseH();
     const iRes = await phaseI();
     const j = await phaseJ();
+    const k = await phaseK();
+
+    // REPORTED, never gated: Phase J's wall-clock pause (host noise), plus the
+    // Phase J / K counts for the run log. stderr, so stdout stays exactly "ok".
+    process.stderr.write(
+        'torture: phaseJ major=' + j.summary.gc.major + ' minor=' + j.summary.gc.minor +
+        ' maxPauseMs=' + j.summary.gc.maxMs.toFixed(3) + ' (pause reported, not gated)' +
+        ' | phaseK ops=' + k.ops + ' major=' + k.summary.gc.major +
+        ' minor=' + k.summary.gc.minor + ' maxPauseMs=' + k.summary.gc.maxMs.toFixed(3) + '\n');
 
     const retentionOk = a.activeCount === 0 && a.trackerSize === 0;
     const budgetOk = b.report.ok;
@@ -923,8 +1116,11 @@ async function main() {
     const transferOk = h.ok;
     const joinNOk = iRes.report.ok;
     const churnOk = j.report.ok;
+    const flagsOk = k.report.ok;
+    const flagsRetentionOk = k.trackerSize === 0 && k.activeCount === 0 && k.flagSum === 0;
 
-    if (retentionOk && budgetOk && joinOk && reserveOk && sweepOk && conservationOk && sabOk && transferOk && joinNOk && churnOk) {
+    if (retentionOk && budgetOk && joinOk && reserveOk && sweepOk && conservationOk && sabOk && transferOk &&
+        joinNOk && churnOk && flagsOk && flagsRetentionOk) {
         process.stdout.write('ok\n');
         process.exit(0);
     }
@@ -987,9 +1183,23 @@ async function main() {
             'torture: churn -- verdict=' + j.report.verdict +
             ' source=' + j.summary.source +
             ' major=' + gc.major + ' maxMs=' + gc.maxMs.toFixed(3) +
-            ' (rules ' + JSON.stringify(RULES) + ')\n');
+            ' minor=' + gc.minor +
+            ' (rules ' + JSON.stringify(RULES_J) + ')\n');
     }
-    die('gate rejected' + (LEAK || HLEAK || JLEAK || SLEAK ? ' (leaky control -- expected)' : ''));
+    if (!flagsOk) {
+        const gc = k.summary.gc;
+        process.stderr.write(
+            'torture: flags -- verdict=' + k.report.verdict +
+            ' source=' + k.summary.source +
+            ' major=' + gc.major + ' minor=' + gc.minor + ' maxMs=' + gc.maxMs.toFixed(3) +
+            ' (rules ' + JSON.stringify(RULES_K) + ')\n');
+    }
+    if (!flagsRetentionOk) {
+        process.stderr.write(
+            'torture: flags-retention -- trackerSize=' + k.trackerSize +
+            ' activeCount=' + k.activeCount + ' flagSum=' + k.flagSum + ' (all must be 0)\n');
+    }
+    die('gate rejected' + (LEAK || HLEAK || JLEAK || SLEAK || FLEAK ? ' (leaky control -- expected)' : ''));
 }
 
 main();

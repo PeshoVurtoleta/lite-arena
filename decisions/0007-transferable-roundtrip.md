@@ -125,3 +125,8 @@ honest contract.
 - Related: builds directly on [[0006-caller-supplied-buffers]];
   [[0005-docs-drift-guard]] keeps the README and llms.txt honest about exactly
   what shipped.
+
+Amendment (2026-10-27, 1.10.0): `rebind()` reads each supplied buffer once,
+validates, and builds every view before re-pointing `data`, then refreshes the
+per-set column cache (`_cols`) that `remove()` walks. Internal invariant: every
+writer of `data[key]` must call `syncCols`.
