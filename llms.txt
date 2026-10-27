@@ -202,6 +202,7 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
   TypedArray kinds; above that each Float32/Float64 column boxes 16 B per swapping
   remove (Node HeapNumber; 12 B pointer-compressed, NOMINAL), Uint32 values >= 2^31
   box too, and `despawn()` inherits the limit through `remove()`.
+  Below 2^31 vs at >= 2^31: 0 vs 7-8 scavenges per 500,000 swapping removes (REPORTED, 2026-10-27, darwin 12 cores, Node 26.8.2, 6 kinds warmed, 1 MiB semi-space; 11 runs: 7 in 9 runs at load1 4.5-6.8, 8 in 2 runs at load1 1.56; scavenge counts, not timings).
 - `registerComponent(schema)` validates the schema at registration (a cold path):
   every field type must be one of the nine numeric TypedArray constructors
   (Int8/Uint8/Uint8Clamped/Int16/Uint16/Int32/Uint32/Float32/Float64Array), or

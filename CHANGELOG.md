@@ -25,7 +25,12 @@ Target 1.10.0 (not cut). Groups A + B + D + E.
   the shared swap site (V8 polymorphic limit). Above that each Float32/Float64
   column still boxes 16 B per swapping remove (pre-existing; Node's
   HeapNumber, 12 B pointer-compressed, NOMINAL) and a Uint32 value >= 2^31
-  boxes too; despawn() inherits the limit through remove(). REPORTED, 6 kinds:
+  boxes too
+  (below 2^31 vs at >= 2^31: 0 vs 7-8 scavenges per 500,000
+  swapping removes (REPORTED, 2026-10-27, darwin 12 cores, Node 26.8.2, 6
+  kinds warmed, 1 MiB semi-space; 11 runs: 7 in 9 runs at load1 4.5-6.8, 8 in
+  2 runs at load1 1.56; scavenge counts, not timings));
+  despawn() inherits the limit through remove(). REPORTED, 6 kinds:
   76 scavenges before, 16 now (7 runs on E).
 - Checked `joinN` (M-22): a throwing call (foreign set, set in both lists,
   shared mask bits M-13, bad mask) now validates before any scratch write or

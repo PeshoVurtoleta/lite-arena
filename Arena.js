@@ -283,7 +283,9 @@ function checkedHasFlags(entity, required, excluded) {
  * normalised `| 0`). Read-only: writes no arena state, so a throw here leaves the
  * join scratch, the epoch and every earlier plan untouched. Cold: called from
  * checkedJoinN (before the prototype joinN) and, as a guard, from the
- * CheckedJoinNPlan constructor.
+ * CheckedJoinNPlan constructor. Each call validates what ITS reads of `required`
+ * / `excluded` return; checked mode assumes plain arrays, so a getter or Proxy
+ * whose contents change between reads is not covered.
  */
 function checkJoinNSets(arena, required, excluded, reqMask, excMask) {
     const reg = arena.components;
@@ -1515,8 +1517,13 @@ class CheckedJoinNPlan {
         // `Arena.prototype.joinN.call(checkedArena, ...)`): the prototype has already
         // bumped the epoch, so a throw here stales every earlier plan (their reads
         // throw) instead of leaving one aliasing the overwritten others / excl
-        // scratch. Through checkedJoinN it passes unless `required` / `excluded`
-        // changed between reads (a getter or Proxy) -- that too now fails closed.
+        // scratch. Through checkedJoinN with plain arrays it re-reads the same
+        // sets and passes. It validates only what ITS reads return, not what
+        // the prototype joinN's own reads (driver pick, others / excl fill)
+        // returned: a list whose contents change between reads (a getter or
+        // Proxy) can make a foreign set the driver, or put one into others /
+        // excl, with no throw.
+        // Checked mode assumes plain arrays; that case is not covered.
         checkJoinNSets(arena, required, excluded, reqMask, excMask);
 
         this._arena = arena;

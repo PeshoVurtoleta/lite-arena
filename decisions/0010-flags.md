@@ -79,7 +79,7 @@ No timings were measured for this decision; the table is structural.
   undefined; any own key throws (no options exist in 1.10.0).
 - Gates: `test/flags.test.js`, `test/flags-checked.test.js`.
 
-## joinN masks (M-4, M-10..M-13, M-20; 1.10.0)
+## joinN masks (M-4, M-10..M-13, M-20, M-25; 1.10.0)
 
 `joinN(required, excluded, reqMask, excMask)` (see 0008 amendment). The caller's
 loop does one row read per candidate: `w = row[e & indexMask]`, match when

@@ -280,7 +280,9 @@ export class Arena {
      *
      * @param required Non-empty; entities must be in ALL of these.
      * @param excluded Entities must be in NONE of these (default: empty).
-     * @param reqMask Every bit must be set in the entity's flag word (default 0).
+     * @param reqMask Every bit must be set in the entity's flag word (default 0;
+     *   pass 0 to skip it -- a positional `undefined`, as in
+     *   `joinN(R, E, undefined, F.c)`, throws in checked mode).
      * @param excMask No bit may be set in the entity's flag word (default 0).
      * @returns The reused {@link JoinNPlan}.
      */

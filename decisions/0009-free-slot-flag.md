@@ -78,4 +78,8 @@ for the cold paths (constructor, `reserve`, `clear`).
 now also gates maxMinor: 0 (remove() allocates nothing after warm-up for <= 4
 TypedArray kinds, M-19; despawn() inherits it through remove(); above 4 kinds a
 Float32/Float64 swap boxes a HeapNumber, 16 B on Node, 12 B pointer-compressed,
-NOMINAL; Uint32 >= 2^31 boxes too) and reports, not gates, its pause.
+NOMINAL; Uint32 >= 2^31 boxes too -- below 2^31 vs at >= 2^31: 0 vs 7-8
+scavenges per 500,000 swapping removes (REPORTED, 2026-10-27, darwin 12 cores,
+Node 26.8.2, 6 kinds warmed, 1 MiB semi-space; 11 runs: 7 in 9 runs at load1
+4.5-6.8, 8 in 2 runs at load1 1.56; scavenge counts, not timings)) and
+reports, not gates, its pause.
