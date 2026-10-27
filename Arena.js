@@ -255,6 +255,22 @@ function checkedHasFlags(entity, required, excluded) {
     return Object.getPrototypeOf(this).hasFlags.call(this, entity, required, excluded);
 }
 
+/**
+ * @this {Arena} M-20: each SUPPLIED joinN mask must be a 32-bit integer; an omitted
+ * (undefined) mask is allowed (= 0). Installed as an OWN property in checked mode
+ * only, so the prototype joinN stays byte-identical (zero production cost). Fires
+ * before the prototype call, i.e. before any scratch write or epoch bump, so an
+ * earlier checked plan stays live after the throw. M-11 order: a null / empty
+ * `required` skips the mask check and still gets the required-set error.
+ */
+function checkedJoinN(required, excluded, reqMask, excMask) {
+    if (required != null && required.length !== 0) {
+        if (reqMask !== undefined) checkMask('joinN', 'the required', reqMask);
+        if (excMask !== undefined) checkMask('joinN', 'the excluded', excMask);
+    }
+    return Object.getPrototypeOf(this).joinN.call(this, required, excluded, reqMask, excMask);
+}
+
 export class Arena {
     /**
      * Allocates the memory pools for the ECS universe. Call once at setup.
@@ -321,12 +337,14 @@ export class Arena {
             driver: null, count: 0,
             others: this._joinNOthers, othersCount: 0,
             excl: this._joinNExcl, exclCount: 0,
+            reqMask: 0, excMask: 0, flags: null,
         };
 
         // Optional development-mode assertions (AR-09 / AR-11). OFF by default and
         // never consulted on any production hot path. When on: join() hands back a
         // staleness-checked plan, every SparseSet gets a validating idx(), and the
-        // arena gets validating setFlags/clearFlags/hasFlags (M-16, below).
+        // arena gets validating setFlags/clearFlags/hasFlags (M-16) and a joinN that
+        // rejects a supplied non-32-bit-integer mask (M-20), both below.
         this._checked = !!(options && options.checked === true);
 
         // Monotonic version stamp for join() plans, bumped on every checked join()
@@ -339,12 +357,14 @@ export class Arena {
         this.flags = null;
         this.indexMask = INDEX_MASK;
 
-        // M-16: checked mode only -- validating flag methods as OWN properties, so a
+        // M-16 / M-20: checked mode only -- validating flag methods and joinN (mask
+        // check) as OWN properties, so a
         // production Arena keeps its exact instance shape and prototype methods.
         if (this._checked) {
             this.setFlags = checkedSetFlags;
             this.clearFlags = checkedClearFlags;
             this.hasFlags = checkedHasFlags;
+            this.joinN = checkedJoinN;  // M-20: validates supplied masks, then delegates
         }
     }
 
@@ -414,6 +434,21 @@ export class Arena {
             `lite-arena: out of memory -- no free slot. capacity=${this.capacity}, ` +
             `activeCount=${this.activeCount}, retiredCount=0. The arena is full; despawn ` +
             'entities or raise capacity with reserve().');
+    }
+
+    /**
+     * COLD: builds the Error thrown by `joinN()` when a non-zero flag mask is
+     * passed to an arena that never called `registerFlags()` (M-10). Split out
+     * like `_exhausted()` so joinN carries only `throw this._noFlags(rm, xm)`.
+     * @param {number} rm - The normalised reqMask.
+     * @param {number} xm - The normalised excMask.
+     * @returns {Error}
+     */
+    _noFlags(rm, xm) {
+        return new Error(
+            `lite-arena: joinN() got reqMask=${rm}, excMask=${xm}, but this arena has no flag ` +
+            'row (arena.flags is null). Call registerFlags() before passing a non-zero reqMask ' +
+            'or excMask, or pass 0 / omit both masks.');
     }
 
     /**
@@ -678,11 +713,31 @@ export class Arena {
      * A foreign set (not registered with this arena) is trusted in production
      * exactly as `join` trusts its inputs; checked mode validates and throws.
      *
+     * Flag masks (M-4, optional): `reqMask` / `excMask` are normalised `| 0`
+     * (omitted -> 0) and carried on the plan with a `flags` reference to
+     * `arena.flags`, so the caller's loop does ONE row read per candidate. The
+     * driver is still the smallest required SET; masks never change the plan's
+     * sets. A non-zero mask on an arena without `registerFlags()` throws before
+     * any state write (M-10); `required` empty still throws the required-set
+     * error first (M-11). `reqMask & excMask` != 0 matches nothing in production
+     * and throws in checked mode (M-13). Checked mode also throws when a SUPPLIED
+     * mask is not a 32-bit integer (NaN, a fraction, a string, >= 2^32) -- before
+     * any state write (M-20). An undefined mask counts as omitted (= 0), so a
+     * misspelled flag name passed as a mask is NOT caught there.
+     * `p.flags` is the row at plan time:
+     * `reserve()` replaces `arena.flags`, so take a NEW plan after growing.
+     * NOMINAL: a mask outside [-2^30, 2^30 - 1] (bit 30 != bit 31) may be a heap
+     * number on pointer-compressed engines, so the plan field may hold one
+     * there; hoist it into a local once per system, as below.
+     *
      * @param {SparseSet[]} required  Non-empty; entities must be in ALL of these.
      * @param {SparseSet[]} [excluded]  Entities must be in NONE of these.
+     * @param {number} [reqMask=0]  Every bit must be set in the entity's flag word.
+     * @param {number} [excMask=0]  No bit may be set in the entity's flag word.
      * @returns {{ driver: SparseSet, count: number,
      *             others: SparseSet[], othersCount: number,
-     *             excl: SparseSet[], exclCount: number }}
+     *             excl: SparseSet[], exclCount: number,
+     *             reqMask: number, excMask: number, flags: Int32Array|null }}
      *
      * @example
      *   const REQ = [Renderable, Position, Visible], EXC = [Culled];  // hoist once
@@ -698,8 +753,21 @@ export class Arena {
      *       if (!ok) continue;
      *       // ... e has every required set and no excluded set ...
      *   }
+     *
+     * @example
+     *   // Masked: same loop plus ONE flag-row read (F = arena.registerFlags([...])).
+     *   const p = arena.joinN(REQ, EXC, F.visible, F.culled);
+     *   const row = p.flags, m = arena.indexMask, rm = p.reqMask, xm = p.excMask;
+     *   // ... drv / n / oth / no / ex / nx hoisted as above ...
+     *   for (let i = 0; i < n; i++) {
+     *       const e = drv.dense[i];
+     *       // ... the others / excl has() checks as above ...
+     *       const w = row[e & m];
+     *       if ((w & rm) !== rm || (w & xm) !== 0) continue;
+     *       // ... e also has every reqMask bit and no excMask bit ...
+     *   }
      */
-    joinN(required, excluded) {
+    joinN(required, excluded, reqMask, excMask) {
         // Fail closed: no required set means no driver and no honest result. An
         // empty match must be requested explicitly, never inferred from nothing.
         if (required == null || required.length === 0) {
@@ -708,6 +776,11 @@ export class Arena {
                 (required == null ? 'null/undefined' : 'an empty array') +
                 '. There is no driver and no honest result for zero required sets.');
         }
+
+        // Flag masks (M-4): normalised `| 0` (omitted -> 0). A non-zero mask with no
+        // flag row fails closed BEFORE any scratch write or epoch bump (M-10).
+        const rm = reqMask | 0, xm = excMask | 0;
+        if ((rm | xm) !== 0 && this.flags === null) throw this._noFlags(rm, xm);
 
         // Pick the global-min-count driver among the required sets. Ties favour
         // the earlier set, matching join()'s "ties favour a".
@@ -743,6 +816,9 @@ export class Arena {
         r.count = driver.count;
         r.othersCount = oc;
         r.exclCount = xc;
+        r.reqMask = rm;
+        r.excMask = xm;
+        r.flags = this.flags;
 
         // Production: hand back the reused scratch, zero allocation. Checked mode:
         // stamp a fresh, staleness-guarded plan (AR-09) that also validates every
@@ -750,7 +826,8 @@ export class Arena {
         if (this._checked) {
             this._joinEpoch = (this._joinEpoch + 1) | 0;
             return new CheckedJoinNPlan(
-                this, this._joinEpoch, required, excluded, driver, driver.count, others, oc, excl, xc);
+                this, this._joinEpoch, required, excluded, driver, driver.count, others, oc, excl, xc,
+                rm, xm, this.flags);
         }
         return r;
     }
@@ -862,6 +939,9 @@ export class Arena {
             const newFlags = new Int32Array(newCapacity);
             newFlags.set(this.flags);
             this.flags = newFlags;
+            // The joinN scratch must not retain the old row (a plan read after
+            // reserve() is invalid anyway; this only drops the reference).
+            this._joinNResult.flags = this.flags;
         }
 
         this.capacity = newCapacity | 0;
@@ -1338,11 +1418,13 @@ class CheckedJoinPlan {
  * make: a set not registered with this arena (foreign set), and a set that is
  * both required and excluded (a contradiction).
  *
- * Structurally a `{ driver, count, others, othersCount, excl, exclCount }`, so
- * it is a drop-in for the production scratch at every call site.
+ * Structurally a `{ driver, count, others, othersCount, excl, exclCount,
+ * reqMask, excMask, flags }`, so it is a drop-in for the production scratch at
+ * every call site. Also throws when reqMask & excMask != 0 (M-13).
  */
 class CheckedJoinNPlan {
-    constructor(arena, epoch, required, excluded, driver, count, others, othersCount, excl, exclCount) {
+    constructor(arena, epoch, required, excluded, driver, count, others, othersCount, excl, exclCount,
+        reqMask, excMask, flags) {
         // Foreign-set validation: every required and excluded set must be one of
         // this arena's registered components. Production skips this (zero cost,
         // exactly as join() trusts its inputs); checked mode fails closed.
@@ -1380,6 +1462,13 @@ class CheckedJoinNPlan {
                 }
             }
         }
+        // Same contradiction for flag bits (M-13): a bit both required and excluded
+        // can never match. Production returns a plan that matches nothing.
+        if ((reqMask & excMask) !== 0) {
+            throw new Error(
+                'lite-arena: joinN() reqMask and excMask share bit(s) ' + (reqMask & excMask) +
+                ' -- the match is always empty. Remove them from one mask. (checked mode.)');
+        }
 
         this._arena = arena;
         this._epoch = epoch;
@@ -1389,6 +1478,9 @@ class CheckedJoinNPlan {
         this._othersCount = othersCount;
         this._excl = excl;
         this._exclCount = exclCount;
+        this._reqMask = reqMask;
+        this._excMask = excMask;
+        this._flags = flags;
     }
 
     _live() {
@@ -1406,4 +1498,7 @@ class CheckedJoinNPlan {
     get othersCount() { this._live(); return this._othersCount; }
     get excl()        { this._live(); return this._excl; }
     get exclCount()   { this._live(); return this._exclCount; }
+    get reqMask()     { this._live(); return this._reqMask; }
+    get excMask()     { this._live(); return this._excMask; }
+    get flags()       { this._live(); return this._flags; }
 }
