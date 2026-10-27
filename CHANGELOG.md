@@ -5,6 +5,77 @@ All notable changes to `@zakkster/lite-arena` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Target 1.10.0 (not cut). Groups A + B + D.
+
+### Fixed
+
+- A free slot's NEXT handle was alive. On a fresh `Arena(4)`,
+  `isAlive((1 << 20) | 0)` was `true` with `activeCount` 0; `add()` on it
+  succeeded and `spawn()` then returned exactly that handle already tagged. The
+  same held for despawned, cleared and reserved slots. Free slots now store
+  `gen | FREE` (`FREE = (GEN_MASK + 1) << 1`, 0x2000); `spawn()` strips it with
+  XOR and stores the generation back (one `generations` load), `despawn()` sets
+  it, the constructor / `reserve()` fill `1 | FREE`, `clear()` maps
+  `(((g & ~FREE) % GEN_MASK) + 1) | FREE`. `isAlive` / `has` / `add` / `remove` /
+  `idx` are byte-identical. See decisions/0009-free-slot-flag.md.
+- `despawn()` of a free slot's handle returned `true`, drove `activeCount` to -1
+  and inserted the slot into the free list twice (fresh `Arena(4)`,
+  `despawn(1048576)`: `remainingCapacity()` 5). It now returns `false` and
+  changes nothing.
+- Behaviour change: a handle persisted from another run or arena and replayed
+  into a fresh or just-`clear()`ed arena was accepted; it now fails closed.
+  Handles are not unique across arenas. The generation sequence, retirement
+  timing and budget are unchanged.
+- Bytecode (Node 26.8.2, `--print-bytecode`): `spawn` 81 -> 93 B, `despawn`
+  177 -> 183 B (the `0x2000` literal is used in the hot bodies; the module const
+  by name would cost 95 / 185 B via a 2-byte TDZ hole check).
+
+### Added
+
+- Entity flags: `arena.registerFlags(names?, options?)` (once; allocates
+  `arena.flags`, an Int32Array of one word per slot, and returns a frozen
+  null-prototype `{ name: bit }` map, name i -> `1 << i`, name #32 ->
+  -2147483648), `setFlags(e, mask)` / `clearFlags(e, mask)` (boolean; false and no
+  write on a dead handle) and `hasFlags(e, required, excluded = 0)`. Masks are
+  normalised with `| 0`. `registerFlags` throws on a second call, more than 32
+  names, a duplicate / empty / non-string name, a non-plain options object or any
+  options key. `despawn()` zeroes the slot's word before the retirement branch;
+  `clear()` zeroes all words; `reserve()` replaces `arena.flags` (re-read it).
+  The flag methods before `registerFlags()`, on a live handle (a dead handle returns false first), throw a native TypeError. Bit ops are
+  inlined (no import). See decisions/0010-flags.md.
+- `arena.indexMask` (read-only, 0xFFFFF today): hoist it in hot loops
+  (`row[e & m]`); do not hard-code 0xFFFFF.
+- Checked mode: `setFlags` / `clearFlags` / `hasFlags` throw unless every mask is a
+  32-bit integer (non-number, NaN, fraction, +-Infinity or outside int32 and uint32;
+  0x80000000 accepted). Production fails open on a typo: `F.tpyo` is undefined,
+  `| 0` makes it 0, so `setFlags(e, F.tpyo)` is a silent no-op returning true.
+  Checked mode does not reject unregistered bits.
+
+- `test/budget.test.js`: deterministic retirement-budget gate in `npm test`
+  (untimed, public API only). `capacity x 4095` despawns, `clear()` 4094 refill,
+  `reserve()` growth, Arena(1000) C1 4,095,000 / C2 3,685,310 / C3 3,115,308
+  (Math.imul LCG, seed 20261027).
+- `test/free-slot.test.js` and `test/gen-stream.mjs`: census
+  (`aliveCount === activeCount`) and generation-stream parity goldens.
+- `test/torture.mjs`: Phase F liveness census, Phase J lifecycle churn
+  zero-major (200,000 spawn/add/despawn on `Arena(4096)`), control
+  `ARENA_TORTURE_SLEAK=1`.
+
+### Docs
+
+- Budget erratum (decisions/0001, dated 2026-10-27): retirement is a
+  `capacity x 4095` despawn budget, not a rarity; "never fires on realistic
+  workloads" removed from README, llms.txt and Arena.d.ts. ADR 0004 section 3
+  and 0001 note "Amended by 0009".
+- "32-bit SMI" corrected (decisions/0001, 0002 errata; Arena.d.ts, README): an
+  int32 handle, a Smi on 64-bit Node, possibly a heap number on 31-bit-Smi
+  platforms (pointer compression) for generations 1024..3071. Nominal.
+- Source line counts removed (package.json description, llms.txt, README).
+- `despawn()` documented as O(registered components), not O(1).
+- Test counts: 138 tests (136 pass, 2 skipped without `--expose-gc`).
+
 ## [1.9.0] - 2026-07-29
 
 N-way / exclusion joins. `join(a, b)` is a two-input driver-picker; real systems

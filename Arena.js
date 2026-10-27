@@ -21,10 +21,11 @@
  *     They grow only via an explicit, between-frames `reserve()` call -- never
  *     implicitly, so `spawn()` can never reallocate and invalidate hoisted refs.
  *   - Optional checked mode (`new Arena(n, { checked: true })`): development-only
- *     assertions -- a stale `join()` plan and a misused `idx()` throw instead of
- *     failing silently. OFF and zero-cost in production; the hot paths (join()'s
- *     reused scratch and the prototype `idx()`) are byte-for-byte identical
- *     whether or not it is on.
+ *     assertions -- a stale `join()` plan, a misused `idx()` and a flag mask
+ *     that is not a 32-bit integer (setFlags / clearFlags / hasFlags) throw
+ *     instead of failing silently. OFF and zero-cost in production; the hot paths
+ *     (join()'s reused scratch, the prototype `idx()` and the prototype flag
+ *     methods) are byte-for-byte identical whether or not it is on.
  *
  * @module @zakkster/lite-arena
  * @author Zahary Shinikchiev
@@ -213,6 +214,47 @@ function checkedIdx(entity) {
     return this.sparse[entity & INDEX_MASK];
 }
 
+/**
+ * M-16/M-18: CHECKED-mode flag-mask guard. A typo'd mask (`F.tpyo` reads
+ * undefined, and `undefined | 0` is 0; `F.hot + F.tpyo` is NaN, which also acts
+ * as 0) fails open in production; in checked mode it throws. Rejects non-numbers,
+ * NaN, fractions, +-Infinity and any value outside both the int32 and the uint32
+ * range; accepts every int32 and every uint32 (so 0x80000000, the 32nd flag
+ * written unsigned, passes).
+ * Cold: called only from the checked* wrappers below, which the Arena constructor
+ * installs as OWN properties ONLY when `checked: true` (the AR-11 pattern), so the
+ * prototype setFlags / clearFlags / hasFlags stay byte-identical and monomorphic.
+ * Validates first, then delegates: dead-handle and before-registerFlags behaviour
+ * is exactly the production one.
+ */
+function checkMask(method, which, mask) {
+    if (typeof mask !== 'number' || ((mask | 0) !== mask && (mask >>> 0) !== mask)) {
+        throw new Error(
+            `lite-arena: ${method}() ${which} mask must be a 32-bit integer, got ${
+                typeof mask === 'number' ? String(mask) : describeSchemaValue(mask)} ` +
+            '(a misspelled flag name reads undefined). (checked mode; OFF and zero-cost in production.)');
+    }
+}
+
+/** @this {Arena} */
+function checkedSetFlags(entity, mask) {
+    checkMask('setFlags', 'the', mask);
+    return Object.getPrototypeOf(this).setFlags.call(this, entity, mask);
+}
+
+/** @this {Arena} */
+function checkedClearFlags(entity, mask) {
+    checkMask('clearFlags', 'the', mask);
+    return Object.getPrototypeOf(this).clearFlags.call(this, entity, mask);
+}
+
+/** @this {Arena} `excluded` may be omitted (undefined); any other non-32-bit-integer throws. */
+function checkedHasFlags(entity, required, excluded) {
+    checkMask('hasFlags', 'the required', required);
+    if (excluded !== undefined) checkMask('hasFlags', 'the excluded', excluded);
+    return Object.getPrototypeOf(this).hasFlags.call(this, entity, required, excluded);
+}
+
 export class Arena {
     /**
      * Allocates the memory pools for the ECS universe. Call once at setup.
@@ -221,10 +263,13 @@ export class Arena {
      * @param {{ checked?: boolean }} [options] - Optional. `checked: true` turns
      *   on development-mode assertions that are OFF and zero-cost in production:
      *   `join()` returns a plan that throws if read after a later `join()`
-     *   superseded it, and `idx()` throws on an entity that is dead or lacks the
-     *   component. Leave it off in shipping builds -- the production hot paths
-     *   (join()'s reused scratch and the prototype `idx()`) are byte-for-byte
-     *   unaffected by this flag.
+     *   superseded it, `idx()` throws on an entity that is dead or lacks the
+     *   component, and `setFlags()` / `clearFlags()` / `hasFlags()` throw
+     *   unless every mask is a 32-bit integer (M-16/M-18; any int32 or uint32,
+     *   so 0x80000000 passes; an omitted `hasFlags` excluded mask is fine).
+     *   Leave it off in shipping builds -- the production hot paths (join()'s
+     *   reused scratch, the prototype `idx()` and the prototype flag methods)
+     *   are byte-for-byte unaffected by this flag.
      * @throws {Error} If `maxEntities` is not an integer in [1, 1048575].
      */
     constructor(maxEntities, options) {
@@ -280,13 +325,27 @@ export class Arena {
 
         // Optional development-mode assertions (AR-09 / AR-11). OFF by default and
         // never consulted on any production hot path. When on: join() hands back a
-        // staleness-checked plan and every SparseSet gets a validating idx().
+        // staleness-checked plan, every SparseSet gets a validating idx(), and the
+        // arena gets validating setFlags/clearFlags/hasFlags (M-16, below).
         this._checked = !!(options && options.checked === true);
 
         // Monotonic version stamp for join() plans, bumped on every checked join()
         // so a plan read after a subsequent join() throws instead of silently
         // reporting the newer join's driver/other/count. Unused when not checked.
         this._joinEpoch = 0 | 0;
+
+        // Per-slot flag row (Int32Array, slot-indexed), null until registerFlags().
+        // indexMask: hot loops hoist `const m = arena.indexMask`, read `row[e & m]`.
+        this.flags = null;
+        this.indexMask = INDEX_MASK;
+
+        // M-16: checked mode only -- validating flag methods as OWN properties, so a
+        // production Arena keeps its exact instance shape and prototype methods.
+        if (this._checked) {
+            this.setFlags = checkedSetFlags;
+            this.clearFlags = checkedClearFlags;
+            this.hasFlags = checkedHasFlags;
+        }
     }
 
     /**
@@ -389,6 +448,9 @@ export class Arena {
 
         this.activeCount = (this.activeCount - 1) | 0;
 
+        // Zero the flag word before either exit: free and retired rows stay 0.
+        if (this.flags !== null) this.flags[index] = 0;
+
         // 2. Advance the generation to invalidate stale handles in closures.
         //    A slot issues live generations 1..GEN_MASK. If this despawn returns
         //    the last one (GEN_MASK), the next bump would wrap and re-issue a
@@ -478,6 +540,70 @@ export class Arena {
      */
     registerTag() {
         return this.registerComponent({});
+    }
+
+    /**
+     * COLD, once: allocates `arena.flags` (Int32Array, one word per SLOT, all 0)
+     * and returns a frozen null-prototype map name i -> `1 << i` (#32 ->
+     * -2147483648). Validates before allocating (a throw leaves flags null).
+     * No names / [] -> frozen {}. reserve() REPLACES arena.flags: re-read it.
+     * @param {string[]} [names] - <= 32 distinct non-empty strings.
+     * @param {Object} [options] - A plain object (prototype Object.prototype or null) with
+     *   no own keys in this version: any own key (Symbol / non-enumerable too) throws.
+     * @returns {Readonly<Object<string, number>>}
+     */
+    registerFlags(names, options) {
+        if (this.flags !== null) throw new Error('lite-arena: registerFlags() was already called on this arena');
+        if (options != null) {
+            const k = typeof options !== 'object' || Array.isArray(options)
+                ? describeSchemaValue(options) : Reflect.ownKeys(options)[0];
+            if (k !== undefined) throw new Error(`lite-arena: registerFlags takes no options; got ${String(k)}`);
+            const proto = Object.getPrototypeOf(options);
+            if (proto !== Object.prototype && proto !== null) {
+                const c = Object.getOwnPropertyDescriptor(proto, 'constructor');
+                throw new Error('lite-arena: registerFlags options must be a plain object (prototype ' +
+                    `Object.prototype or null), got ${c && typeof c.value === 'function' && c.value.name
+                        ? (c.value.name === 'Object' ? 'an Object from another realm' : 'a ' + c.value.name)
+                        : 'an object with a custom prototype'}`);
+            }
+        }
+        const list = names === undefined ? [] : names;
+        if (!Array.isArray(list) || list.length > 32) {
+            throw new Error(`lite-arena: registerFlags names must be an array of <= 32 strings, got ${
+                Array.isArray(list) ? list.length + ' names' : describeSchemaValue(list)}`);
+        }
+        const map = Object.create(null);
+        for (let i = 0; i < list.length; i++) {
+            const name = list[i];
+            if (typeof name !== 'string' || name.length === 0 || name in map) {
+                throw new Error(`lite-arena: registerFlags name #${i} (${typeof name === 'string'
+                    ? JSON.stringify(name) : describeSchemaValue(name)}) is empty, not a string, or a duplicate`);
+            }
+            map[name] = 1 << i;
+        }
+        this.flags = new Int32Array(this.capacity);
+        return Object.freeze(map);
+    }
+
+    /** O(1): ORs `mask | 0` into e's flag word; false (no write) if dead. Needs registerFlags(). */
+    setFlags(entity, mask) {
+        if (!this.isAlive(entity)) return false;
+        this.flags[entity & INDEX_MASK] |= mask | 0;
+        return true;
+    }
+
+    /** O(1): clears `mask | 0` in e's flag word; false (no write) if dead. Needs registerFlags(). */
+    clearFlags(entity, mask) {
+        if (!this.isAlive(entity)) return false;
+        this.flags[entity & INDEX_MASK] &= ~(mask | 0);
+        return true;
+    }
+
+    /** O(1): alive, every `required` bit set, no `excluded` bit (omitted -> 0). Needs registerFlags(). */
+    hasFlags(entity, required, excluded) {
+        if (!this.isAlive(entity)) return false;
+        const w = this.flags[entity & INDEX_MASK];
+        return (w & (required | 0)) === (required | 0) && (w & (excluded | 0)) === 0;
     }
 
     /**
@@ -731,6 +857,13 @@ export class Arena {
             this.components[i]._grow(newCapacity);
         }
 
+        // Flag row: copy, new slots 0. Replaces arena.flags (re-read after growing).
+        if (this.flags !== null) {
+            const newFlags = new Int32Array(newCapacity);
+            newFlags.set(this.flags);
+            this.flags = newFlags;
+        }
+
         this.capacity = newCapacity | 0;
         return true;
     }
@@ -781,6 +914,8 @@ export class Arena {
         for (let i = 0; i < this.components.length; i++) {
             this.components[i].count = 0 | 0;
         }
+
+        if (this.flags !== null) this.flags.fill(0);
 
         this.activeCount = 0 | 0;
         this.retiredCount = 0 | 0;

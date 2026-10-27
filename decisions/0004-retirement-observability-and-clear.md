@@ -76,6 +76,9 @@ generation is bumped back onto that value). That is acceptable and documented:
 "all pre-clear handles are invalid" is the contract; do not retain a handle
 across a clear(). The alternative -- a clear() that leaks capacity -- is worse.
 
+Amended by 0009: `clear()` strips and re-sets the FREE flag around this map; the
+revive behaviour and the 4094-per-slot refill are unchanged.
+
 ### 4. No `onRetire` callback -- rejected in writing (AR-05)
 
 An `onRetire` hook is tempting and is the wrong shape: it is a callback into

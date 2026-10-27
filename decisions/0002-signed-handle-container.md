@@ -12,7 +12,7 @@ generation. `<<` and `|` operate on SIGNED 32-bit integers, so the moment a
 slot reaches generation 2048 the generation's top bit lands in bit 31 and the
 handle is a NEGATIVE number. `spawn()` has always returned that signed value,
 and this is correct and intentional -- the handle stays a 32-bit SMI, so it
-never boxes and spawning never allocates.
+never boxes and spawning never allocates. (see Erratum 2026-10-27)
 
 The bug was in the container, not the handle. `SparseSet.dense` was a
 `Uint32Array`. Storing a negative handle into a `Uint32Array` writes its
@@ -77,3 +77,12 @@ already gate. `>>> 0` would surface as heap growth in that same window.)
   under Changed.
 - `Int32Array` and `Uint32Array` have identical load/store cost; the hot
   iteration path is unchanged (asserted within noise against v1.3.0).
+
+## Erratum (2026-10-27)
+
+"32-bit SMI" above is imprecise. The handle is an int32; it is a Smi on 64-bit
+Node, but may be a heap number on 31-bit-Smi platforms (pointer compression,
+e.g. Chrome) for generations 1024..3071, where the value leaves the 31-bit
+range. The `Int32Array` decision is unaffected (it stores any int32 exactly and
+rejecting `>>> 0` still avoids a larger, uint32-wide range of non-Smi values).
+NOMINAL: Node cannot measure the pointer-compression case.

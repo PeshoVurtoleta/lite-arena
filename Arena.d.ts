@@ -4,7 +4,7 @@
  */
 
 /**
- * A 32-bit SMI handle holding both the entity slot index (low 20 bits)
+ * An int32 handle holding both the entity slot index (low 20 bits)
  * and the generation counter (high 12 bits).
  *
  * Always pass entity handles as-is to API methods; never decompose them
@@ -14,9 +14,15 @@
  * (the high bit is set). This is the intended bit pattern; equality and
  * `isAlive()` comparisons remain correct.
  *
+ * The handle is an int32: a Smi on 64-bit Node, but it may be a heap number on
+ * 31-bit-Smi platforms (pointer compression, e.g. Chrome) for generations
+ * 1024..3071 (nominal; Node cannot measure it).
+ *
  * The 12-bit generation field issues 4095 live values per slot. A slot that
  * exhausts them is retired on despawn (see {@link Arena.retiredCount}) rather
- * than wrapping, so a stale handle can never alias as valid.
+ * than wrapping, so a stale handle can never alias as valid. Handles are not
+ * unique across arenas: a handle from one arena (or a previous run) is only
+ * meaningful to the arena that minted it.
  */
 export type Entity = number;
 
@@ -99,19 +105,43 @@ export class Arena {
      * A slot is retired when it has issued all 4095 of its live generations;
      * it is never recycled, so a stale handle can never alias as valid
      * (fail-closed rollover; see the docs on {@link Entity}). Retirement is a
-     * cold-path event and never fires on realistic workloads -- entities that
-     * live for >= 1 frame never cycle a single slot 4095 times. Non-zero here
-     * means you have entered the adversarial-churn regime and are losing a slot
-     * of capacity per exhausted slot. Read-only.
+     * cold-path event, but it is a budget, not a rarity: at the default 20/12
+     * split the arena has `capacity x 4095` despawns from construction (the
+     * free list is LIFO, so a hot slot is reused at once). The first retirement
+     * lands at about `4095 x entity lifetime` and `spawn()` fails at or before
+     * `capacity x 4095 / despawns-per-second`, sooner when many entities are
+     * alive. `clear()` refills 4094 per revived slot; `reserve()` adds
+     * `(newCap - cap) x 4095`. See decisions/0001 (erratum). Read-only.
      */
     readonly retiredCount: number;
+
+    /**
+     * Per-slot flag words (Int32Array, slot-indexed, length = capacity), or
+     * `null` until {@link Arena.registerFlags} is called. Index with `e & indexMask`.
+     * Like `data.x`, `reserve()` REPLACES this array: re-read it after growing.
+     * Read-only from user code; write through setFlags / clearFlags.
+     * Bits 30-31 are plain int32 inside the array; held in a JS variable they may be
+     * heap numbers on pointer-compressed engines (nominal; Node cannot observe it).
+     */
+    readonly flags: Int32Array | null;
+
+    /**
+     * Mask that turns an {@link Entity} handle into its slot index (0xFFFFF
+     * today). Hoist it in hot loops: `const m = arena.indexMask; row[e & m]`.
+     * Do not hard-code 0xFFFFF. Read-only.
+     */
+    readonly indexMask: number;
 
     /**
      * Pre-allocates the ECS universe.
      * @param maxEntities Integer in `[1, 1048575]`.
      * @param options Optional. `checked: true` enables development-mode
      *   assertions -- a stale {@link Arena.join} plan and a misused
-     *   {@link SparseSet.idx} throw -- that are OFF and zero-cost in production.
+     *   {@link SparseSet.idx} throw, and setFlags / clearFlags / hasFlags throw
+     *   unless every mask is a 32-bit integer (non-number, NaN, fraction, +-Infinity
+     *   or a value outside both int32 and uint32 throws; 0x80000000 is accepted),
+     *   -- that are OFF and
+     *   zero-cost in production.
      *   The production hot paths are byte-for-byte unaffected by this flag.
      * @throws Error when `maxEntities` is not an integer in that range.
      */
@@ -119,7 +149,7 @@ export class Arena {
 
     /**
      * O(1) entity allocation.
-     * @returns A 32-bit generational handle.
+     * @returns An int32 generational handle.
      * @throws Error when all slots are in use.
      */
     spawn(): Entity;
@@ -127,14 +157,17 @@ export class Arena {
     /**
      * O(1) liveness check. Safe to call on any 32-bit integer.
      * Returns true only when the handle matches the slot's current generation.
+     * A free slot (never spawned, despawned, cleared or reserved) is never alive,
+     * including its next handle (FREE flag, decisions/0009).
      */
     isAlive(entity: Entity): boolean;
 
     /**
-     * O(1) despawn. Removes the entity from every registered component
-     * (via swap-and-pop), bumps the slot's generation, and returns the slot
+     * Despawn: O(registered components). Removes the entity from every
+     * registered component (via swap-and-pop), bumps the slot's generation, and returns the slot
      * to the free list.
-     * @returns true if the entity was alive, false if the handle was already stale.
+     * @returns true if the entity was alive, false if the handle was already stale
+     *   or names a free slot (nothing changes in that case).
      */
     despawn(entity: Entity): boolean;
 
@@ -251,6 +284,9 @@ export class Arena {
      * silently copy zero bytes; rebind the returned buffer first. See
      * decisions/0007.
      *
+     * New slots start free (their next handle is not alive) and add
+     * `(newCap - cap) x 4095` to the despawn budget.
+     *
      * @param newCapacity Target capacity; an integer `<= 1048575`.
      * @returns `true` if the arena grew, `false` if it was already large enough.
      * @throws Error when `newCapacity` is not an integer, exceeds 1048575, any
@@ -262,14 +298,58 @@ export class Arena {
      * Resets the arena to empty WITHOUT reallocating: rebuilds the free list,
      * advances every generation, revives every retired slot, and drops each
      * registered component's `count` to 0. O(capacity); a cold, between-frames
-     * operation that allocates nothing.
+     * operation that allocates nothing. Every slot is left free, with 4094
+     * generations per revived slot still to issue.
      *
      * Every {@link Entity} handle minted before `clear()` is INVALID afterward --
      * `isAlive()` rejects it (the honest contract of a reset). Reviving retired
      * slots restores full capacity and returns `retiredCount` to 0. Do not retain
-     * or test any pre-clear handle across a `clear()`.
+     * or test any pre-clear handle across a `clear()`; handles persisted from
+     * another run fail closed on a fresh or cleared arena.
      */
     clear(): void;
+
+    /**
+     * COLD, once per arena: allocates {@link Arena.flags} and returns a frozen
+     * null-prototype map `{ name: bit }`, name i -> `1 << i` (name #32 is
+     * -2147483648, the Int32 sign bit). `registerFlags()` and `registerFlags([])`
+     * allocate the row and return a frozen `{}`.
+     *
+     * @param names At most 32 distinct non-empty strings (`'__proto__'` is allowed).
+     * @param options `undefined` / `null` / a plain object with NO own keys (prototype
+     *   Object.prototype or null).
+     * @throws Error on a second call, more than 32 names, a duplicate / empty /
+     *   non-string name, a non-plain options object, or any options key. A throw
+     *   leaves `flags` null.
+     */
+    registerFlags(names?: readonly string[], options?: {} | null): Readonly<Record<string, number>>;
+
+    /**
+     * O(1): ORs `mask | 0` into the entity's flag word (0x80000000 works).
+     * Precondition: registerFlags() was called; before that, on a live handle, it throws a native
+     * TypeError (null row). A dead handle returns `false` and writes nothing;
+     * `setFlags(e, 0)` on a live entity is a no-op returning `true`.
+     * PRODUCTION fails open on a typo: `F.tpyo` is undefined, `undefined | 0` is 0,
+     * so the call is a silent no-op that returns `true`. Checked mode throws instead.
+     * @returns `true` if the entity is alive.
+     */
+    setFlags(entity: Entity, mask: number): boolean;
+
+    /**
+     * O(1): clears `mask | 0` in the entity's flag word. Same precondition,
+     * dead-handle and typo behaviour as {@link Arena.setFlags}.
+     * @returns `true` if the entity is alive.
+     */
+    clearFlags(entity: Entity, mask: number): boolean;
+
+    /**
+     * O(1): alive AND `(row & required) === required` AND `(row & excluded) === 0`.
+     * `excluded` defaults to 0. `hasFlags(e, 0)` on a live entity is `true`. A dead
+     * handle is `false`. Same precondition as {@link Arena.setFlags}; a typo'd mask
+     * reads as 0 in production (so `hasFlags(e, F.tpyo)` is `true`), and throws in
+     * checked mode. Checked mode does NOT reject unregistered bits.
+     */
+    hasFlags(entity: Entity, required: number, excluded?: number): boolean;
 }
 
 export class SparseSet<T extends Record<string, TypedArrayConstructor>> {

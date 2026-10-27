@@ -1,6 +1,6 @@
 # @zakkster/lite-arena
 
-> Zero-GC Entity-Component-System (ECS) memory allocator in ~280 lines.
+> Zero-GC Entity-Component-System (ECS) memory allocator in a single file.
 > Generational handles defeat ABA; SoA sparse sets give cache-friendly
 > iteration; swap-and-pop keeps removal O(1) without array shifts.
 
@@ -20,7 +20,8 @@ import { Arena, SparseSet, Entity } from '@zakkster/lite-arena';
 // Construction (once, at startup):
 const arena = new Arena(maxEntities: number);   // [1, 1_048_575]
 // Optional dev-only assertions (OFF and zero-cost in production):
-//   new Arena(maxEntities, { checked: true });  // stale join()/misused idx() throw
+//   new Arena(maxEntities, { checked: true });  // stale join()/misused idx() throw,
+//   // and a flag mask that is not a 32-bit integer throws (typo guard)
 
 // Components: SoA schemas mapped to parallel TypedArrays.
 const Pos = arena.registerComponent({
@@ -50,7 +51,7 @@ Vel.rebind({ vx: vxBuf });                   // return leg: Vel.data.vx is live 
 // Entity lifecycle:
 const e: Entity = arena.spawn();        // O(1), throws when full (throw names full vs retired)
 arena.isAlive(e): boolean;              // O(1), safe on arbitrary input
-arena.despawn(e): boolean;              // O(1), cascades to every component
+arena.despawn(e): boolean;              // O(registered components), cascades; false on a dead or free-slot handle
 arena.remainingCapacity(): number;      // O(1), = capacity - activeCount - retiredCount
 arena.clear();                          // reset in place (no realloc); ALL prior handles die
 
@@ -96,6 +97,21 @@ for (let i = 0; i < n; i++) {
   y[i] += vy[i] * dt;
 }
 
+// Entity flags: ONE Int32Array word per slot, up to 32 named bits (cold, once):
+const F = arena.registerFlags(['hot', 'dirty']);   // frozen { hot: 1, dirty: 2 }
+arena.setFlags(e, F.hot | F.dirty): boolean;       // O(1); false (no write) if dead
+arena.clearFlags(e, F.dirty): boolean;             // O(1); false if dead
+arena.hasFlags(e, F.hot, F.dirty): boolean;        // required all set, excluded none; false if dead
+// Hot loop: hoist the row and the mask; never hard-code 0xFFFFF.
+const row = arena.flags, m = arena.indexMask;      // row is REPLACED by reserve(): re-read
+for (let i = 0; i < n; i++) {
+    const e = dense[i];
+    if ((row[e & m] & F.hot) !== 0) { /* ... */ }
+}
+// Calling the flag methods before registerFlags() on a live handle (a dead handle returns false first) throws a TypeError. Production
+// fails OPEN on a typo: F.tpyo is undefined -> 0, so setFlags(e, F.tpyo) is a silent
+// no-op returning true. Use checked mode in development.
+
 // Capacity growth (cold, between-frames, EXPLICIT only):
 arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
 // spawn() at capacity THROWS -- it never auto-grows. Call reserve() yourself
@@ -112,8 +128,25 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
   guaranteed to be rejected on a fresh arena.
 - Generational rollover is fail-closed: a slot that exhausts its 4095 live
   generations is permanently retired on despawn (never recycled), so a stale
-  handle can never alias as valid. `arena.retiredCount` counts retired slots;
-  it stays `0` on realistic workloads. See decisions/0001-generational-rollover.md.
+  handle can never alias as valid. `arena.retiredCount` counts retired slots.
+  This is a despawn BUDGET, not a rarity: at the default 20/12 split the arena
+  has capacity x 4095 despawns from construction (LIFO free list: a hot slot is
+  reused at once); the first retirement lands at about 4095 x entity lifetime and
+  spawn() fails at or before capacity x 4095 / despawns-per-second, sooner when
+  many entities are alive (bound: (cap - active) x 4095 <= D <= cap x 4095 -
+  active). clear() refills 4094 per revived slot; reserve() adds
+  (newCap - cap) x 4095. Arena(1000): 1 spawn/frame with a 1-frame life fails at
+  4,095,000 despawns (100%), 10/frame with a 30-frame life at 3,685,310 (90%),
+  5/frame with a 1..120-frame life at 3,115,308 (76.08%); deterministic counts
+  gated by test/budget.test.js. See decisions/0001-generational-rollover.md
+  (erratum).
+- Free slots carry a FREE flag in `generations`: a free slot's next handle is not
+  alive, so isAlive/add/despawn reject it (also handles persisted from another run
+  or arena; handles are not unique across arenas). See
+  decisions/0009-free-slot-flag.md.
+- The handle is an int32: a Smi on 64-bit Node, possibly a heap number on
+  31-bit-Smi platforms (pointer compression, e.g. Chrome) for generations
+  1024..3071 (nominal; Node cannot measure it).
 - Conservation law: every slot is live, free, or retired, so
   `activeCount + retiredCount + remainingCapacity() === capacity` holds after
   every operation. `remainingCapacity()` (O(1)) is the free count; it drops below
@@ -130,9 +163,15 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
   in production. When on: reading a `join()`/`joinN()` plan after a later
   `join()`/`joinN()` throws (they share one epoch), a `joinN()` foreign set or a
   set that is both required and excluded throws, and `idx()` on a dead/non-member
-  entity throws. The checked `idx` shadows the
+  entity throws, and setFlags/clearFlags/hasFlags throw unless every mask is a
+  32-bit integer (0x80000000 ok; NaN, fractions, +-Infinity, non-numbers throw).
+  The checked `idx` shadows the
   prototype method as an own property, so the production `idx()` fast path is
   byte-for-byte unchanged.
+- Flags: `registerFlags(names)` once (<= 32 distinct non-empty strings; name i ->
+  `1 << i`, #32 -> -2147483648); a second call or any options key throws.
+  `despawn()` zeroes the slot's word and `clear()` zeroes all, so a respawned slot
+  starts with no flags. See decisions/0010-flags.md.
 - `idx()` skips validation; only call inside loops where validity is guaranteed.
 - `despawn()` automatically removes the entity from every registered component.
 - `registerComponent(schema)` validates the schema at registration (a cold path):
@@ -200,7 +239,7 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
 
 - [README.md](README.md): Full documentation, benchmarks, mermaid diagrams,
   FAQ, edge cases. Start here.
-- [./Arena.js](./Arena.js): The implementation (~280 lines, MIT, ESM).
+- [./Arena.js](./Arena.js): The implementation (MIT, ESM).
 - [./Arena.d.ts](./Arena.d.ts): TypeScript definitions, fully typed including
   `ComponentData<T>` generic for typed `data` field access.
 - [test/Arena.test.js](test/Arena.test.js): node:test unit suite including a
@@ -208,6 +247,11 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
   retirement/`clear()` observability, checked-mode assertions, caller-supplied
   buffer validation (both directions), and a zero-allocation guarantee under
   `--expose-gc`.
+- [test/budget.test.js](test/budget.test.js): deterministic generation-retirement
+  budget gate (untimed, public API only): capacity x 4095, the clear() 4094
+  refill, reserve() growth, Arena(1000) workloads.
+- [test/free-slot.test.js](test/free-slot.test.js): free-slot flag census
+  (a free slot's next handle is not alive) and generation-stream parity.
 - [test/cross-thread.test.js](test/cross-thread.test.js): a `worker_threads`
   smoke test proving a SharedArrayBuffer-backed component payload is reachable
   from a Worker both ways, postMessage-fenced.
