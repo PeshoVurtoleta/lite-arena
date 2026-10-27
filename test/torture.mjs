@@ -57,6 +57,14 @@
  *     back to full capacity. Self-controlling: any off-by-one in remainingCapacity
  *     /retirement/clear trips a die(). (Named Phase F: E is the handle sweep above
  *     and D is the reserve gate, both already shipped under those names.)
+ *     It also runs a liveness CENSUS -- aliveCount(arena) === activeCount, where
+ *     aliveCount brute-forces isAlive((g << 20) | i) over every slot i and every
+ *     generation g in [0, 4095] -- at start, after the prelude, after each
+ *     retirement, after clear() and after the post-clear refill. A free slot
+ *     that answers to its next handle (the pre-ADR-0009 build: a fresh slot
+ *     stores generation 1, so handle (1 << 20) | i was alive before any spawn)
+ *     fails it as "phaseF: census at start". Its own control: the frozen pre-fix
+ *     build exits 1 there.
  *
  *   Phase G (caller-supplied buffers) -- the S5 (1.7.0) gate. Runs the Phase B
  *     hot tick over a 4-field component TWICE: once own-allocated, once backed by
@@ -91,17 +99,31 @@
  *     always be the globally rarest required set. Its control is
  *     ARENA_TORTURE_JLEAK=1 (below).
  *
+ *   Phase J (lifecycle churn zero-major) -- the free-slot (ADR 0009) gate.
+ *     200,000 iterations of spawn + component add + tag add + despawn on
+ *     Arena(4096), recycling a 2048-handle ring, gated at RULES (maxMajor:0,
+ *     maxPauseMs:4) under the same settle rules as B/C/D/I. About 100 cycles per
+ *     slot, far under the 4094 that would retire one, so it measures churn, not
+ *     retirement (retiredCount must stay 0). It gates GC (no major, no long
+ *     pause), NOT zero bytes: a component remove() that swaps runs a for-in over
+ *     its data fields, which allocates per call (measured ~48 B/op on Node 26,
+ *     frozen and current builds alike), so minor GCs are expected. Its control is
+ *     ARENA_TORTURE_SLEAK=1 (below).
+ *
  * A pass means something only if the gate can fail. Run
  *
  *     ARENA_TORTURE_LEAK=1 node --expose-gc test/torture.mjs    (Phase A/retention)
  *     ARENA_TORTURE_HLEAK=1 node --expose-gc test/torture.mjs   (Phase H/transfer)
  *     ARENA_TORTURE_JLEAK=1 node --expose-gc test/torture.mjs   (Phase I/joinN)
+ *     ARENA_TORTURE_SLEAK=1 node --expose-gc test/torture.mjs   (Phase J/churn)
  *
  * ARENA_TORTURE_LEAK skips every despawn: the retention oracles stay non-zero and
  * the process exits non-zero. ARENA_TORTURE_HLEAK injects a retained per-frame
  * allocation into Phase H's hand-off loop, tripping maxArrayBuffersGrowth.
  * ARENA_TORTURE_JLEAK retains a per-call allocation in Phase I's join loop,
- * tripping maxMajor. Each is a control -- see CHANGELOG.md and the DONE-WHEN.
+ * tripping maxMajor. ARENA_TORTURE_SLEAK retains a per-iteration allocation in
+ * Phase J's churn loop, tripping maxMajor. Each is a control -- see CHANGELOG.md
+ * and the DONE-WHEN.
  *
  * Peers are devDependencies, never runtime deps: Arena.js has zero deps.
  *
@@ -472,12 +494,38 @@ function assertConservation(arena, where) {
     }
 }
 
+// Liveness census (the free-slot gate, ADR 0009). Counts every (slot, generation)
+// pair the arena calls alive by brute force: i in [0, capacity), g in [0, 4095],
+// handle (g << 20) | i. The oracle is the TRUE definition of "alive" -- it asks
+// isAlive() about every handle that can exist, not just the ones spawn() issued
+// -- so a free slot that still answers to its next generation counts as alive
+// and breaks the equality with activeCount. O(capacity x 4096): keep CAP_F small.
+function aliveCount(arena) {
+    const cap = arena.capacity;
+    let n = 0;
+    for (let i = 0; i < cap; i++) {
+        for (let g = 0; g <= 4095; g++) {
+            if (arena.isAlive((g << 20) | i)) n++;
+        }
+    }
+    return n;
+}
+
+function assertCensus(arena, where) {
+    const alive = aliveCount(arena);
+    if (alive !== arena.activeCount) {
+        die('phaseF: census ' + where + ' -- aliveCount=' + alive +
+            ' activeCount=' + arena.activeCount + ' (must be equal)');
+    }
+}
+
 function phaseF() {
     const CAP_F = 6;
     const arena = new Arena(CAP_F);
     const comp = arena.registerComponent({ x: Float32Array });
     const tag = arena.registerTag();
 
+    assertCensus(arena, 'at start');
     assertConservation(arena, 'at start');
     if (arena.remainingCapacity() !== CAP_F) die('phaseF: fresh remainingCapacity != capacity');
 
@@ -495,6 +543,7 @@ function phaseF() {
         assertConservation(arena, 'prelude despawn');
     }
     if (arena.remainingCapacity() !== CAP_F) die('phaseF: prelude did not fully drain');
+    assertCensus(arena, 'after prelude');
 
     // (2) Retirement grind -- retire EVERY slot, checking conservation and
     // remainingCapacity() after every spawn and every despawn. LIFO churn hammers
@@ -524,6 +573,7 @@ function phaseF() {
             die('phaseF: remainingCapacity=' + arena.remainingCapacity() +
                 ' expected ' + (CAP_F - retiredSoFar) + ' after ' + retiredSoFar + ' retirements');
         }
+        assertCensus(arena, 'after retirement ' + retiredSoFar);
     }
 
     // (3) Fully retired: empty yet exhausted, and the throw must NAME retirement.
@@ -539,6 +589,7 @@ function phaseF() {
     // (4) clear() restores the arena to full capacity and re-opens every slot,
     // reviving the retired ones -- the conservation law holds again afterward.
     arena.clear();
+    assertCensus(arena, 'after clear');
     assertConservation(arena, 'after clear');
     if (arena.activeCount !== 0)             die('phaseF: clear left activeCount != 0');
     if (arena.retiredCount !== 0)            die('phaseF: clear did not revive retired slots');
@@ -550,6 +601,7 @@ function phaseF() {
         assertConservation(arena, 'post-clear spawn ' + i);
     }
     if (arena.remainingCapacity() !== 0) die('phaseF: arena not full after respawning all slots post-clear');
+    assertCensus(arena, 'after post-clear refill');
 
     return { ok: true };
 }
@@ -754,6 +806,92 @@ async function phaseI() {
     return { report: checkNoGc(summary, RULES), summary };
 }
 
+// --- Phase J: spawn/add/despawn churn is zero-major (the free-slot gate) -------
+
+// The free-slot flag (ADR 0009) puts one XOR + one store in spawn() and an OR in
+// despawn()'s relink. This phase gates the lifecycle path itself -- not just the
+// dense tick -- at zero major GC: J_OPS iterations of spawn + component add + tag
+// add + despawn on Arena(CAP), gated at RULES (maxMajor:0, maxPauseMs:4) like the
+// other GcProfiler windows. Minor GCs are allowed and expected (the swap branch of
+// remove() allocates per call through its for-in over data; see file header).
+// A ring of J_RING live handles (Int32Array, power-of-2 mask) is recycled
+// oldest-first, so the LIFO free list rotates J_RING + 1 slots:
+// each slot sees about (J_OPS + J_WARM) / (J_RING + 1) ~= 100 cycles, far under
+// the 4094 that would retire it -- the phase measures churn, not retirement, and
+// asserts retiredCount stays 0.
+//
+// Control: ARENA_TORTURE_SLEAK=1 retains a per-iteration allocation inside the
+// window (sSink); the growing heap forces a major GC and maxMajor:0 trips.
+const SLEAK = process.env.ARENA_TORTURE_SLEAK === '1';
+const J_OPS = 200000;     // measured spawn+add+despawn iterations (>= HOT_OPS_MIN)
+const J_WARM = 4096;      // unmeasured warm-up iterations, same body
+const J_RING = 2048;      // live handles held while churning (power of 2)
+const J_MASK = J_RING - 1;
+const sSink = [];         // retains the control's per-iteration allocations
+
+// One churn run of `ops` iterations. ring/st are caller-owned typed arrays: st[0]
+// is the ring head, st[1] counts despawns that returned false (must stay 0).
+// Returns an integer checksum of the add() results so V8 cannot dead-code them.
+function jChurn(arena, comp, tag, ring, st, ops, leak) {
+    let acc = 0;
+    let head = st[0];
+    for (let n = 0; n < ops; n++) {
+        const e = arena.spawn();
+        acc = (acc + comp.add(e) + tag.add(e)) | 0;
+        if (!arena.despawn(ring[head])) st[1] = st[1] + 1;
+        ring[head] = e;
+        head = (head + 1) & J_MASK;
+        if (leak) sSink.push(new Array(32)); // control: retained per-iteration alloc
+    }
+    st[0] = head;
+    return acc;
+}
+
+async function phaseJ() {
+    const arena = new Arena(CAP);
+    const comp = arena.registerComponent({ x: Float32Array });
+    const tag = arena.registerTag();
+    const ring = new Int32Array(J_RING);
+    const st = new Int32Array(2);
+
+    for (let i = 0; i < J_RING; i++) {
+        const e = arena.spawn();
+        comp.add(e); tag.add(e);
+        ring[i] = e;
+    }
+    jChurn(arena, comp, tag, ring, st, J_WARM, false);
+
+    globalThis.gc();
+    globalThis.gc();
+
+    const gc = new GcProfiler(256, { heap: true }).start();
+    gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
+
+    const acc = jChurn(arena, comp, tag, ring, st, J_OPS, SLEAK);
+
+    const mu = process.memoryUsage();
+    gc.sampleHeap(performance.now(), mu.heapUsed, mu);
+
+    await gc.settle();
+    const summary = gc.summary();
+    gc.stop();
+
+    if (st[1] !== 0) die('phaseJ: ' + st[1] + ' despawns of a ring handle returned false');
+    if (!(acc >= 0)) die('phaseJ: non-integer add() checksum');
+    if (arena.retiredCount !== 0) die('phaseJ: churn retired ' + arena.retiredCount + ' slots');
+    if (arena.activeCount !== J_RING) die('phaseJ: activeCount=' + arena.activeCount + ' expected ' + J_RING);
+    if (comp.count !== J_RING || tag.count !== J_RING) {
+        die('phaseJ: component/tag count drifted (comp=' + comp.count + ' tag=' + tag.count + ')');
+    }
+    for (let i = 0; i < J_RING; i++) {
+        if (!arena.isAlive(ring[i]) || !comp.has(ring[i]) || !tag.has(ring[i])) {
+            die('phaseJ: ring handle ' + i + ' not alive and attached after churn');
+        }
+    }
+
+    return { report: checkNoGc(summary, RULES), summary };
+}
+
 // --- gate --------------------------------------------------------------------
 
 async function main() {
@@ -773,6 +911,7 @@ async function main() {
     const g = phaseG();
     const h = phaseH();
     const iRes = await phaseI();
+    const j = await phaseJ();
 
     const retentionOk = a.activeCount === 0 && a.trackerSize === 0;
     const budgetOk = b.report.ok;
@@ -783,8 +922,9 @@ async function main() {
     const sabOk = g.ok;
     const transferOk = h.ok;
     const joinNOk = iRes.report.ok;
+    const churnOk = j.report.ok;
 
-    if (retentionOk && budgetOk && joinOk && reserveOk && sweepOk && conservationOk && sabOk && transferOk && joinNOk) {
+    if (retentionOk && budgetOk && joinOk && reserveOk && sweepOk && conservationOk && sabOk && transferOk && joinNOk && churnOk) {
         process.stdout.write('ok\n');
         process.exit(0);
     }
@@ -841,7 +981,15 @@ async function main() {
             ' major=' + gc.major + ' maxMs=' + gc.maxMs.toFixed(3) +
             ' (rules ' + JSON.stringify(RULES) + ')\n');
     }
-    die('gate rejected' + (LEAK || HLEAK || JLEAK ? ' (leaky control -- expected)' : ''));
+    if (!churnOk) {
+        const gc = j.summary.gc;
+        process.stderr.write(
+            'torture: churn -- verdict=' + j.report.verdict +
+            ' source=' + j.summary.source +
+            ' major=' + gc.major + ' maxMs=' + gc.maxMs.toFixed(3) +
+            ' (rules ' + JSON.stringify(RULES) + ')\n');
+    }
+    die('gate rejected' + (LEAK || HLEAK || JLEAK || SLEAK ? ' (leaky control -- expected)' : ''));
 }
 
 main();

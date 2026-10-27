@@ -10,6 +10,10 @@
  *     silently reusing a wrapped generation, the slot is permanently withdrawn
  *     (see `retiredCount` and decisions/0001-generational-rollover.md). Retirement
  *     is a cold-path event; `isAlive()` and the hot loop are unaffected.
+ *     A FREE slot stores `gen | FREE` (bit 13, kept apart from the retirement
+ *     poison bit 12), so no handle -- synthesized or stale -- matches a slot that
+ *     is not live (see decisions/0009-free-slot-flag.md). spawn() strips FREE,
+ *     despawn() and clear() set it; `isAlive()` is unchanged.
  *   - SoA Sparse Sets: Component data is strictly parallel typed arrays.
  *   - Swap-and-Pop: O(1) component removal keeps dense arrays contiguous
  *     without shifting.
@@ -28,7 +32,13 @@
  */
 
 const INDEX_MASK = 0xFFFFF; // 20 bits -> Max 1,048,575 entities
-const GEN_MASK = 0xFFF;     // 12 bits -> 4096 generations
+const GEN_MASK = 0xFFF;     // 4095 live generations (1..4095; 0 never alive; 4096 = retired poison)
+// Free-slot flag: bit 13 (0x2000), one above the retirement poison GEN_MASK + 1.
+// Every slot on the free list stores `gen | FREE`; a live slot never carries it
+// and a retired slot never carries it. isAlive() compares the stored value to a
+// 12-bit generation, so a FREE-flagged slot rejects every handle. Kept with
+// (GEN_MASK | FREE) < 2^30 so a stored generation is always a Smi.
+const FREE = (GEN_MASK + 1) << 1;
 
 // The nine numeric TypedArray constructors -- the ONLY legal component field
 // types. Building a Set once, at module load, so schema validation is a cold
@@ -229,11 +239,13 @@ export class Arena {
         // Bumped only in the despawn cold path; never read on any hot path.
         this.retiredCount = 0 | 0;
 
-        // Generational anti-stale tracking. Initialized to 1 (not 0) so that
-        // the synthesized handle `0` — and any handle whose generation bits
-        // are zero — is reliably rejected by isAlive on a fresh arena.
-        // Bumped on despawn; wraps via 12-bit mask.
-        this.generations = new Uint32Array(maxEntities).fill(1);
+        // Generational anti-stale tracking. Every slot starts FREE at generation
+        // 1, stored as `1 | FREE`: the FREE flag makes isAlive reject every
+        // handle into a never-spawned slot -- the synthesized `0`, any gen-0
+        // handle, and the gen-1 handle spawn() will hand out first. spawn()
+        // strips FREE; despawn() bumps the generation and sets FREE again.
+        // Retires at GEN_MASK, never wraps (see despawn()).
+        this.generations = new Uint32Array(maxEntities).fill(1 | FREE);
 
         // O(1) internal implicit free-list. Each slot stores the next free index.
         this.freeList = new Uint32Array(maxEntities);
@@ -290,7 +302,18 @@ export class Arena {
         const index = this.freeHead;
         this.freeHead = this.freeList[index];
 
-        const gen = this.generations[index];
+        // A free slot always stores `gen | FREE`: XOR strips the flag and the
+        // stripped generation is stored back, so the slot is live from here on.
+        // If that invariant ever broke, XOR would SET FREE instead and the handle
+        // would be dead on arrival (fail closed) -- never a gen-0 slot. `& GEN_MASK`
+        // is rejected for that reason: on a slot without FREE it is a silent no-op
+        // and on a poisoned one it stores 0. One `this.generations` load.
+        // 0x2000 is FREE written as a literal: a module-const read here costs a
+        // context load plus a TDZ hole check (+2 B of never-firing guard) in
+        // this hot body. Keep it equal to FREE.
+        const gens = this.generations;
+        const gen = gens[index] ^ 0x2000;
+        gens[index] = gen;
         this.activeCount = (this.activeCount + 1) | 0;
 
         // Note: bitwise OR treats operands as signed 32-bit, so a generation of
@@ -348,10 +371,11 @@ export class Arena {
     }
 
     /**
-     * O(1) despawn. Removes the entity from all components, invalidates
+     * O(registered components) despawn. Removes the entity from all components, invalidates
      * its generation, and returns the slot to the free list.
      * @param {number} entity
-     * @returns {boolean} True if successfully despawned, false if already dead.
+     * @returns {boolean} True if successfully despawned, false if already dead
+     *   (a free-slot handle is dead: FREE makes isAlive reject it).
      */
     despawn(entity) {
         if (!this.isAlive(entity)) return false;
@@ -380,7 +404,10 @@ export class Arena {
             return true;
         }
 
-        this.generations[index] = this.generations[index] + 1;
+        // A relinked slot is FREE: set the flag with the bump, so no handle
+        // matches it until spawn() strips the flag again. 0x2000 is FREE as a
+        // literal (no hole check in this body; see spawn()). Keep it equal.
+        this.generations[index] = (this.generations[index] + 1) | 0x2000;
 
         // 3. Return slot to the head of the free list.
         this.freeList[index] = this.freeHead;
@@ -677,12 +704,12 @@ export class Arena {
 
         const oldCapacity = this.capacity;
 
-        // Generations: copy live/retired state verbatim; initialize the new
-        // slots to generation 1 (same as the constructor) so a synthesized
-        // gen-0 handle into the new region is rejected by isAlive.
+        // Generations: copy live/free/retired state verbatim; initialize the new
+        // slots to `1 | FREE` (same as the constructor) so no handle into the
+        // new region -- gen 0 or gen 1 -- is accepted by isAlive before spawn().
         const newGenerations = new Uint32Array(newCapacity);
         newGenerations.set(this.generations);
-        newGenerations.fill(1, oldCapacity);
+        newGenerations.fill(1 | FREE, oldCapacity);
         this.generations = newGenerations;
 
         // Free list: copy the existing chain intact, then push the fresh slots
@@ -728,16 +755,18 @@ export class Arena {
         const gens = this.generations;
         const free = this.freeList;
 
-        // Advance every generation into a fresh LIVE value in [1, GEN_MASK]. The
-        // map g -> (g % GEN_MASK) + 1 does three jobs at once: it bumps a live slot
-        // (so its outstanding handle no longer matches isAlive), it wraps
-        // GEN_MASK -> 1, and it revives a retired slot (poison GEN_MASK+1 -> 2)
-        // back into a spawnable generation. The result is never 0 (which isAlive
-        // rejects) and never GEN_MASK+1 (retired), and always differs from the
-        // slot's pre-clear value -- so every slot ends live and reusable, and every
-        // pre-clear handle is rejected.
+        // Advance every generation to a fresh value in [1, GEN_MASK] and mark it
+        // FREE (every slot is on the free list after a clear). FREE is stripped
+        // first, so a free slot advances exactly like a live one. The map
+        // g -> ((g & ~FREE) % GEN_MASK) + 1 does three jobs at once: it bumps a
+        // live or free slot (so its outstanding handle no longer matches
+        // isAlive), it wraps GEN_MASK -> 1, and it revives a retired slot (poison
+        // GEN_MASK+1 -> 2) back into a spawnable generation. The generation is
+        // never 0 and never GEN_MASK+1 (retired), and always differs from the
+        // slot's pre-clear generation -- so every slot ends free and reusable,
+        // and every pre-clear handle is rejected.
         for (let i = 0; i < cap; i++) {
-            gens[i] = (gens[i] % GEN_MASK) + 1;
+            gens[i] = (((gens[i] & ~FREE) % GEN_MASK) + 1) | FREE;
         }
 
         // Rebuild the implicit free list across the whole capacity -- revived slots
