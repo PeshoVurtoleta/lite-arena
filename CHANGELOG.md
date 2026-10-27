@@ -5,70 +5,11 @@ All notable changes to `@zakkster/lite-arena` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.10.0] - 2026-10-27
 
-Target 1.10.0 (not cut). Groups A + B + D + E.
-
-### Fixed
-
-- `SparseSet.remove()` allocated on every swapping remove: its swap branch
-  walked `for (const key in this.data)` over the dictionary-mode null-prototype
-  `data` bag. Each set now caches its column views in an internal `_cols` array;
-  `remove()` walks it by index, and a module-level `syncCols()` refreshes it in
-  place after `_grow` (`reserve()`) and `rebind()`. Scavenges per 500,000
-  swapping removes (Node 26.8.2, `--trace-gc`, 1 MiB semi-space, deterministic
-  gate in test/remove-alloc.test.js): 1 Float32-class column 22-23 -> 0; 4
-  columns (Float32, Float64, Int32, Uint8) 45-46 -> 0-1; tag set 0 -> 0 (2026-10-27, darwin, 7 runs after 20,000
-  warm-up ops; gate <= noop + 1).
-  Limit (maintainer decision M-19): after warm-up, remove() allocates nothing
-  only while the whole app's components use <= 4 distinct TypedArray kinds at
-  the shared swap site (V8 polymorphic limit). Above that each Float32/Float64
-  column still boxes 16 B per swapping remove (pre-existing; Node's
-  HeapNumber, 12 B pointer-compressed, NOMINAL) and a Uint32 value >= 2^31
-  boxes too
-  (below 2^31 vs at >= 2^31: 0 vs 7-8 scavenges per 500,000
-  swapping removes (REPORTED, 2026-10-27, darwin 12 cores, Node 26.8.2, 6
-  kinds warmed, 1 MiB semi-space; 11 runs: 7 in 9 runs at load1 4.5-6.8, 8 in
-  2 runs at load1 1.56; scavenge counts, not timings));
-  despawn() inherits the limit through remove(). REPORTED, 6 kinds:
-  76 scavenges before, 16 now (7 runs on E).
-- Checked `joinN` (M-22): a throwing call (foreign set, set in both lists,
-  shared mask bits M-13, bad mask) now validates before any scratch write or
-  epoch bump, so earlier plans stay valid. A direct
-  `Arena.prototype.joinN.call(checkedArena, ...)` bypassing the wrapper still
-  fails closed (earlier plans go stale).
-- Caller-supplied buffers (`registerComponent` buffers / `rebind`, M-23) are
-  brand-checked via the intrinsic ArrayBuffer / SharedArrayBuffer `byteLength`
-  getters: prototype fakes and Proxies are rejected, cross-realm buffers (vm
-  contexts) are accepted, and the size check uses the real length (an own
-  `byteLength` shadow cannot pass).
-- Behaviour change: assigning `comp.data[key] = ...` directly was never
-  supported and is now NOT honoured by `remove()` (the cache keeps the old
-  view). Replace a column only via `rebind()`; `reserve()` replaces every
-  column (re-read `data.x` after).
-- `rebind()` is now atomic: it reads each supplied buffer once, validates, and
-  builds every view before re-pointing `data` and refreshing the cache, so a
-  throw can no longer leave `data` partly re-pointed.
-- A free slot's NEXT handle was alive. On a fresh `Arena(4)`,
-  `isAlive((1 << 20) | 0)` was `true` with `activeCount` 0; `add()` on it
-  succeeded and `spawn()` then returned exactly that handle already tagged. The
-  same held for despawned, cleared and reserved slots. Free slots now store
-  `gen | FREE` (`FREE = (GEN_MASK + 1) << 1`, 0x2000); `spawn()` strips it with
-  XOR and stores the generation back (one `generations` load), `despawn()` sets
-  it, the constructor / `reserve()` fill `1 | FREE`, `clear()` maps
-  `(((g & ~FREE) % GEN_MASK) + 1) | FREE`. `isAlive` / `has` / `add` / `remove` /
-  `idx` are byte-identical. See decisions/0009-free-slot-flag.md.
-- `despawn()` of a free slot's handle returned `true`, drove `activeCount` to -1
-  and inserted the slot into the free list twice (fresh `Arena(4)`,
-  `despawn(1048576)`: `remainingCapacity()` 5). It now returns `false` and
-  changes nothing.
-- Behaviour change: a handle persisted from another run or arena and replayed
-  into a fresh or just-`clear()`ed arena was accepted; it now fails closed.
-  Handles are not unique across arenas. The generation sequence, retirement
-  timing and budget are unchanged.
-- Bytecode (Node 26.8.2, `--print-bytecode`): `spawn` 81 -> 93 B, `despawn`
-  177 -> 183 B (the `0x2000` literal is used in the hot bodies; the module const
-  by name would cost 95 / 185 B via a 2-byte TDZ hole check).
+Groups A + B + D + E: retirement-budget gate, free-slot FREE bit, entity
+flags + joinN flag masks, zero-alloc `SparseSet.remove()`, checked-mode
+hardening (M-20 / M-22 / M-25), caller-buffer brand check (M-23).
 
 ### Added
 
@@ -115,7 +56,6 @@ Target 1.10.0 (not cut). Groups A + B + D + E.
   0x80000000 accepted). Production fails open on a typo: `F.tpyo` is undefined,
   `| 0` makes it 0, so `setFlags(e, F.tpyo)` is a silent no-op returning true.
   Checked mode does not reject unregistered bits.
-
 - `test/budget.test.js`: deterministic retirement-budget gate in `npm test`
   (untimed, public API only). `capacity x 4095` despawns, `clear()` 4094 refill,
   `reserve()` growth, Arena(1000) C1 4,095,000 / C2 3,685,310 / C3 3,115,308
@@ -131,6 +71,70 @@ Target 1.10.0 (not cut). Groups A + B + D + E.
   leg 4,096 cycles back to 0; after `reserve(8192)` the old flag row is
   unreachable (WeakRef) and `p.flags === arena.flags`), controls
   `ARENA_TORTURE_SLEAK=1` / `ARENA_TORTURE_FLEAK=1` / `ARENA_TORTURE_MLEAK=1`.
+
+### Changed
+
+- Behaviour change: assigning `comp.data[key] = ...` directly was never
+  supported and is now NOT honoured by `remove()` (the cache keeps the old
+  view). Replace a column only via `rebind()`; `reserve()` replaces every
+  column (re-read `data.x` after).
+- Behaviour change: a handle persisted from another run or arena and replayed
+  into a fresh or just-`clear()`ed arena was accepted; it now fails closed.
+  Handles are not unique across arenas. The generation sequence, retirement
+  timing and budget are unchanged.
+
+### Fixed
+
+- `SparseSet.remove()` allocated on every swapping remove: its swap branch
+  walked `for (const key in this.data)` over the dictionary-mode null-prototype
+  `data` bag. Each set now caches its column views in an internal `_cols` array;
+  `remove()` walks it by index, and a module-level `syncCols()` refreshes it in
+  place after `_grow` (`reserve()`) and `rebind()`. Scavenges per 500,000
+  swapping removes (Node 26.8.2, `--trace-gc`, 1 MiB semi-space, deterministic
+  gate in test/remove-alloc.test.js): 1 Float32-class column 22-23 -> 0; 4
+  columns (Float32, Float64, Int32, Uint8) 45-46 -> 0-1; tag set 0 -> 0 (2026-10-27, darwin, 7 runs after 20,000
+  warm-up ops; gate <= noop + 1).
+  Limit (maintainer decision M-19): after warm-up, remove() allocates nothing
+  only while the whole app's components use <= 4 distinct TypedArray kinds at
+  the shared swap site (V8 polymorphic limit). Above that each Float32/Float64
+  column still boxes 16 B per swapping remove (pre-existing; Node's
+  HeapNumber, 12 B pointer-compressed, NOMINAL) and a Uint32 value >= 2^31
+  boxes too
+  (below 2^31 vs at >= 2^31: 0 vs 7-8 scavenges per 500,000
+  swapping removes (REPORTED, 2026-10-27, darwin 12 cores, Node 26.8.2, 6
+  kinds warmed, 1 MiB semi-space; 11 runs: 7 in 9 runs at load1 4.5-6.8, 8 in
+  2 runs at load1 1.56; scavenge counts, not timings));
+  despawn() inherits the limit through remove(). REPORTED, 6 kinds:
+  76 scavenges before, 16 now (7 runs on E).
+- Checked `joinN` (M-22): a throwing call (foreign set, set in both lists,
+  shared mask bits M-13, bad mask) now validates before any scratch write or
+  epoch bump, so earlier plans stay valid. A direct
+  `Arena.prototype.joinN.call(checkedArena, ...)` bypassing the wrapper still
+  fails closed (earlier plans go stale).
+- Caller-supplied buffers (`registerComponent` buffers / `rebind`, M-23) are
+  brand-checked via the intrinsic ArrayBuffer / SharedArrayBuffer `byteLength`
+  getters: prototype fakes and Proxies are rejected, cross-realm buffers (vm
+  contexts) are accepted, and the size check uses the real length (an own
+  `byteLength` shadow cannot pass).
+- `rebind()` is now atomic: it reads each supplied buffer once, validates, and
+  builds every view before re-pointing `data` and refreshing the cache, so a
+  throw can no longer leave `data` partly re-pointed.
+- A free slot's NEXT handle was alive. On a fresh `Arena(4)`,
+  `isAlive((1 << 20) | 0)` was `true` with `activeCount` 0; `add()` on it
+  succeeded and `spawn()` then returned exactly that handle already tagged. The
+  same held for despawned, cleared and reserved slots. Free slots now store
+  `gen | FREE` (`FREE = (GEN_MASK + 1) << 1`, 0x2000); `spawn()` strips it with
+  XOR and stores the generation back (one `generations` load), `despawn()` sets
+  it, the constructor / `reserve()` fill `1 | FREE`, `clear()` maps
+  `(((g & ~FREE) % GEN_MASK) + 1) | FREE`. `isAlive` / `has` / `add` / `remove` /
+  `idx` are byte-identical. See decisions/0009-free-slot-flag.md.
+- `despawn()` of a free slot's handle returned `true`, drove `activeCount` to -1
+  and inserted the slot into the free list twice (fresh `Arena(4)`,
+  `despawn(1048576)`: `remainingCapacity()` 5). It now returns `false` and
+  changes nothing.
+- Bytecode (Node 26.8.2, `--print-bytecode`): `spawn` 81 -> 93 B, `despawn`
+  177 -> 183 B (the `0x2000` literal is used in the hot bodies; the module const
+  by name would cost 95 / 185 B via a 2-byte TDZ hole check).
 
 ### Docs
 
