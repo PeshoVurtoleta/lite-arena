@@ -7,7 +7,7 @@
  * scavenge lands in its window, which hid a ~310 B/op mutant.
  *
  * A1: oneCol / fourCol / tag <= noop + 1 scavenges; the must-fail `box` lane
- *   (one {a: i} per op) >= 15, proving the counter sees allocation. The sixKind
+ *   (one {a: i} per op) >= noop + 8, proving the counter sees allocation. The sixKind
  *   lane (6 TypedArray kinds, decision M-19) is REPORTED, never asserted.
  * A4: column refs held by the set do not retain replaced columns: after
  *   reserve / transfer / rebind on 64 live sets, tracker.size() is 0, and 0 again
@@ -64,7 +64,10 @@ test('A1: swapping remove does not allocate (tag)', () => {
     assert.ok(counts.tag <= counts.noop + 1, 'tag ' + counts.tag + ' noop ' + counts.noop);
 });
 test('A1: must-fail lane (one object per op) is seen by the counter', () => {
-    assert.ok(counts.box >= 15, 'box ' + counts.box);
+    // box stores one {a: i} per op (a 1-field JSObject, nominal 32 B on Node,
+    // 16 B pointer-compressed), not a HeapNumber. The <= noop + 1 gates resolve
+    // ~2 B/op; >= noop + 8 (~16 B/op) keeps this control clear of them on Node.
+    assert.ok(counts.box >= counts.noop + 8, 'box ' + counts.box + ' must exceed noop ' + counts.noop + ' by >= 8');
 });
 // REPORTED only (M-19): never asserted.
 test('A1 (reported): six TypedArray kinds', (t) => {

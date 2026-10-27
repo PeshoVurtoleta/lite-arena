@@ -94,8 +94,10 @@ function churn(arena, perFrame, lifeFn, maxLife, perSlot = LIVE_GENS) {
     let fault = '';
     let err = null;
     let held = arena.activeCount;
+    let frame = 0;
+    let firstRetireFrame = -1;
 
-    for (let frame = 0; ; frame++) {
+    for (frame = 0; ; frame++) {
         const b = frame & MASK;
         const n = cnt[b];
         const base = b * cap;
@@ -106,6 +108,7 @@ function churn(arena, perFrame, lifeFn, maxLife, perSlot = LIVE_GENS) {
             const r = arena.retiredCount;
             if (r !== lastRetired) {
                 if (r !== lastRetired + 1 || nRetire >= cap) { fault = 'retire-jump@D=' + D; break; }
+                if (nRetire === 0) firstRetireFrame = frame;
                 retireAt[nRetire++] = D;
                 lastRetired = r;
             }
@@ -146,6 +149,8 @@ function churn(arena, perFrame, lifeFn, maxLife, perSlot = LIVE_GENS) {
         fault,
         retireAt: retireAt.subarray(0, nRetire),
         nRetire,
+        frame,
+        firstRetireFrame,
     };
 }
 
@@ -284,6 +289,9 @@ test('budget T-e: C1/C2/C3 on Arena(1000)', (t) => {
     // PIN (frozen ce3f63c).
     assert.equal(c3.D, PIN.C3.D);
     assert.equal(c3.retireAt[0], PIN.C3.first);
+    // first retirement frame (ADR 0001): measured by churn(), not re-derived.
+    assert.equal(c3.firstRetireFrame, 257818);
+    assert.equal(c3.frame, 623127); // frame of the failing spawn()
     assert.equal(c3.retired, PIN.C3.retired);
     assert.equal(c3.active, PIN.C3.active);
 });

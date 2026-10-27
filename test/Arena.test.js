@@ -1,5 +1,5 @@
 /**
- * @zakkster/lite-arena — Unit test suite.
+ * @zakkster/lite-arena -- Unit test suite.
  *
  * Run: `npm test`            (node --test)
  *      or: `node --expose-gc --test`  to include the zero-allocation tests.
@@ -134,7 +134,7 @@ test('Arena: lifecycle > isAlive never throws on arbitrary input', () => {
 });
 
 // -----------------------------------------------------------------
-// Arena: generational handles — the ABA defence
+// Arena: generational handles -- the ABA defence
 // -----------------------------------------------------------------
 
 test('Arena: generational handles > invalidates stale handles after slot reuse', () => {
@@ -503,7 +503,7 @@ test('SparseSet: add / has / remove > despawn detaches from all components autom
 });
 
 // -----------------------------------------------------------------
-// SparseSet: swap-and-pop correctness — the subtle one
+// SparseSet: swap-and-pop correctness -- the subtle one
 // -----------------------------------------------------------------
 
 test('SparseSet: swap-and-pop correctness > keeps dense array contiguous after middle-element removal', () => {
@@ -594,7 +594,7 @@ test('SparseSet: swap-and-pop correctness > re-add after remove restores the ent
 });
 
 // -----------------------------------------------------------------
-// SparseSet: iteration — the hot path that ECS users actually run
+// SparseSet: iteration -- the hot path that ECS users actually run
 // -----------------------------------------------------------------
 
 test('SparseSet: iteration > iterating dense[0..count) visits every member exactly once', () => {
@@ -1194,7 +1194,7 @@ test('Arena: reserve > preserves packed dense order after prior swap-and-pop chu
 });
 
 // -----------------------------------------------------------------
-// Arena: randomized churn (1000 ops) — pure correctness under churn
+// Arena: randomized churn (1000 ops) -- pure correctness under churn
 // -----------------------------------------------------------------
 
 test('Arena: randomized churn (1000 ops) > matches a Set/Map oracle through random spawn/despawn/add/remove', () => {
@@ -1247,7 +1247,7 @@ test('Arena: randomized churn (1000 ops) > matches a Set/Map oracle through rand
 });
 
 // -----------------------------------------------------------------
-// Arena: zero-allocation guarantee — requires --expose-gc
+// Arena: zero-allocation guarantee -- requires --expose-gc
 // -----------------------------------------------------------------
 
 const hasGc = typeof globalThis.gc === 'function';

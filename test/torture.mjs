@@ -1201,9 +1201,9 @@ function lRetention() {
     }
     if (st[1] !== 0) die('phaseL: retention cycle ' + (st[1] - 1) + ' masked joinN count off by ' + st[2]);
     if (!LEAK && joins !== L_CYCLES) die('phaseL: retention ran ' + joins + ' masked plans, expected ' + L_CYCLES);
-    let flagSum = 0;
+    let flagOr = 0; // OR, not a signed sum: words cannot cancel to 0
     const rrow = ra.flags;
-    for (let i = 0; i < CAP; i++) flagSum += rrow[i];
+    for (let i = 0; i < CAP; i++) flagOr |= rrow[i];
     const trackerSize = tracker.size();
     const activeCount = ra.activeCount;
 
@@ -1211,7 +1211,7 @@ function lRetention() {
     const wr = new WeakRef(ra.flags);
     if (!ra.reserve(L_GROW)) die('phaseL: reserve(' + L_GROW + ') failed');
     if (ra.flags.length !== L_GROW) die('phaseL: flag row length ' + ra.flags.length + ' after reserve');
-    return { ra, REQ, EXC, wr, trackerSize, activeCount, flagSum };
+    return { ra, REQ, EXC, wr, trackerSize, activeCount, flagOr };
 }
 
 function lTick() {
@@ -1241,9 +1241,13 @@ async function phaseL() {
 
     // Brute-force oracle, ONCE outside the window: the C-driven candidates in A and
     // B and not D (the unmasked count), and of those the ones arena.hasFlags()
-    // accepts. Cross-checked against the harness's own words (slot === i here: a
-    // fresh arena hands out slots 0..CAP-1 in order).
+    // accepts. Asserted below: some candidate fails each single test (failReq,
+    // failExc), is excluded by f5 while holding both req bits (excOnly), and holds
+    // exactly one of f0 / f31 (f31NotF0, f0NotF31). The coverage counters read the
+    // harness's own word w (slot === i here: a fresh arena hands out slots
+    // 0..CAP-1 in order), not arena.hasFlags.
     let unmasked = 0, expected = 0, mirror = 0, failReq = 0, failExc = 0;
+    let excOnly = 0, f31NotF0 = 0, f0NotF31 = 0;
     for (let i = 0; i < C.count; i++) {
         const e = C.dense[i];
         if (!(A.has(e) && B.has(e) && !D.has(e))) continue;
@@ -1252,9 +1256,15 @@ async function phaseL() {
         if (!arena.hasFlags(e, L_RQ, 0)) failReq++;
         if (!arena.hasFlags(e, 0, L_XQ)) failExc++;
         const w = lFlagWord(e & INDEX_MASK);
+        if ((w & L_RQ) === L_RQ && (w & L_XQ) !== 0) excOnly++;
+        if ((w & L_RQ) === (1 << 31) && (w & L_XQ) === 0) f31NotF0++;
+        if ((w & L_RQ) === 1 && (w & L_XQ) === 0) f0NotF31++;
         if ((w & L_RQ) === L_RQ && (w & L_XQ) === 0) mirror++;
     }
     if (expected !== mirror) die('phaseL: hasFlags oracle ' + expected + ' != harness words ' + mirror);
+    if (!(excOnly > 0)) die('phaseL: oracle population has no excOnly candidate (both req bits, excluded by f5)');
+    if (!(f31NotF0 > 0)) die('phaseL: oracle population has no f31-without-f0 candidate');
+    if (!(f0NotF31 > 0)) die('phaseL: oracle population has no f0-without-f31 candidate');
     if (!(expected > 0) || !(expected < unmasked) || !(failReq > 0) || !(failExc > 0)) {
         die('phaseL: degenerate oracle (masked=' + expected + ' unmasked=' + unmasked +
             ' failReq=' + failReq + ' failExc=' + failExc + ')');
@@ -1325,7 +1335,7 @@ async function phaseL() {
 
     return {
         report: checkNoGc(summary, RULES_L), summary, ops: HOT_OPS_MIN, expected, unmasked,
-        trackerSize: r.trackerSize, activeCount: r.activeCount, flagSum: r.flagSum,
+        trackerSize: r.trackerSize, activeCount: r.activeCount, flagOr: r.flagOr,
     };
 }
 
@@ -1376,7 +1386,7 @@ async function main() {
     const flagsOk = k.report.ok;
     const flagsRetentionOk = k.trackerSize === 0 && k.activeCount === 0 && k.flagSum === 0;
     const maskedOk = l.report.ok;
-    const maskedRetentionOk = l.trackerSize === 0 && l.activeCount === 0 && l.flagSum === 0;
+    const maskedRetentionOk = l.trackerSize === 0 && l.activeCount === 0 && l.flagOr === 0;
 
     if (retentionOk && budgetOk && joinOk && reserveOk && sweepOk && conservationOk && sabOk && transferOk &&
         joinNOk && churnOk && flagsOk && flagsRetentionOk && maskedOk && maskedRetentionOk) {
@@ -1469,7 +1479,7 @@ async function main() {
     if (!maskedRetentionOk) {
         process.stderr.write(
             'torture: masked-joinN-retention (phaseL) -- trackerSize=' + l.trackerSize +
-            ' activeCount=' + l.activeCount + ' flagSum=' + l.flagSum + ' (all must be 0)\n');
+            ' activeCount=' + l.activeCount + ' flagOr=' + l.flagOr + ' (all must be 0)\n');
     }
     die('gate rejected' + (LEAK || HLEAK || JLEAK || SLEAK || FLEAK || MLEAK ? ' (leaky control -- expected)' : ''));
 }

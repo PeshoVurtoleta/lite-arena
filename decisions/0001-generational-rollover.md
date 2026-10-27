@@ -158,7 +158,7 @@ retirement at 2047.5 s and failure at 1.71 h. C3 (5 spawns/frame, seed
 20261027, pins: first retirement at despawn #1,288,804; D = 3,115,308 with 330
 active at failure): first retirement at frame 257,818 (churn driver;
 ~ (1,288,804 + active) / 5) = 4297.0 s; failure at
-frame (3,115,308 + 330) / 5 = 623,127.6 = 10,385 s = 2.88 h.
+frame 623,127 (churn driver; floor((3,115,308 + 330) / 5)) = 10,385 s = 2.88 h.
 
 The counts are deterministic arithmetic; the time columns only divide them by a
 frame rate. Long-running servers or sims that spawn and despawn continuously

@@ -113,24 +113,27 @@ test('M-16 production pin: setFlags(e, undefined) is true, row unchanged', () =>
     assert.equal(row(a, e), 2);
 });
 
-test('M-16 production pin: no own setFlags/clearFlags/hasFlags keys', () => {
+test('M-16 production pin: no own setFlags/clearFlags/hasFlags/joinN keys', () => {
     const a = mk();
-    for (const k of ['setFlags', 'clearFlags', 'hasFlags']) {
+    for (const k of ['setFlags', 'clearFlags', 'hasFlags', 'joinN']) {
         assert.equal(Object.hasOwn(a, k), false, k);
         assert.equal(typeof a[k], 'function', k);
+        assert.equal(a[k], Arena.prototype[k], k);
     }
 });
 
 test('M-17 registerFlags: non-plain options throw and leave flags null', () => {
     const cases = [
-        Object.create({ x: 1 }),
-        new Map(),
-        [],
+        ['prototype keys', Object.create({ x: 1 })],
+        ['Map', new Map()],
+        ['array', []],
     ];
-    for (const o of cases) {
+    for (const [name, o] of cases) {
         const a = new Arena(4);
-        assert.throws(() => a.registerFlags(['a'], o), /plain object|takes no options/); // [] is rejected by the own-key door
-        assert.equal(a.flags, null);
+        // one matcher per input; [] is rejected by the own-key door
+        const re = name === 'array' ? /takes no options/ : /plain object/;
+        assert.throws(() => a.registerFlags(['a'], o), re, name);
+        assert.equal(a.flags, null, name);
     }
 });
 
