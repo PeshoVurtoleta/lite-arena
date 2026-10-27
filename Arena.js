@@ -1,5 +1,5 @@
 /**
- * @zakkster/lite-arena — Zero-GC Entity-Component-System (ECS)
+ * @zakkster/lite-arena -- Zero-GC Entity-Component-System (ECS)
  *
  * Architecture:
  *   - Generational Handles: 32-bit integers (20 bits index, 12 bits generation).
@@ -104,6 +104,14 @@ function validateSchema(schema) {
     // An empty schema is intentionally legal: registerTag() is registerComponent({}).
 }
 
+// M-23: intrinsic byteLength getters, captured once at module load, for the
+// brand check in validateBufferTypeAndSize (cold). SAB's is null where the
+// runtime has no SharedArrayBuffer.
+const AB_BYTELEN = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength').get;
+const SAB_BYTELEN = typeof SharedArrayBuffer === 'function'
+    ? Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength').get
+    : null;
+
 /**
  * Shared per-field buffer check (type + exact byte size), used by BOTH
  * `validateBuffers` (registration, S5) and `SparseSet.rebind` (re-adopt after a
@@ -118,20 +126,32 @@ function validateSchema(schema) {
  * @param {number} capacity - each buffer must span exactly capacity * BYTES_PER_ELEMENT
  * @param {boolean} hasSAB - whether SharedArrayBuffer exists in this runtime
  * @throws {Error} On a wrong-typed or wrong-sized buffer.
+ *
+ * M-23: the type test is a BRAND check, not `instanceof`: the intrinsic
+ * `byteLength` getter (hoisted below) throws on anything without the internal
+ * buffer slot, so a prototype fake (`Object.create(ArrayBuffer.prototype)`) is
+ * rejected and a cross-realm buffer (vm context, iframe) is accepted. The size
+ * check uses the length the getter returned, never `buf.byteLength`, which a
+ * fake could shadow. Cold path (registration / rebind) only.
  */
 function validateBufferTypeAndSize(key, buf, ctor, capacity, hasSAB) {
-    if (!(buf instanceof ArrayBuffer) && !(hasSAB && buf instanceof SharedArrayBuffer)) {
+    let byteLength = -1;
+    try { byteLength = AB_BYTELEN.call(buf); } catch { /* not an ArrayBuffer */ }
+    if (byteLength < 0 && hasSAB && SAB_BYTELEN !== null) {
+        try { byteLength = SAB_BYTELEN.call(buf); } catch { /* not a SharedArrayBuffer */ }
+    }
+    if (byteLength < 0) {
         throw new Error(
             `lite-arena: the buffer for component field "${key}" must be an ArrayBuffer or ` +
             `SharedArrayBuffer, got ${describeSchemaValue(buf)}`);
     }
     const bytesPerElement = ctor.BYTES_PER_ELEMENT;
     const expected = capacity * bytesPerElement;
-    if (buf.byteLength !== expected) {
+    if (byteLength !== expected) {
         throw new Error(
             `lite-arena: the buffer for component field "${key}" has the wrong byteLength: ` +
             `expected ${expected} (capacity ${capacity} * ${bytesPerElement} bytes/element for ` +
-            `${ctor.name}), got ${buf.byteLength}. The arena never resizes a caller-supplied ` +
+            `${ctor.name}), got ${byteLength}. The arena never resizes a caller-supplied ` +
             'buffer, so it must span exactly the arena capacity.');
     }
 }
@@ -223,7 +243,8 @@ function checkedIdx(entity) {
  * written unsigned, passes).
  * Cold: called only from the checked* wrappers below, which the Arena constructor
  * installs as OWN properties ONLY when `checked: true` (the AR-11 pattern), so the
- * prototype setFlags / clearFlags / hasFlags stay byte-identical and monomorphic.
+ * prototype setFlags / clearFlags / hasFlags / joinN stay byte-identical and
+ * monomorphic.
  * Validates first, then delegates: dead-handle and before-registerFlags behaviour
  * is exactly the production one.
  */
@@ -256,17 +277,78 @@ function checkedHasFlags(entity, required, excluded) {
 }
 
 /**
- * @this {Arena} M-20: each SUPPLIED joinN mask must be a 32-bit integer; an omitted
- * (undefined) mask is allowed (= 0). Installed as an OWN property in checked mode
- * only, so the prototype joinN stays byte-identical (zero production cost). Fires
- * before the prototype call, i.e. before any scratch write or epoch bump, so an
- * earlier checked plan stays live after the throw. M-11 order: a null / empty
- * `required` skips the mask check and still gets the required-set error.
+ * CHECKED-mode joinN set validation (S7 / M-13 / M-22). Throws when a required or
+ * excluded set is not registered with `arena` (foreign SparseSet), when a set is
+ * both required and excluded, or when `reqMask & excMask` != 0 (masks already
+ * normalised `| 0`). Read-only: writes no arena state, so a throw here leaves the
+ * join scratch, the epoch and every earlier plan untouched. Cold: called from
+ * checkedJoinN (before the prototype joinN) and, as a guard, from the
+ * CheckedJoinNPlan constructor.
+ */
+function checkJoinNSets(arena, required, excluded, reqMask, excMask) {
+    const reg = arena.components;
+    const rn = reg.length;
+    for (let i = 0; i < required.length; i++) {
+        const s = required[i];
+        let k = 0;
+        while (k < rn && reg[k] !== s) k++;
+        if (k === rn) {
+            throw new Error(
+                'lite-arena: joinN() required set #' + i + ' is not registered with this ' +
+                'arena (foreign SparseSet). (checked mode.)');
+        }
+    }
+    if (excluded != null) {
+        for (let i = 0; i < excluded.length; i++) {
+            const s = excluded[i];
+            let k = 0;
+            while (k < rn && reg[k] !== s) k++;
+            if (k === rn) {
+                throw new Error(
+                    'lite-arena: joinN() excluded set #' + i + ' is not registered with this ' +
+                    'arena (foreign SparseSet). (checked mode.)');
+            }
+        }
+        // Contradiction: a set that is both required and excluded can never match.
+        // Production yields the empty set naturally; checked mode names the bug.
+        for (let i = 0; i < required.length; i++) {
+            for (let j = 0; j < excluded.length; j++) {
+                if (required[i] === excluded[j]) {
+                    throw new Error(
+                        'lite-arena: joinN() set appears in both required and excluded -- the ' +
+                        'match is always empty. Remove it from one list. (checked mode.)');
+                }
+            }
+        }
+    }
+    // Same contradiction for flag bits (M-13): a bit both required and excluded
+    // can never match. Production returns a plan that matches nothing.
+    if ((reqMask & excMask) !== 0) {
+        throw new Error(
+            'lite-arena: joinN() reqMask and excMask share bit(s) ' + (reqMask & excMask) +
+            ' -- the match is always empty. Remove them from one mask. (checked mode.)');
+    }
+}
+
+/**
+ * @this {Arena} Checked joinN (M-20 / M-25 / M-22). Installed as an OWN property in
+ * checked mode only, so the prototype joinN stays byte-identical (zero production
+ * cost). Every check below runs BEFORE the prototype call, i.e. before any scratch
+ * write or epoch bump, so a throw leaves every earlier checked plan live and its
+ * others / excl untouched. Order: (1) null / empty `required` -> the prototype's
+ * required-set error (M-11; masks are not inspected); (2) each mask argument that
+ * is PRESENT (arguments.length, so a supplied `undefined` -- a misspelled flag --
+ * throws, M-25) must be a 32-bit integer; an omitted mask is 0; (3) a non-zero
+ * mask with no flag row -> the prototype's no-flags error (M-10); (4) foreign set,
+ * set in both lists, shared mask bits (checkJoinNSets).
  */
 function checkedJoinN(required, excluded, reqMask, excMask) {
     if (required != null && required.length !== 0) {
-        if (reqMask !== undefined) checkMask('joinN', 'the required', reqMask);
-        if (excMask !== undefined) checkMask('joinN', 'the excluded', excMask);
+        const argc = arguments.length;
+        if (argc > 2) checkMask('joinN', 'the required', reqMask);
+        if (argc > 3) checkMask('joinN', 'the excluded', excMask);
+        const rm = reqMask | 0, xm = excMask | 0;
+        if ((rm | xm) === 0 || this.flags !== null) checkJoinNSets(this, required, excluded, rm, xm);
     }
     return Object.getPrototypeOf(this).joinN.call(this, required, excluded, reqMask, excMask);
 }
@@ -358,13 +440,13 @@ export class Arena {
         this.indexMask = INDEX_MASK;
 
         // M-16 / M-20: checked mode only -- validating flag methods and joinN (mask
-        // check) as OWN properties, so a
-        // production Arena keeps its exact instance shape and prototype methods.
+        // check) as OWN properties, so a production Arena keeps its exact instance
+        // shape and prototype methods.
         if (this._checked) {
             this.setFlags = checkedSetFlags;
             this.clearFlags = checkedClearFlags;
             this.hasFlags = checkedHasFlags;
-            this.joinN = checkedJoinN;  // M-20: validates supplied masks, then delegates
+            this.joinN = checkedJoinN;  // M-20 / M-22: validates masks + sets, then delegates
         }
     }
 
@@ -721,9 +803,10 @@ export class Arena {
      * any state write (M-10); `required` empty still throws the required-set
      * error first (M-11). `reqMask & excMask` != 0 matches nothing in production
      * and throws in checked mode (M-13). Checked mode also throws when a SUPPLIED
-     * mask is not a 32-bit integer (NaN, a fraction, a string, >= 2^32) -- before
-     * any state write (M-20). An undefined mask counts as omitted (= 0), so a
-     * misspelled flag name passed as a mask is NOT caught there.
+     * mask is not a 32-bit integer (NaN, a fraction, a string, >= 2^32, or
+     * `undefined` -- a misspelled flag name; M-20 / M-25) -- before any state
+     * write. Only an OMITTED mask (fewer arguments) is 0 there; production
+     * normalises with `| 0`, so a misspelled flag fails open (reads 0) in production.
      * `p.flags` is the row at plan time:
      * `reserve()` replaces `arena.flags`, so take a NEW plan after growing.
      * NOMINAL: a mask outside [-2^30, 2^30 - 1] (bit 30 != bit 31) may be a heap
@@ -755,16 +838,18 @@ export class Arena {
      *   }
      *
      * @example
-     *   // Masked: same loop plus ONE flag-row read (F = arena.registerFlags([...])).
+     *   // Masked: same loop plus ONE flag-row read (F = arena.registerFlags([...])),
+     *   // tested FIRST -- one array read rejects before any has() call.
      *   const p = arena.joinN(REQ, EXC, F.visible, F.culled);
      *   const row = p.flags, m = arena.indexMask, rm = p.reqMask, xm = p.excMask;
      *   // ... drv / n / oth / no / ex / nx hoisted as above ...
      *   for (let i = 0; i < n; i++) {
      *       const e = drv.dense[i];
-     *       // ... the others / excl has() checks as above ...
      *       const w = row[e & m];
      *       if ((w & rm) !== rm || (w & xm) !== 0) continue;
-     *       // ... e also has every reqMask bit and no excMask bit ...
+     *       // ... then the others / excl has() checks as above ...
+     *       // ... e has every required set, no excluded set, every reqMask bit
+     *       //     and no excMask bit ...
      *   }
      */
     joinN(required, excluded, reqMask, excMask) {
@@ -1021,7 +1106,7 @@ function syncCols(set) {
 export class SparseSet {
     /**
      * Construct a sparse-set-backed component pool. Prefer
-     * `arena.registerComponent(schema)` over calling this directly — the arena
+     * `arena.registerComponent(schema)` over calling this directly -- the arena
      * version also registers the set for automatic cleanup on despawn.
      *
      * @param {number} maxEntities
@@ -1413,62 +1498,26 @@ class CheckedJoinPlan {
  * Checked-mode wrapper for a `joinN()` plan (S7 / AR-09). Only ever constructed
  * when the arena was created with `{ checked: true }`; production `joinN()`
  * returns the plain reused scratch and never allocates one of these. Beyond the
- * shared-epoch staleness guard (a later `join` OR `joinN` supersedes it), it
- * validates at construction the two mistakes production trusts the caller not to
- * make: a set not registered with this arena (foreign set), and a set that is
- * both required and excluded (a contradiction).
+ * shared-epoch staleness guard (a later `join` OR `joinN` supersedes it), checked
+ * joinN rejects the mistakes production trusts the caller not to make: a set not
+ * registered with this arena (foreign set), a set that is both required and
+ * excluded, and `(reqMask & excMask) !== 0` (M-13) -- see checkJoinNSets, run by
+ * checkedJoinN before any state write (M-22) and re-run here as a guard.
  *
  * Structurally a `{ driver, count, others, othersCount, excl, exclCount,
  * reqMask, excMask, flags }`, so it is a drop-in for the production scratch at
- * every call site. Also throws when reqMask & excMask != 0 (M-13).
+ * every call site.
  */
 class CheckedJoinNPlan {
     constructor(arena, epoch, required, excluded, driver, count, others, othersCount, excl, exclCount,
         reqMask, excMask, flags) {
-        // Foreign-set validation: every required and excluded set must be one of
-        // this arena's registered components. Production skips this (zero cost,
-        // exactly as join() trusts its inputs); checked mode fails closed.
-        const reg = arena.components;
-        const inReg = (s) => {
-            for (let i = 0; i < reg.length; i++) if (reg[i] === s) return true;
-            return false;
-        };
-        for (let i = 0; i < required.length; i++) {
-            if (!inReg(required[i])) {
-                throw new Error(
-                    'lite-arena: joinN() required set #' + i + ' is not registered with this ' +
-                    'arena (foreign SparseSet). (checked mode.)');
-            }
-        }
-        if (excluded != null) {
-            for (let i = 0; i < excluded.length; i++) {
-                if (!inReg(excluded[i])) {
-                    throw new Error(
-                        'lite-arena: joinN() excluded set #' + i + ' is not registered with this ' +
-                        'arena (foreign SparseSet). (checked mode.)');
-                }
-            }
-        }
-        // Contradiction: a set that is both required and excluded can never match.
-        // Production yields the empty set naturally; checked mode names the bug.
-        if (excluded != null) {
-            for (let i = 0; i < required.length; i++) {
-                for (let j = 0; j < excluded.length; j++) {
-                    if (required[i] === excluded[j]) {
-                        throw new Error(
-                            'lite-arena: joinN() set appears in both required and excluded -- the ' +
-                            'match is always empty. Remove it from one list. (checked mode.)');
-                    }
-                }
-            }
-        }
-        // Same contradiction for flag bits (M-13): a bit both required and excluded
-        // can never match. Production returns a plan that matches nothing.
-        if ((reqMask & excMask) !== 0) {
-            throw new Error(
-                'lite-arena: joinN() reqMask and excMask share bit(s) ' + (reqMask & excMask) +
-                ' -- the match is always empty. Remove them from one mask. (checked mode.)');
-        }
+        // Fail-closed guard for a call that bypassed checkedJoinN (e.g.
+        // `Arena.prototype.joinN.call(checkedArena, ...)`): the prototype has already
+        // bumped the epoch, so a throw here stales every earlier plan (their reads
+        // throw) instead of leaving one aliasing the overwritten others / excl
+        // scratch. Through checkedJoinN it passes unless `required` / `excluded`
+        // changed between reads (a getter or Proxy) -- that too now fails closed.
+        checkJoinNSets(arena, required, excluded, reqMask, excMask);
 
         this._arena = arena;
         this._epoch = epoch;

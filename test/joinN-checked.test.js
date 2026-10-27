@@ -3,7 +3,8 @@
  *
  * Expected values come from the M-20 decision text, never from the build under
  * test: with { checked: true }, each SUPPLIED mask must satisfy
- * typeof m === 'number' && ((m | 0) === m || (m >>> 0) === m); undefined means 0.
+ * typeof m === 'number' && ((m | 0) === m || (m >>> 0) === m); a supplied undefined throws
+ * (M-25), an omitted mask means 0.
  * Production (no checked option) keeps a plain `| 0` and never throws for these.
  *
  * Run: `node --test test/joinN-checked.test.js`
@@ -19,8 +20,8 @@ const mod = await import(process.env.LITE_ARENA_PATH
     : '../Arena.js');
 const { Arena } = mod;
 
-const BAD = [NaN, 1.5, -0.5, Infinity, -Infinity, 2 ** 32, -2147483649, '1', null, {}, true, 1n];
-const GOOD = [undefined, 0, -0, 1, -1, 0x80000000, -2147483648, 0xFFFFFFFF, 2147483647];
+const BAD = [undefined, NaN, 1.5, -0.5, Infinity, -Infinity, 2 ** 32, -2147483649, '1', null, {}, true, 1n];
+const GOOD = [0, -0, 1, -1, 0x80000000, -2147483648, 0xFFFFFFFF, 2147483647];
 const lbl = (m) => (typeof m === 'bigint' ? m + 'n' : typeof m === 'string' ? JSON.stringify(m)
     : m && typeof m === 'object' ? '{}' : Object.is(m, -0) ? '-0' : String(m));
 
