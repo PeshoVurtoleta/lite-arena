@@ -516,7 +516,7 @@ Four levels of verification, depending on how deep you want to go.
 npm test
 ```
 
-Runs **280 test cases** (278 pass, 2 skipped without `--expose-gc`) under `node --test`, covering:
+Runs **294 test cases** (292 pass, 2 skipped without `--expose-gc`) under `node --test`, covering:
 
 | Group | What's tested |
 |---|---|
@@ -539,7 +539,7 @@ Runs **280 test cases** (278 pass, 2 skipped without `--expose-gc`) under `node 
 | Randomized churn | 1000 random ops vs. Set/Map oracle |
 | Zero-allocation guarantee | 100k spawn/despawn → < 1 MB heap (requires `--expose-gc`) |
 
-Two zero-allocation cases require `--expose-gc`; without it they skip (`node --test` -> `278 passed, 2 skipped`, or `280 passed` under `node --expose-gc --test`). Suitable for CI.
+Two zero-allocation cases require `--expose-gc`; without it they skip (`node --test` -> `292 passed, 2 skipped`, or `294 passed` under `node --expose-gc --test`). Suitable for CI.
 
 ### 2. Torture gate — "does zero-GC actually hold under stress?"
 
@@ -575,10 +575,12 @@ A 50,000-particle gravity simulation. Drag to move the gravity well; observe con
 
 | Command | What it does |
 |---|---|
-| `npm test` | Run the unit suite (280 cases) under `node --test` |
+| `npm test` | Run the unit suite (294 cases) under `node --test` |
 | `npm run test:watch` | Re-run on save |
 | `npm run torture` | Run the zero-GC torture gate (`node --expose-gc test/torture.mjs`) |
 | `npm run bench` | Run the Node benchmark, write `bench/bench-results.json` |
+| `npm run inline -- BEFORE.js` | TurboFan + Maglev inlining A/B of a frozen `Arena.js` vs the live one (`--control` = must-fail run); exit 0 SAME / 1 DIFF / 2 NO-VERDICT. A decision diff, not part of `npm test` |
+| `npm run inline-budget-diff` | The vendored V8 inlining-diff tool itself (`-- --self-test` is gated in `npm test`) |
 | `npm run verify` | `npm test && npm run torture && npm run bench` — the full CI-style check |
 
 ---

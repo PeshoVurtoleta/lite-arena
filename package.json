@@ -27,6 +27,8 @@
     "test:watch": "node --test --watch test/*.test.js",
     "torture": "node --expose-gc test/torture.mjs",
     "bench": "node --expose-gc bench/bench.js",
+    "inline": "bash bench/inline/run.sh",
+    "inline-budget-diff": "bash bench/inlining-budget-diff.sh",
     "verify": "npm test && npm run torture && npm run bench"
   },
   "devDependencies": {

@@ -5,6 +5,15 @@ All notable changes to `@zakkster/lite-arena` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Tooling
+- `bench/inlining-budget-diff.sh`: the V8 TurboFan + Maglev inlining-decision diff, vendored from LiteUtils
+  (as in lite-signal), with `bench/inline/run.sh` (frozen-before vs live `Arena.js`, plus a must-fail
+  `--control`) and npm scripts `inline` / `inline-budget-diff`. Not shipped. Its `--self-test` is gated in
+  `npm test` by `test/inlining-budget-diff.test.js` (43-check pin, 12 must-fail script mutants): 294 tests
+  (292 pass, 2 skipped without `--expose-gc`).
+
 ## [1.10.0] - 2026-10-27
 
 Groups A + B + D + E: retirement-budget gate, free-slot FREE bit, entity
