@@ -516,7 +516,7 @@ Four levels of verification, depending on how deep you want to go.
 npm test
 ```
 
-Runs **294 test cases** (292 pass, 2 skipped without `--expose-gc`) under `node --test`, covering:
+Runs **315 test cases** (313 pass, 2 skipped without `--expose-gc`, on node v26.8.2; other node versions also skip the 5 version-pinned bytecode rows) under `node --test`, covering:
 
 | Group | What's tested |
 |---|---|
@@ -537,9 +537,10 @@ Runs **294 test cases** (292 pass, 2 skipped without `--expose-gc`) under `node 
 | `rebind()` atomicity | each supplied buffer is read once, so a getter cannot hand in a bad buffer after validation (`test/rebind-atomic.test.js`); a bad buffer in a multi-field rebind re-points nothing (`test/Arena.test.js:1861`) |
 | Iteration patterns | dense scan covers every member exactly once |
 | Randomized churn | 1000 random ops vs. Set/Map oracle |
+| Tooling gates | the vendored V8 tools' `--self-test` + must-fail script mutants (`test/inlining-budget-diff.test.js`, `test/bytecode-budget.test.js`); hot-method bytecode-length pins on node v26.8.2 and the joinN <= 460 B ceiling |
 | Zero-allocation guarantee | 100k spawn/despawn → < 1 MB heap (requires `--expose-gc`) |
 
-Two zero-allocation cases require `--expose-gc`; without it they skip (`node --test` -> `292 passed, 2 skipped`, or `294 passed` under `node --expose-gc --test`). Suitable for CI.
+Two zero-allocation cases require `--expose-gc`; without it they skip (`node --test` -> `313 passed, 2 skipped`, or `315 passed` under `node --expose-gc --test`, both on node v26.8.2; other node versions also skip the 5 version-pinned bytecode rows). Suitable for CI.
 
 ### 2. Torture gate — "does zero-GC actually hold under stress?"
 
@@ -575,12 +576,13 @@ A 50,000-particle gravity simulation. Drag to move the gravity well; observe con
 
 | Command | What it does |
 |---|---|
-| `npm test` | Run the unit suite (294 cases) under `node --test` |
+| `npm test` | Run the unit suite (315 cases) under `node --test` |
 | `npm run test:watch` | Re-run on save |
 | `npm run torture` | Run the zero-GC torture gate (`node --expose-gc test/torture.mjs`) |
 | `npm run bench` | Run the Node benchmark, write `bench/bench-results.json` |
 | `npm run inline -- BEFORE.js` | TurboFan + Maglev inlining A/B of a frozen `Arena.js` vs the live one (`--control` = must-fail run); exit 0 SAME / 1 DIFF / 2 NO-VERDICT. A decision diff, not part of `npm test` |
 | `npm run inline-budget-diff` | The vendored V8 inlining-diff tool itself (`-- --self-test` is gated in `npm test`) |
+| `npm run bytecode-budget` | The vendored V8 bytecode-length report / gate tool; `npm test` gates its `--self-test` and pins the hot methods' bytecode lengths on node v26.8.2 (joinN <= 460 B) |
 | `npm run verify` | `npm test && npm run torture && npm run bench` — the full CI-style check |
 
 ---

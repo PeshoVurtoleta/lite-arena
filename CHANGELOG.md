@@ -11,8 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `bench/inlining-budget-diff.sh`: the V8 TurboFan + Maglev inlining-decision diff, vendored from LiteUtils
   (as in lite-signal), with `bench/inline/run.sh` (frozen-before vs live `Arena.js`, plus a must-fail
   `--control`) and npm scripts `inline` / `inline-budget-diff`. Not shipped. Its `--self-test` is gated in
-  `npm test` by `test/inlining-budget-diff.test.js` (43-check pin, 12 must-fail script mutants): 294 tests
-  (292 pass, 2 skipped without `--expose-gc`).
+  `npm test` by `test/inlining-budget-diff.test.js` (43-check pin, 12 must-fail script mutants).
+- `bench/bytecode-budget.sh`: the V8 bytecode-length report / gate tool, vendored from LiteUtils (as in
+  lite-signal), npm script `bytecode-budget`. `test/bytecode-budget.test.js` gates its `--self-test` (49-check
+  pin, 8 must-fail script mutants), real runs on a tiny driver, and Arena's hot methods: exact bytecode-length
+  pins on node v26.8.2 (despawn 199, joinN 423, isAlive 40, spawn 93, setFlags 45, hasFlags 65, clearFlags 47,
+  SparseSet add 113 / has 66 / remove 140 / idx 16) plus a fixed joinN ceiling of 460 B (the TurboFan
+  single-inline limit), with padded-copy must-fail rows. 315 tests (313 pass, 2 skipped without `--expose-gc`,
+  on node v26.8.2; other node versions also skip the 5 version-pinned bytecode rows).
 
 ## [1.10.0] - 2026-10-27
 

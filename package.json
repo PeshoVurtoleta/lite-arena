@@ -29,6 +29,7 @@
     "bench": "node --expose-gc bench/bench.js",
     "inline": "bash bench/inline/run.sh",
     "inline-budget-diff": "bash bench/inlining-budget-diff.sh",
+    "bytecode-budget": "bash bench/bytecode-budget.sh",
     "verify": "npm test && npm run torture && npm run bench"
   },
   "devDependencies": {
