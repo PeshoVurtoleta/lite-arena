@@ -137,6 +137,22 @@
  *     fresh plan's p.flags must be the new arena.flags. Its control is
  *     ARENA_TORTURE_MLEAK=1 (below).
  *
+ *   Phase M (Hi flag word zero-GC + mirror oracle) -- the F1 second-word gate,
+ *     Phase K and Phase L's twin for arena.flagsHi. Arena(4096) full with 32 + 32
+ *     registered flags: 64 frames x (4096 two-row reads `row[e & m]` +
+ *     `rowHi[e & m]` against all four masks + 4096 hasFlagsHi() + 64 despawn /
+ *     spawn / setFlags / setFlagsHi) = 528,384 ops; then Phase L's population with
+ *     a Hi word per entity, planned with joinN(REQ, EXC, reqMask, excMask,
+ *     reqMaskHi, excMaskHi) HOT_OPS_MIN times (Hi bit 31 in reqMaskHi). Both
+ *     windows are gated at RULES_M (maxMajor:0, maxMinor:0); every count must
+ *     equal a mirror oracle built from the harness's own bookkeeping (never an
+ *     arena read), with 0 < masked < unmasked. A retention leg runs 4096 cycles x
+ *     64 spawn / setFlagsHi(e, -1) / lite-leak track / two-word joinN, then
+ *     untrack / despawn: tracker.size(), activeCount and the OR of BOTH flag rows
+ *     must return to 0. Then reserve(8192): a WeakRef to the old Hi row must deref
+ *     to undefined after two awaited gc() passes. Its control is
+ *     ARENA_TORTURE_WLEAK=1 (below).
+ *
  * A pass means something only if the gate can fail. Run
  *
  *     ARENA_TORTURE_LEAK=1 node --expose-gc test/torture.mjs    (Phase A/retention)
@@ -145,9 +161,11 @@
  *     ARENA_TORTURE_SLEAK=1 node --expose-gc test/torture.mjs   (Phase J/churn)
  *     ARENA_TORTURE_FLEAK=1 node --expose-gc test/torture.mjs   (Phase K/flags)
  *     ARENA_TORTURE_MLEAK=1 node --expose-gc test/torture.mjs   (Phase L/masked joinN)
+ *     ARENA_TORTURE_WLEAK=1 node --expose-gc test/torture.mjs   (Phase M/two-word joinN)
  *
  * ARENA_TORTURE_LEAK skips every despawn: the retention oracles stay non-zero and
- * the process exits non-zero (Phase A, and the Phase K / Phase L retention legs).
+ * the process exits non-zero (Phase A, and the Phase K / Phase L / Phase M
+ * retention legs).
  * ARENA_TORTURE_HLEAK injects a retained per-frame
  * allocation into Phase H's hand-off loop, tripping maxArrayBuffersGrowth.
  * ARENA_TORTURE_JLEAK retains a per-call allocation in Phase I's join loop,
@@ -155,6 +173,8 @@
  * Phase J's churn loop, tripping maxMajor. ARENA_TORTURE_FLEAK retains 4,096
  * Float64Array(4096) inside Phase K's window, tripping RULES_K. ARENA_TORTURE_MLEAK
  * retains a per-call allocation in Phase L's masked joinN loop, tripping RULES_L.
+ * ARENA_TORTURE_WLEAK retains a per-call allocation in Phase M's two-word masked
+ * joinN loop, tripping RULES_M.
  * Each is a control -- see CHANGELOG.md and the DONE-WHEN.
  *
  * Phase F runs FIRST, before Phase A, so its liveness census sees a fresh
@@ -1339,6 +1359,364 @@ async function phaseL() {
     };
 }
 
+// --- Phase M: the Hi flag word is zero-GC and agrees with a mirror oracle (F1) ----
+
+// Phase K + Phase L for the second flag word (bits 32..63, arena.flagsHi). Two
+// windows, both gated at RULES_M (zero major AND zero minor GC):
+//   frames -- a full Arena(CAP) with 32 + 32 registered flags; M_FRAMES frames x
+//     (CAP two-row reads `row[e & m]` + `rowHi[e & m]` against all four masks +
+//     CAP hasFlagsHi() + M_CHURN despawn / spawn / setFlags / setFlagsHi). The
+//     two-row count and the hasFlagsHi() count must equal, every frame, an oracle
+//     over the harness's own Int32Array mirrors of BOTH words (never read back).
+//   joinN -- Phase L's population plus a Hi word per entity, planned with
+//     joinN(REQ, EXC, L_RQ, L_XQ, M_RH, M_XH) HOT_OPS_MIN times (Hi bit 31 in
+//     M_RH); every call runs the two-word masked loop and its match count must
+//     equal an oracle computed from plain index arithmetic (set membership and
+//     both words derived from i, no arena reads). Non-degenerate: 0 < masked <
+//     lo-only masked < unmasked, and the Hi word rejects a candidate on each of
+//     its three tests (Hi bit 31 missing, Hi bit 0 missing, Hi excluded bit set).
+// A frame-oracle mismatch is gated in main(), not die()d, so a build that leaves
+// a stale Hi word on a freed slot also reaches (and trips) the retention OR below.
+//
+// Retention leg: M_CYCLES cycles x M_CHURN spawn / setFlags / setFlagsHi(e, -1)
+// (odd i then clearFlagsHi(e, M_XH)) / lite-leak track / all-four-mask joinN
+// (count checked against the harness's words), then untrack / despawn.
+// tracker.size(), activeCount and the OR of EACH row (flags, flagsHi) must return
+// to 0. ARENA_TORTURE_LEAK=1 skips the plan and the release here too. Then
+// reserve(8192): after two awaited gc() passes a WeakRef to the old Hi row must
+// deref to undefined, and a fresh plan's p.flagsHi must be the new arena.flagsHi.
+//
+// Control: ARENA_TORTURE_WLEAK=1 retains a per-call allocation inside the joinN
+// window (mSink); RULES_M trips.
+const WLEAK = process.env.ARENA_TORTURE_WLEAK === '1';
+const M_FRAMES = 64;
+const M_WARM = 8;          // unmeasured warm-up frames, same body
+const M_CHURN = 64;        // despawn/spawn/setFlags/setFlagsHi per frame; retention batch
+const M_CYCLES = 4096;     // retention cycles
+const M_GROW = 8192;       // reserve() target after the retention leg
+const M_RH = (1 << 31) | 1;  // FH.h31 | FH.h0 (Hi bit 31 = -2147483648): -2147483647
+const M_XH = 1 << 2;         // FH.h2
+const M_OPS = M_FRAMES * (CAP + CAP + M_CHURN); // 528,384
+const RULES_M = { maxMajor: 0, maxMinor: 0 };
+const mSink = [];          // retains the control's per-call allocations
+
+function mNamesHi() {
+    const names = [];
+    for (let i = 0; i < 32; i++) names.push('h' + i);
+    return names;
+}
+
+// The Hi word the harness gives population entity i. On the C-driven candidates
+// (i = 64j) that pass every set test and the word-0 masks (j in {1, 17, 33, 49}),
+// j bits 4 / 5 (i bits 10 / 11) pick: 00 -> both req bits (match), 10 -> Hi bit 31
+// withheld, 01 -> Hi bit 0 withheld, 11 -> both req bits AND Hi bit 2 (excluded).
+// Bit 16 on i bit 6 is noise.
+function mFlagWordHi(i) {
+    const b10 = (i >> 10) & 1, b11 = (i >> 11) & 1;
+    let w = (i & 64) !== 0 ? 1 << 16 : 0;
+    if (b10 === 1 && b11 === 1) return w | M_RH | M_XH;
+    if (b10 === 0) w |= 1 << 31;
+    if (b11 === 0) w |= 1;
+    return w;
+}
+
+// One frame. hs: live handles (ring of CAP), mir / mirH: the oracle's word-0 / Hi
+// mirrors (slot-indexed), st: [0] churn cursor, [1] word-0 LCG, [2] Hi LCG, [3]
+// first mismatching frame + 1 (0 = none), [4] last two-row count, [5] last
+// hasFlagsHi count, [6] last two-word oracle, [7] last Hi-only oracle.
+function mFrame(arena, hs, mir, mirH, st, frame) {
+    let cur = st[0], rng = st[1], rngH = st[2];
+    for (let k = 0; k < M_CHURN; k++) {
+        const old = hs[cur];
+        arena.despawn(old);
+        mir[old & INDEX_MASK] = 0;
+        mirH[old & INDEX_MASK] = 0;
+        const e = arena.spawn();
+        const s = e & INDEX_MASK;
+        rng = (Math.imul(rng, 1664525) + 1013904223) | 0;
+        rngH = (Math.imul(rngH, 22695477) + 1) | 0;
+        const wh = rngH ^ (rngH >>> 13);
+        arena.setFlags(e, rng);
+        arena.setFlagsHi(e, wh);
+        mir[s] = mir[s] | rng;
+        mirH[s] = mirH[s] | wh;
+        hs[cur] = e;
+        cur = (cur + 1) & (CAP - 1);
+    }
+    st[0] = cur; st[1] = rng; st[2] = rngH;
+
+    // Read form 1: both hoisted rows, all four masks.
+    const row = arena.flags, rowHi = arena.flagsHi, m = arena.indexMask;
+    let rowN = 0;
+    for (let i = 0; i < CAP; i++) {
+        const x = hs[i] & m;
+        const w = row[x], wh = rowHi[x];
+        if ((w & K_REQ) !== K_REQ || (w & K_EXC) !== 0 || (wh & M_RH) !== M_RH || (wh & M_XH) !== 0) continue;
+        rowN++;
+    }
+    // Read form 2: hasFlagsHi().
+    let hasN = 0;
+    for (let i = 0; i < CAP; i++) {
+        if (arena.hasFlagsHi(hs[i], M_RH, M_XH)) hasN++;
+    }
+    // Oracle: the mirrors, by the TRUE definition of a match.
+    let orN = 0, orH = 0;
+    for (let i = 0; i < CAP; i++) {
+        const w = mir[i], wh = mirH[i];
+        const hiOk = (wh & M_RH) === M_RH && (wh & M_XH) === 0;
+        if (hiOk) orH++;
+        if (hiOk && (w & K_REQ) === K_REQ && (w & K_EXC) === 0) orN++;
+    }
+    if ((rowN !== orN || hasN !== orH) && st[3] === 0) st[3] = frame + 1;
+    st[4] = rowN; st[5] = hasN; st[6] = orN; st[7] = orH;
+}
+
+// Retention leg + reserve (synchronous, as lRetention: no strong ref to the old
+// Hi row survives into the caller's awaited gc passes).
+function mRetention() {
+    const ra = new Arena(CAP);
+    const rA = ra.registerComponent({ x: Float32Array });
+    const rD = ra.registerTag();
+    ra.registerFlags(lNames());
+    const FH = ra.registerFlagsHi(mNamesHi());
+    if ((FH.h31 | FH.h0) !== M_RH || FH.h2 !== M_XH) die('phaseM: retention Hi flag map bits wrong');
+    const REQ = [rA], EXC = [rD];
+    const tracker = createLeakTracker({ name: 'arena-flags-hi-retention' });
+    const leakHandles = new Array(CAP).fill(null);
+    const live = new Int32Array(M_CHURN);
+    const st = new Int32Array(3); // [0] LCG state, [1] first bad cycle + 1, [2] its count delta
+    st[0] = 0x3C6EF372;
+    let rng = st[0];
+    let joins = 0;
+    for (let cycle = 0; cycle < M_CYCLES; cycle++) {
+        let n = 0, want = 0;
+        for (let i = 0; i < M_CHURN; i++) {
+            if (ra.activeCount >= CAP) break; // LEAK control fills the arena: stop, do not throw
+            const e = ra.spawn();
+            rA.add(e);
+            const excluded = (i & 7) === 0;
+            if (excluded) rD.add(e);
+            rng = (Math.imul(rng, 1664525) + 1013904223) | 0;
+            if (!ra.setFlags(e, rng)) die('phaseM: setFlags false on a live entity');
+            if (!ra.setFlagsHi(e, -1)) die('phaseM: setFlagsHi false on a live entity');
+            const hiOk = (i & 1) !== 0;
+            if (hiOk && !ra.clearFlagsHi(e, M_XH)) die('phaseM: clearFlagsHi false on a live entity');
+            if (!excluded && hiOk && (rng & L_RQ) === L_RQ && (rng & L_XQ) === 0) want++;
+            const slot = e & INDEX_MASK;
+            leakHandles[slot] = tracker.track({ slot }, NOOP, slot);
+            live[n++] = e;
+        }
+        if (LEAK) continue; // control: skip the plan and the release entirely
+        const p = ra.joinN(REQ, EXC, L_RQ, L_XQ, M_RH, M_XH);
+        const drv = p.driver, cnt = p.count;
+        const ex = p.excl, nx = p.exclCount;
+        const row = p.flags, rowHi = p.flagsHi, m = ra.indexMask;
+        const rm = p.reqMask, xm = p.excMask, rh = p.reqMaskHi, xh = p.excMaskHi;
+        let got = 0;
+        for (let i = 0; i < cnt; i++) {
+            const e = drv.dense[i];
+            const w = row[e & m], wh = rowHi[e & m];
+            if ((w & rm) !== rm || (w & xm) !== 0 || (wh & rh) !== rh || (wh & xh) !== 0) continue;
+            let ok = true;
+            for (let k = 0; k < nx; k++) if (ex[k].has(e)) { ok = false; break; }
+            if (!ok) continue;
+            got++;
+        }
+        joins++;
+        if (got !== want && st[1] === 0) { st[1] = cycle + 1; st[2] = got - want; }
+        for (let i = 0; i < n; i++) {
+            const e = live[i];
+            const slot = e & INDEX_MASK;
+            tracker.untrack(leakHandles[slot]);
+            leakHandles[slot] = null;
+            ra.despawn(e);
+        }
+    }
+    if (st[1] !== 0) die('phaseM: retention cycle ' + (st[1] - 1) + ' two-word joinN count off by ' + st[2]);
+    if (!LEAK && joins !== M_CYCLES) die('phaseM: retention ran ' + joins + ' plans, expected ' + M_CYCLES);
+    let flagOr = 0, flagOrHi = 0; // OR, not a signed sum: words cannot cancel to 0
+    const rrow = ra.flags, rrowHi = ra.flagsHi;
+    for (let i = 0; i < CAP; i++) { flagOr |= rrow[i]; flagOrHi |= rrowHi[i]; }
+    const trackerSize = tracker.size();
+    const activeCount = ra.activeCount;
+
+    // reserve() replaces arena.flagsHi; take the WeakRef BEFORE, holding no strong ref.
+    const wr = new WeakRef(ra.flagsHi);
+    if (!ra.reserve(M_GROW)) die('phaseM: reserve(' + M_GROW + ') failed');
+    if (ra.flagsHi.length !== M_GROW) die('phaseM: Hi row length ' + ra.flagsHi.length + ' after reserve');
+    return { ra, REQ, EXC, wr, trackerSize, activeCount, flagOr, flagOrHi };
+}
+
+async function phaseM() {
+    // ---- frames window ----
+    const fa = new Arena(CAP);
+    fa.registerFlags(lNames());
+    const FH = fa.registerFlagsHi(mNamesHi());
+    if (FH.h31 !== -2147483648) die('phaseM: Hi flag #31 is ' + FH.h31 + ', expected -2147483648');
+    if ((FH.h31 | FH.h0) !== M_RH || FH.h2 !== M_XH) die('phaseM: Hi flag map bits wrong');
+
+    const hs = new Int32Array(CAP);
+    const mir = new Int32Array(CAP);
+    const mirH = new Int32Array(CAP);
+    const st = new Int32Array(8);
+    let rng = 0x2545F491, rngH = 0x6B43A9B5;
+    for (let i = 0; i < CAP; i++) {
+        const e = fa.spawn();
+        rng = (Math.imul(rng, 1664525) + 1013904223) | 0;
+        rngH = (Math.imul(rngH, 22695477) + 1) | 0;
+        const wh = rngH ^ (rngH >>> 13);
+        fa.setFlags(e, rng);
+        fa.setFlagsHi(e, wh);
+        mir[e & INDEX_MASK] = rng;
+        mirH[e & INDEX_MASK] = wh;
+        hs[i] = e;
+    }
+    st[1] = rng; st[2] = rngH;
+    if (fa.activeCount !== CAP) die('phaseM: arena not full (' + fa.activeCount + ')');
+
+    for (let f = 0; f < M_WARM; f++) mFrame(fa, hs, mir, mirH, st, f);
+    const warmBad = st[3];
+    st[3] = 0;
+
+    globalThis.gc();
+    globalThis.gc();
+
+    const gcF = new GcProfiler(256, { heap: true }).start();
+    gcF.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
+
+    for (let f = 0; f < M_FRAMES; f++) mFrame(fa, hs, mir, mirH, st, f);
+
+    const muF = process.memoryUsage();
+    gcF.sampleHeap(performance.now(), muF.heapUsed, muF);
+
+    await gcF.settle();
+    const fSummary = gcF.summary();
+    gcF.stop();
+
+    const frameBad = warmBad !== 0 ? -warmBad : st[3]; // < 0: warm-up frame; > 0: window frame
+    const fRow = st[4], fHas = st[5], fOr = st[6], fOrH = st[7];
+    if (!(fOr > 0) || !(fOr < fOrH) || !(fOrH < CAP)) {
+        die('phaseM: degenerate frame oracle (two-word ' + fOr + ', Hi-only ' + fOrH + ')');
+    }
+    if (fa.activeCount !== CAP) die('phaseM: activeCount drifted to ' + fa.activeCount);
+
+    // ---- joinN window ----
+    const arena = new Arena(CAP);
+    const A = arena.registerComponent({ x: Float32Array }); // required, largest
+    const B = arena.registerTag();                          // required, half
+    const C = arena.registerTag();                          // required, rarest -> driver
+    const D = arena.registerTag();                          // excluded
+    arena.registerFlags(lNames());
+    arena.registerFlagsHi(mNamesHi());
+    for (let i = 0; i < CAP; i++) {
+        const e = arena.spawn();
+        if ((e & INDEX_MASK) !== i) die('phaseM: fresh arena handed slot ' + (e & INDEX_MASK) + ' at ' + i);
+        A.add(e);
+        if ((i & 1) === 0) B.add(e);
+        if ((i & 63) === 0) C.add(e);
+        if ((i & 127) === 0) D.add(e);
+        if (!arena.setFlags(e, lFlagWord(i))) die('phaseM: setFlags false on a live entity');
+        if (!arena.setFlagsHi(e, mFlagWordHi(i))) die('phaseM: setFlagsHi false on a live entity');
+    }
+    const REQ = [A, B, C];
+    const EXC = [D];
+
+    // Mirror oracle, ONCE outside the window, from index arithmetic only: the set
+    // memberships the loop above chose and the two words lFlagWord / mFlagWordHi.
+    let unmasked = 0, loMasked = 0, expected = 0, hiNo31 = 0, hiNo0 = 0, hiExc = 0;
+    for (let i = 0; i < CAP; i++) {
+        if ((i & 63) !== 0 || (i & 1) !== 0 || (i & 127) === 0) continue;
+        unmasked++;
+        const w = lFlagWord(i), wh = mFlagWordHi(i);
+        if ((w & L_RQ) !== L_RQ || (w & L_XQ) !== 0) continue;
+        loMasked++;
+        if ((wh & M_XH) !== 0) hiExc++;
+        else if ((wh & (1 << 31)) === 0) hiNo31++;
+        else if ((wh & 1) === 0) hiNo0++;
+        else expected++;
+    }
+    if (!(expected > 0) || !(expected < loMasked) || !(loMasked < unmasked) ||
+        !(hiNo31 > 0) || !(hiNo0 > 0) || !(hiExc > 0)) {
+        die('phaseM: degenerate oracle (masked=' + expected + ' loMasked=' + loMasked +
+            ' unmasked=' + unmasked + ' hiNo31=' + hiNo31 + ' hiNo0=' + hiNo0 + ' hiExc=' + hiExc + ')');
+    }
+    const p0 = arena.joinN(REQ, EXC, L_RQ, L_XQ, M_RH, M_XH);
+    if (p0.reqMaskHi !== M_RH || p0.excMaskHi !== M_XH || p0.flagsHi !== arena.flagsHi) {
+        die('phaseM: plan Hi fields reqMaskHi=' + p0.reqMaskHi + ' excMaskHi=' + p0.excMaskHi +
+            ' flagsHi===arena.flagsHi ' + (p0.flagsHi === arena.flagsHi));
+    }
+
+    // [0] first call whose driver was not C + 1, [1] first miscounting call + 1,
+    // [2] that call's count. Preallocated: the window writes ints only.
+    const mst = new Int32Array(3);
+
+    globalThis.gc();
+    globalThis.gc();
+
+    const gc = new GcProfiler(256, { heap: true }).start();
+    gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
+
+    let acc = 0;
+    for (let n = 0; n < HOT_OPS_MIN; n++) {
+        const p = arena.joinN(REQ, EXC, L_RQ, L_XQ, M_RH, M_XH);
+        if (p.driver !== C && mst[0] === 0) mst[0] = n + 1;
+        const drv = p.driver, cnt = p.count;
+        const oth = p.others, no = p.othersCount;
+        const ex = p.excl, nx = p.exclCount;
+        const row = p.flags, rowHi = p.flagsHi, m = arena.indexMask;
+        const rm = p.reqMask, xm = p.excMask, rh = p.reqMaskHi, xh = p.excMaskHi;
+        let matched = 0;
+        for (let i = 0; i < cnt; i++) {
+            const e = drv.dense[i];
+            const w = row[e & m], wh = rowHi[e & m];
+            if ((w & rm) !== rm || (w & xm) !== 0 || (wh & rh) !== rh || (wh & xh) !== 0) continue;
+            let ok = true;
+            for (let k = 0; k < no; k++) if (!oth[k].has(e)) { ok = false; break; }
+            if (ok) for (let k = 0; k < nx; k++) if (ex[k].has(e)) { ok = false; break; }
+            if (!ok) continue;
+            matched++;
+        }
+        if (matched !== expected && mst[1] === 0) { mst[1] = n + 1; mst[2] = matched; }
+        acc = acc + matched;
+        if (WLEAK) mSink.push(new Array(32)); // control: retained per-call alloc
+    }
+
+    const mu = process.memoryUsage();
+    gc.sampleHeap(performance.now(), mu.heapUsed, mu);
+
+    await gc.settle();
+    const summary = gc.summary();
+    gc.stop();
+
+    if (mst[0] !== 0) die('phaseM: two-word joinN did not drive C at call ' + (mst[0] - 1));
+    if (mst[1] !== 0) {
+        die('phaseM: two-word joinN match miscounted at call ' + (mst[1] - 1) + ' (got ' + mst[2] +
+            ' expected ' + expected + ', lo-only ' + loMasked + ', unmasked ' + unmasked + ')');
+    }
+    if (acc !== expected * HOT_OPS_MIN) die('phaseM: match total ' + acc + ' != ' + (expected * HOT_OPS_MIN));
+    mSink.length = 0;
+
+    // Retention leg + reserve (unmeasured), then the old-Hi-row reachability check.
+    const r = mRetention();
+    await lTick();
+    globalThis.gc();
+    await lTick();
+    globalThis.gc();
+    await lTick();
+    if (r.wr.deref() !== undefined) {
+        die('phaseM: the pre-reserve Hi flag row is still reachable after reserve(' + M_GROW +
+            ') + 2 gc passes (the joinN scratch retains it)');
+    }
+    const q = r.ra.joinN(r.REQ, r.EXC, L_RQ, L_XQ, M_RH, M_XH);
+    if (q.flagsHi !== r.ra.flagsHi) die('phaseM: a fresh plan after reserve() does not carry arena.flagsHi');
+
+    return {
+        fReport: checkNoGc(fSummary, RULES_M), fSummary, fOps: M_OPS, frameBad, fRow, fHas, fOr, fOrH,
+        report: checkNoGc(summary, RULES_M), summary, ops: HOT_OPS_MIN, expected, loMasked, unmasked,
+        trackerSize: r.trackerSize, activeCount: r.activeCount, flagOr: r.flagOr, flagOrHi: r.flagOrHi,
+    };
+}
+
 // --- gate --------------------------------------------------------------------
 
 async function main() {
@@ -1362,6 +1740,7 @@ async function main() {
     const j = await phaseJ();
     const k = await phaseK();
     const l = await phaseL();
+    const mR = await phaseM();
 
     // REPORTED, never gated: Phase J's wall-clock pause (host noise), plus the
     // Phase J / K / L counts for the run log. stderr, so stdout stays exactly "ok".
@@ -1371,7 +1750,13 @@ async function main() {
         ' | phaseK ops=' + k.ops + ' major=' + k.summary.gc.major +
         ' minor=' + k.summary.gc.minor + ' maxPauseMs=' + k.summary.gc.maxMs.toFixed(3) +
         ' | phaseL ops=' + l.ops + ' major=' + l.summary.gc.major +
-        ' minor=' + l.summary.gc.minor + ' maxPauseMs=' + l.summary.gc.maxMs.toFixed(3) + '\n');
+        ' minor=' + l.summary.gc.minor + ' maxPauseMs=' + l.summary.gc.maxMs.toFixed(3) +
+        ' | phaseM frames ops=' + mR.fOps + ' major=' + mR.fSummary.gc.major +
+        ' minor=' + mR.fSummary.gc.minor + ' row/hasHi=' + mR.fRow + '/' + mR.fHas +
+        ' oracle=' + mR.fOr + '/' + mR.fOrH +
+        ' joinN ops=' + mR.ops + ' major=' + mR.summary.gc.major + ' minor=' + mR.summary.gc.minor +
+        ' masked/lo/unmasked=' + mR.expected + '/' + mR.loMasked + '/' + mR.unmasked +
+        ' retention or=' + mR.flagOr + ' orHi=' + mR.flagOrHi + '\n');
 
     const retentionOk = a.activeCount === 0 && a.trackerSize === 0;
     const budgetOk = b.report.ok;
@@ -1387,9 +1772,15 @@ async function main() {
     const flagsRetentionOk = k.trackerSize === 0 && k.activeCount === 0 && k.flagSum === 0;
     const maskedOk = l.report.ok;
     const maskedRetentionOk = l.trackerSize === 0 && l.activeCount === 0 && l.flagOr === 0;
+    const hiFramesOk = mR.fReport.ok;
+    const hiFrameOracleOk = mR.frameBad === 0;
+    const hiJoinOk = mR.report.ok;
+    const hiRetentionOk = mR.trackerSize === 0 && mR.activeCount === 0 &&
+        mR.flagOr === 0 && mR.flagOrHi === 0;
 
     if (retentionOk && budgetOk && joinOk && reserveOk && sweepOk && conservationOk && sabOk && transferOk &&
-        joinNOk && churnOk && flagsOk && flagsRetentionOk && maskedOk && maskedRetentionOk) {
+        joinNOk && churnOk && flagsOk && flagsRetentionOk && maskedOk && maskedRetentionOk &&
+        hiFramesOk && hiFrameOracleOk && hiJoinOk && hiRetentionOk) {
         process.stdout.write('ok\n');
         process.exit(0);
     }
@@ -1481,7 +1872,36 @@ async function main() {
             'torture: masked-joinN-retention (phaseL) -- trackerSize=' + l.trackerSize +
             ' activeCount=' + l.activeCount + ' flagOr=' + l.flagOr + ' (all must be 0)\n');
     }
-    die('gate rejected' + (LEAK || HLEAK || JLEAK || SLEAK || FLEAK || MLEAK ? ' (leaky control -- expected)' : ''));
+    if (!hiFramesOk) {
+        const gc = mR.fSummary.gc;
+        process.stderr.write(
+            'torture: flags-hi frames (phaseM) -- verdict=' + mR.fReport.verdict +
+            ' source=' + mR.fSummary.source +
+            ' major=' + gc.major + ' minor=' + gc.minor + ' maxMs=' + gc.maxMs.toFixed(3) +
+            ' (rules ' + JSON.stringify(RULES_M) + ')\n');
+    }
+    if (!hiFrameOracleOk) {
+        process.stderr.write(
+            'torture: flags-hi frame oracle (phaseM) -- ' + (mR.frameBad < 0 ? 'warm-up ' : '') +
+            'frame ' + (Math.abs(mR.frameBad) - 1) + ' two-row/hasFlagsHi disagree with the mirror (last ' +
+            mR.fRow + '/' + mR.fHas + ' vs ' + mR.fOr + '/' + mR.fOrH + ')\n');
+    }
+    if (!hiJoinOk) {
+        const gc = mR.summary.gc;
+        process.stderr.write(
+            'torture: two-word joinN (phaseM) -- verdict=' + mR.report.verdict +
+            ' source=' + mR.summary.source +
+            ' major=' + gc.major + ' minor=' + gc.minor + ' maxMs=' + gc.maxMs.toFixed(3) +
+            ' (rules ' + JSON.stringify(RULES_M) + ')\n');
+    }
+    if (!hiRetentionOk) {
+        process.stderr.write(
+            'torture: flags-hi-retention (phaseM) -- trackerSize=' + mR.trackerSize +
+            ' activeCount=' + mR.activeCount + ' flagOr=' + mR.flagOr + ' flagOrHi=' + mR.flagOrHi +
+            ' (all must be 0)\n');
+    }
+    die('gate rejected' + (LEAK || HLEAK || JLEAK || SLEAK || FLEAK || MLEAK || WLEAK
+        ? ' (leaky control -- expected)' : ''));
 }
 
 main();

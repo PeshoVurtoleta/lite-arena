@@ -100,6 +100,15 @@ export interface JoinNPlan {
      * (and a checked plan) keeps the pre-reserve row -- re-read after growing.
      */
     flags: Int32Array | null;
+    /** The `reqMaskHi` passed to `joinN()`, normalised `| 0` (omitted -> 0). Tested against `flagsHi` (M-26). */
+    reqMaskHi: number;
+    /** The `excMaskHi` passed to `joinN()`, normalised `| 0` (omitted -> 0). */
+    excMaskHi: number;
+    /**
+     * `arena.flagsHi` at plan time; `null` without `registerFlagsHi()`. Same `reserve()`
+     * caveat as `flags`: a hoisted row (and a checked plan) keeps the pre-reserve row.
+     */
+    flagsHi: Int32Array | null;
 }
 
 export class Arena {
@@ -136,6 +145,16 @@ export class Arena {
     readonly flags: Int32Array | null;
 
     /**
+     * The SECOND flag word (bits 32..63, M-26): per-slot Int32Array, length =
+     * capacity, or `null` until {@link Arena.registerFlagsHi} is called. Index with
+     * `e & indexMask`. `reserve()` REPLACES this array: re-read it after growing.
+     * Read-only from user code; write through setFlagsHi / clearFlagsHi. An arena
+     * that never registers it allocates no Hi row (0 B per slot; despawn() adds one nested null check). Bits 30-31 carry the same
+     * nominal pointer-compressed boxing note as {@link Arena.flags}.
+     */
+    readonly flagsHi: Int32Array | null;
+
+    /**
      * Mask that turns an {@link Entity} handle into its slot index (0xFFFFF
      * today). Hoist it in hot loops: `const m = arena.indexMask; row[e & m]`.
      * Do not hard-code 0xFFFFF. Read-only.
@@ -147,7 +166,7 @@ export class Arena {
      * @param maxEntities Integer in `[1, 1048575]`.
      * @param options Optional. `checked: true` enables development-mode
      *   assertions -- a stale {@link Arena.join} plan and a misused
-     *   {@link SparseSet.idx} throw, and setFlags / clearFlags / hasFlags throw
+     *   {@link SparseSet.idx} throw, and setFlags / clearFlags / hasFlags (and the Hi twins) throw
      *   unless every mask is a 32-bit integer (non-number, NaN, fraction, +-Infinity
      *   or a value outside both int32 and uint32 throws; 0x80000000 is accepted) -- that are OFF and
      *   zero-cost in production.
@@ -278,15 +297,31 @@ export class Arena {
      * mask reads 0 and fails open (matches as if no mask). NOMINAL: a mask outside [-2^30, 2^30 - 1]
      * may be a heap number on pointer-compressed engines; hoist it into a local.
      *
+     * Second word (M-26, optional args 5-6): `reqMaskHi` / `excMaskHi` do the same
+     * against `arena.flagsHi` and ride on the plan with a `flagsHi` reference. The
+     * extra cost is O(1) per call (two more `| 0`, one no-row guard, three plan-field stores), not zero; an arena that never calls
+     * registerFlagsHi() allocates no Hi row (0 B per slot; despawn() adds one nested null check). A non-zero Hi mask with no Hi row throws before
+     * any state write, with its own message naming `registerFlagsHi()`; when both
+     * words are missing the word-0 no-flags error fires first. In checked mode the mask type
+     * checks (M-20 / M-25) fire before either no-row error. A Hi-only call pads
+     * args 3-4 with 0, 0 (M-27). M-13 applies PER WORD: `reqMaskHi & excMaskHi` != 0
+     * matches nothing (throws in checked mode); a bit shared ACROSS the two words
+     * (`reqMask & excMaskHi`) is fine. Checked mode validates a supplied Hi mask like
+     * the word-0 ones (M-20 / M-25; a supplied `undefined` throws). NOMINAL: Hi
+     * masks with bit 30 != bit 31 may be heap numbers on pointer-compressed
+     * engines; hoist them into locals.
+     *
      * @param required Non-empty; entities must be in ALL of these.
      * @param excluded Entities must be in NONE of these (default: empty).
      * @param reqMask Every bit must be set in the entity's flag word (default 0;
      *   pass 0 to skip it -- a positional `undefined`, as in
      *   `joinN(R, E, undefined, F.c)`, throws in checked mode).
      * @param excMask No bit may be set in the entity's flag word (default 0).
+     * @param reqMaskHi Every bit must be set in the entity's Hi flag word (default 0).
+     * @param excMaskHi No bit may be set in the entity's Hi flag word (default 0).
      * @returns The reused {@link JoinNPlan}.
      */
-    joinN(required: SparseSet<any>[], excluded?: SparseSet<any>[], reqMask?: number, excMask?: number): JoinNPlan;
+    joinN(required: SparseSet<any>[], excluded?: SparseSet<any>[], reqMask?: number, excMask?: number, reqMaskHi?: number, excMaskHi?: number): JoinNPlan;
 
     /**
      * Explicit, opt-in capacity growth -- the ONLY way the universe grows.
@@ -342,7 +377,7 @@ export class Arena {
      * -2147483648, the Int32 sign bit). `registerFlags()` and `registerFlags([])`
      * allocate the row and return a frozen `{}`.
      *
-     * @param names At most 32 distinct non-empty strings (`'__proto__'` is allowed).
+     * @param names At most 32 distinct non-empty strings PER WORD (`'__proto__'` is allowed).
      * @param options `undefined` / `null` / a plain object with NO own keys (prototype
      *   Object.prototype or null).
      * @throws Error on a second call, more than 32 names, a duplicate / empty /
@@ -377,6 +412,48 @@ export class Arena {
      * checked mode. Checked mode does NOT reject unregistered bits.
      */
     hasFlags(entity: Entity, required: number, excluded?: number): boolean;
+
+    /**
+     * COLD, once per arena: the SECOND flag word (M-26). Allocates {@link Arena.flagsHi}
+     * and returns a frozen null-prototype map `{ name: bit }`, name i -> `1 << i`
+     * (name #32 is -2147483648, Hi bit 31). Together with {@link Arena.registerFlags}
+     * an arena holds up to 64 flags. The two maps are independent: a name may appear
+     * in both (M-27 Q4). `registerFlagsHi()` and `registerFlagsHi([])` allocate the row
+     * and return a frozen `{}`.
+     *
+     * Requires {@link Arena.registerFlags} to have been called first (M-27); call
+     * `registerFlags([])` for a Hi-only arena.
+     *
+     * @param names At most 32 distinct non-empty strings (`'__proto__'` is allowed).
+     * @param options `undefined` / `null` / a plain object with NO own keys.
+     * @throws Error on a second call, when `registerFlags()` was not called, more than
+     *   32 names, a duplicate / empty / non-string name, a non-plain options object, or
+     *   any options key. A validation throw leaves `flagsHi` null.
+     */
+    registerFlagsHi(names?: readonly string[], options?: Record<string, never> | null): Readonly<Record<string, number>>;
+
+    /**
+     * O(1): ORs `mask | 0` into the entity's Hi flag word. Twin of {@link Arena.setFlags}
+     * for `flagsHi`; precondition: registerFlagsHi() was called (a live handle before
+     * that throws a native TypeError). A dead handle returns `false` and writes nothing.
+     * Production fails open on a typo (`undefined | 0` is 0); checked mode throws.
+     * @returns `true` if the entity is alive.
+     */
+    setFlagsHi(entity: Entity, mask: number): boolean;
+
+    /**
+     * O(1): clears `mask | 0` in the entity's Hi flag word. Same precondition,
+     * dead-handle and typo behaviour as {@link Arena.setFlagsHi}.
+     * @returns `true` if the entity is alive.
+     */
+    clearFlagsHi(entity: Entity, mask: number): boolean;
+
+    /**
+     * O(1): alive AND `(hiRow & required) === required` AND `(hiRow & excluded) === 0`.
+     * `excluded` defaults to 0. Twin of {@link Arena.hasFlags} for `flagsHi`; same
+     * precondition as {@link Arena.setFlagsHi}.
+     */
+    hasFlagsHi(entity: Entity, required: number, excluded?: number): boolean;
 }
 
 export class SparseSet<T extends Record<string, TypedArrayConstructor>> {

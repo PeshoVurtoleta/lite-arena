@@ -105,6 +105,13 @@ for (let i = 0; i < qn; i++) {
   // ...
 }
 
+// Hi variant (1.11.0): args 5-6 are reqMaskHi / excMaskHi against the Hi row; H = the registerFlagsHi map.
+const hq = arena.joinN([Pos, Frozen], [Culled], F2.visible, F2.culled, H.boss, H.elite);
+const hrow = hq.flags, hrowHi = hq.flagsHi, hm = arena.indexMask;
+const hrm = hq.reqMask, hxm = hq.excMask, hrh = hq.reqMaskHi, hxh = hq.excMaskHi;
+// per candidate: w = hrow[e & hm]; wh = hrowHi[e & hm];
+// keep e iff (w & hrm) === hrm && (w & hxm) === 0 && (wh & hrh) === hrh && (wh & hxh) === 0
+
 // Hot loop (the canonical pattern):
 const n = Pos.count;
 const x = Pos.data.x;       // hoist the typed-array ref
@@ -114,11 +121,16 @@ for (let i = 0; i < n; i++) {
   y[i] += vy[i] * dt;
 }
 
-// Entity flags: ONE Int32Array word per slot, up to 32 named bits (cold, once):
+// Entity flags: ONE Int32Array word per slot, up to 32 named bits per word (cold, once):
 const F = arena.registerFlags(['hot', 'dirty']);   // frozen { hot: 1, dirty: 2 }
 arena.setFlags(e, F.hot | F.dirty): boolean;       // O(1); false (no write) if dead
 arena.clearFlags(e, F.dirty): boolean;             // O(1); false if dead
 arena.hasFlags(e, F.hot, F.dirty): boolean;        // required all set, excluded none; false if dead
+// Second word (1.11.0, M-26): 64 flags total. Needs registerFlags() first (registerFlags([]) = Hi-only).
+const H = arena.registerFlagsHi(['boss', 'elite']);   // own frozen map { boss: 1, elite: 2 }; arena.flagsHi row
+arena.setFlagsHi(e, H.boss): boolean;                 // O(1); false (no write) if dead
+arena.clearFlagsHi(e, H.boss): boolean;               // O(1); false if dead
+arena.hasFlagsHi(e, H.boss, H.elite): boolean;        // required all set, excluded none; false if dead
 // Hot loop: hoist the row and the mask; never hard-code 0xFFFFF.
 const row = arena.flags, m = arena.indexMask;      // row is REPLACED by reserve(): re-read
 for (let i = 0; i < n; i++) {
@@ -181,7 +193,8 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
   `join()`/`joinN()` throws (they share one epoch), a `joinN()` foreign set or a
   set that is both required and excluded throws, and `idx()` on a dead/non-member
   entity throws, and setFlags/clearFlags/hasFlags throw unless every mask is a
-  32-bit integer (0x80000000 ok; NaN, fractions, +-Infinity, non-numbers throw).
+  32-bit integer (0x80000000 ok; NaN, fractions, +-Infinity, non-numbers throw);
+  the Hi methods and joinN's reqMaskHi / excMaskHi (args 5-6) are validated the same way.
   joinN() masks: a SUPPLIED reqMask / excMask must be a 32-bit integer (M-20), and a
   supplied-but-undefined one (a misspelled F.tpyo) throws too (M-25); an OMITTED mask
   is 0. PRODUCTION stays a plain `| 0`: there a misspelled joinN mask reads 0 and fails
@@ -190,10 +203,17 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
   stay valid (M-22); a non-SparseSet `required` entry gets the foreign-set error.
   The checked `idx` shadows the prototype method as an own property, so the production `idx()` fast path is
   byte-for-byte unchanged.
-- Flags: `registerFlags(names)` once (<= 32 distinct non-empty strings; name i ->
+- Flags: `registerFlags(names)` once (<= 32 distinct non-empty strings in this word; name i ->
   `1 << i`, #32 -> -2147483648); a second call or any options key throws.
   `despawn()` zeroes the slot's word and `clear()` zeroes all, so a respawned slot
   starts with no flags. See decisions/0010-flags.md.
+- Second flag word (1.11.0, M-26 / M-27): `registerFlagsHi(names)` once allocates `arena.flagsHi`
+  (bits 32..63; <= 32 names PER WORD, Hi name i -> `1 << i`, #32 -> -2147483648) and returns its own
+  frozen map; same validation as registerFlags(). It THROWS unless registerFlags() was called first
+  (`registerFlags([])` for a Hi-only arena). The two maps are independent: a name may appear in both.
+  `setFlagsHi` / `clearFlagsHi` / `hasFlagsHi` mirror the word-0 methods on `arena.flagsHi`;
+  `despawn()` and `clear()` zero the Hi word. An arena that never registers it allocates no Hi row (0 B per slot; despawn() adds one nested null check).
+  NOMINAL: Hi bits 30-31 may be heap numbers in a JS variable on pointer-compressed engines.
 - `idx()` skips validation; only call inside loops where validity is guaranteed.
 - `despawn()` automatically removes the entity from every registered component.
 - Replace a column only via `rebind()` (`reserve()` replaces all columns); never
@@ -221,9 +241,10 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
   smaller-count set); it allocates nothing and is called once per system, cold.
   It is a planner, not an iterator -- there is deliberately no `query()` or
   `forEach()`. Consume the result before the next `join()` on the same arena.
-- `joinN(required, excluded, reqMask, excMask)` generalizes `join` to k required sets plus a NOT
+- `joinN(required, excluded, reqMask, excMask, reqMaskHi, excMaskHi)` generalizes `join` to k required sets plus a NOT
   list ("A AND B AND C, WITHOUT D"). It returns a REUSED scratch
-  `{driver, count, others, othersCount, excl, exclCount, reqMask, excMask, flags}` -- driver = the rarest
+  `{driver, count, others, othersCount, excl, exclCount, reqMask, excMask, flags,
+  reqMaskHi, excMaskHi, flagsHi}` -- driver = the rarest
   required set (ties favour the first), `others` = the remaining required sets to
   `has()`-check, `excl` = the excluded sets to `!has()`-check. Loop to
   `othersCount`/`exclCount`, never `.length` (the arrays are grow-once scratch
@@ -239,7 +260,17 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
   (M-11: a flags-only scan is a caller loop over `arena.flags`, O(capacity));
   `(reqMask & excMask) !== 0` matches nothing (throws in checked mode, M-13).
   NOMINAL: a mask outside [-2^30, 2^30 - 1] may be a heap number on
-  pointer-compressed engines. `join(a, b)` is untouched -- the fast two-set path stays exactly as it was.
+  pointer-compressed engines. Hi masks (1.11.0, M-26, args 5-6): the same test against
+  `arena.flagsHi`; the plan carries `reqMaskHi` / `excMaskHi` / `flagsHi`. The extra cost is O(1)
+  per call (not zero). Precedence: empty `required` throws first (M-11); then a non-zero word-0 mask
+  with no flag row (M-10); then a non-zero Hi mask with no Hi row ("joinN() got reqMaskHi=...,
+  excMaskHi=..., but this arena has no Hi flag row (arena.flagsHi is null). Call registerFlagsHi()
+  ..."). In checked mode the mask type checks (M-20 / M-25) fire before either no-row error.
+  Checked mode (M-25 analog): a SUPPLIED Hi mask must be a 32-bit integer ("the required Hi"
+  / "the excluded Hi"), a supplied-but-undefined one throws, and a Hi-only call pads args 3-4 with
+  `0, 0` (M-27). M-13 holds PER WORD: `reqMaskHi & excMaskHi` != 0 matches nothing (throws in
+  checked mode); a bit shared ACROSS the words is allowed. `reserve()` replaces `arena.flagsHi` too.
+  `join(a, b)` is untouched -- the fast two-set path stays exactly as it was.
 - The arena NEVER auto-grows. `spawn()` at capacity throws; growth happens only
   through an explicit, between-frames `reserve(newCap)`. `reserve()` reallocates
   every backing buffer (copying live contents; all handles/memberships/dense

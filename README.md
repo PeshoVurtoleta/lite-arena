@@ -319,6 +319,7 @@ Throws if `maxEntities` is out of range or non-integer.
 | `activeCount` | `number` | Current number of living entities. Read-only. |
 | `retiredCount` | `number` | Slots permanently retired by generation exhaustion (fail-closed rollover). A budget, not a rarity: `capacity x 4095` despawns at the default split, first retirement at about `4095 x entity lifetime`; see [Generational rollover](#edge-cases--guarantees). Read-only. |
 | `flags` | `Int32Array \| null` | Per-slot flag words (length = capacity), `null` until `registerFlags()`. `reserve()` replaces it: re-read after growing. See [Entity flags](#entity-flags). Read-only. |
+| `flagsHi` | `Int32Array \| null` | The second flag word (bits 32..63, M-26): per-slot, `null` until `registerFlagsHi()`. `reserve()` replaces it: re-read after growing. Read-only. |
 | `indexMask` | `number` | Mask from a handle to its slot index (0xFFFFF today). Hoist it; do not hard-code 0xFFFFF. Read-only. |
 
 ### `Arena` methods
@@ -332,11 +333,14 @@ Throws if `maxEntities` is out of range or non-integer.
 | `registerComponent(schema)` | `SparseSet` | Mounts a new SoA component. Schema: `{ key: TypedArrayConstructor }`. **Validated at registration** (a cold path): every field type must be one of the nine numeric TypedArray constructors, or it throws a library error naming the offending key (see [Schema validation](#schema-validation)). |
 | `registerTag()` | `SparseSet` | Zero-size tag component (membership only). `registerComponent({})` with intent. `data` is an empty null-prototype object. |
 | `join(a, b)` | `{ driver, other, count }` | Cold-path join planner. Returns a **reused** scratch with the smaller-count set as `driver`; allocates nothing. Not an iterator — you write the loop. In [checked mode](#checked-mode-development-only) it returns a plan that throws if read after the next `join()`. |
-| `joinN(required, excluded?, reqMask?, excMask?)` | `{ driver, count, others, othersCount, excl, exclCount, reqMask, excMask, flags }` | Cold-path **k-way + exclusion** planner: "in every `required` set AND in none of `excluded`". The k-input sibling of `join` (which is untouched). Picks the rarest `required` set as `driver` (ties favour the first); `others`/`excl` are **grow-once reused** scratch arrays — loop to `othersCount`/`exclCount`, never `.length`. Zero-alloc steady-state. Fail-closed: empty/null `required` throws; a set in both lists is empty (throws in checked mode). Optional **flag masks** (1.10.0): `reqMask` bits must all be set and `excMask` bits all clear in the entity's flag word; the plan carries both (normalised `\| 0`) plus `flags` (`arena.flags`, `null` without `registerFlags()`; `reserve()` refreshes the production plan's `flags`, a hoisted row keeps the old one). See [Entity flags](#entity-flags). |
-| `registerFlags(names?, options?)` | frozen `{ name: bit }` | Cold, once: allocates `arena.flags` and returns name i -> `1 << i`. Throws on a second call, > 32 names, a duplicate / empty / non-string name, or any options key. See [Entity flags](#entity-flags). |
+| `joinN(required, excluded?, reqMask?, excMask?, reqMaskHi?, excMaskHi?)` | `{ driver, count, others, othersCount, excl, exclCount, reqMask, excMask, flags, reqMaskHi, excMaskHi, flagsHi }` | Cold-path **k-way + exclusion** planner: "in every `required` set AND in none of `excluded`". The k-input sibling of `join` (which is untouched). Picks the rarest `required` set as `driver` (ties favour the first); `others`/`excl` are **grow-once reused** scratch arrays — loop to `othersCount`/`exclCount`, never `.length`. Zero-alloc steady-state. Fail-closed: empty/null `required` throws; a set in both lists is empty (throws in checked mode). Optional **flag masks** (1.10.0): `reqMask` bits must all be set and `excMask` bits all clear in the entity's flag word; the plan carries both (normalised `\| 0`) plus `flags` (`arena.flags`, `null` without `registerFlags()`; `reserve()` refreshes the production plan's `flags`, a hoisted row keeps the old one). Optional **Hi masks** (1.11.0, args 5-6): the same test against the second word `arena.flagsHi`; the plan also carries `reqMaskHi` / `excMaskHi` / `flagsHi`. The extra cost is O(1) per call (not zero); with both Hi masks 0 the loop reads no Hi row. See [Entity flags](#entity-flags). |
+| `registerFlags(names?, options?)` | frozen `{ name: bit }` | Cold, once: allocates `arena.flags` and returns name i -> `1 << i`. Throws on a second call, > 32 names (per word), a duplicate / empty / non-string name, or any options key. See [Entity flags](#entity-flags). |
 | `setFlags(e, mask)` / `clearFlags(e, mask)` | `boolean` | O(1). Set / clear bits in the entity's flag word; `false` (nothing written) if `e` is dead. |
 | `hasFlags(e, required, excluded = 0)` | `boolean` | O(1). Alive, every `required` bit set, no `excluded` bit set. |
-| `reserve(newCap)` | `boolean` | **Explicit, between-frames capacity growth** — the only way the arena grows. Reallocates every backing buffer (all handles/data preserved); `false` no-op if `newCap <= capacity`. Invalidates hoisted refs — re-read `data.x` and `arena.flags` after. |
+| `registerFlagsHi(names?, options?)` | frozen `{ name: bit }` | Cold, once (1.11.0, M-26): allocates `arena.flagsHi`, the second 32-name word (64 flags total). Needs `registerFlags()` first (`registerFlags([])` for a Hi-only arena). Same validation as `registerFlags`; a name may appear in both maps. |
+| `setFlagsHi(e, mask)` / `clearFlagsHi(e, mask)` | `boolean` | O(1). Set / clear bits in the entity's Hi flag word; `false` (nothing written) if `e` is dead. |
+| `hasFlagsHi(e, required, excluded = 0)` | `boolean` | O(1). Alive, every `required` Hi bit set, no `excluded` Hi bit set. |
+| `reserve(newCap)` | `boolean` | **Explicit, between-frames capacity growth** — the only way the arena grows. Reallocates every backing buffer (all handles/data preserved); `false` no-op if `newCap <= capacity`. Invalidates hoisted refs — re-read `data.x`, `arena.flags` and `arena.flagsHi` after. |
 | `clear()` | `void` | Resets the arena to empty **without reallocating** — rebuilds the free list, bumps every generation, revives every retired slot, zeroes each component's `count`. O(capacity), allocates nothing. **Every handle minted before `clear()` is invalid afterward.** |
 
 ### `SparseSet<T>` instance members
@@ -358,7 +362,7 @@ Throws if `maxEntities` is out of range or non-integer.
 
 ### Entity flags
 
-A per-slot bit row for cheap boolean state ("hot", "dirty", "frozen") without one `SparseSet` per flag. Opt in once; each entity gets one Int32 word, up to 32 named bits.
+A per-slot bit row for cheap boolean state ("hot", "dirty", "frozen") without one `SparseSet` per flag. Opt in once; each entity gets one Int32 word, up to 32 named bits. A second word (`registerFlagsHi`, 1.11.0) extends that to 64 flags in two independent 32-name maps; an arena that never registers it allocates no Hi row (0 B per slot; despawn() adds one nested null check).
 
 ```js
 const arena = new Arena(10_000);
@@ -385,7 +389,15 @@ for (let i = 0, n = Pos.count; i < n; i++) {
 - `despawn()` zeroes the slot's word and `clear()` zeroes every word, so a respawned slot starts with no flags.
 - Calling the flag methods before `registerFlags()` on a live handle (a dead handle returns false first) throws a native `TypeError` (the row is `null`): a documented precondition.
 - **Production fails open on a typo.** `F.tpyo` is `undefined`, `undefined | 0` is `0`, so `setFlags(e, F.tpyo)` is a silent no-op that returns `true` and `hasFlags(e, F.tpyo)` is `true`. Use [checked mode](#checked-mode-development-only) in development: it throws on a mask that is not a 32-bit integer (it does not reject unregistered bits). The same holds for the optional `joinN` masks, with one difference: a `joinN` mask may be OMITTED (= 0), but a supplied `undefined` (a misspelled `F.tpyo`) throws in checked mode, exactly like `setFlags`; in production a misspelled `joinN` mask is a plain `| 0`, reads 0 and fails open (it matches as if no mask were given) (M-20 / M-25).
-- Bits 30 and 31 are outside the 31-bit Smi range on pointer-compressed engines (e.g. Chrome), so such a value held in a JS variable may be a heap number; inside the Int32Array it is a plain int32. Nominal: Node cannot observe it.
+- Bits 30 and 31 are outside the 31-bit Smi range on pointer-compressed engines (e.g. Chrome), so such a value held in a JS variable may be a heap number; inside the Int32Array it is a plain int32. Nominal: Node cannot observe it. The same NOMINAL note applies to Hi bits 30-31.
+- **Second word (1.11.0, M-26 / M-27).** `registerFlagsHi(names?)` allocates `arena.flagsHi` (bits 32..63; Hi name `i` maps to `1 << i`, the 32nd is `-2147483648`) and returns its own frozen map. It needs `registerFlags()` first (it throws otherwise; `registerFlags([])` gives a Hi-only arena) and has the same validation, 32-name cap and once-only rule, per word. The two maps are independent: a name may appear in both. `setFlagsHi` / `clearFlagsHi` / `hasFlagsHi` mirror the word-0 methods; `despawn()` and `clear()` zero the Hi word too. Before `registerFlagsHi()` a live-handle Hi call throws a native `TypeError` (null row), as for word 0.
+
+```js
+// registerFlags([...]) above comes first (registerFlags([]) for a Hi-only arena)
+const H = arena.registerFlagsHi(['boss', 'elite']);          // bits 32..63: { boss: 1, elite: 2 }
+arena.setFlagsHi(e, H.boss);
+arena.hasFlagsHi(e, H.boss, H.elite);                        // true
+```
 
 `joinN` takes flag masks since 1.10.0 (masked-loop example in the `joinN` section below). Rationale and alternatives: [decisions/0010-flags.md](decisions/0010-flags.md).
 
@@ -393,10 +405,10 @@ for (let i = 0, n = Pos.count; i < n; i++) {
 
 | | Flags row | One `SparseSet` tag per flag | Column bitset (caller-owned recipe) |
 |---|---|---|---|
-| Bytes per slot | 4 B for all 32 flags (one Int32 word) | 8 B per tag (`sparse` Uint32Array + `dense` Int32Array, each `capacity` long) | 1 bit per flag (4 B per 32 flags), in your own `Uint32Array`s |
+| Bytes per slot | 4 B per Int32 word: 4 B for 32 flags, 8 B for all 64 (two words; the Hi row exists only if registered) | 8 B per tag (`sparse` Uint32Array + `dense` Int32Array, each `capacity` long) | 1 bit per flag (4 B per 32 flags), in your own `Uint32Array`s |
 | Membership test | `isAlive` + one row read (`hasFlags`), or one read in a hoisted loop | `has(e)` | your own index + mask; no liveness check |
 | Iterate the flagged entities | scan `arena.flags`, O(capacity) | dense list, O(count) | scan your words, O(capacity / 32) words |
-| `joinN` participation | yes (1.10.0: `reqMask` / `excMask`) | yes | no |
+| `joinN` participation | yes (1.10.0: `reqMask` / `excMask`; 1.11.0: `reqMaskHi` / `excMaskHi`) | yes | no |
 | Cleared on despawn | yes (word zeroed) | yes (cascade remove) | no, you must do it |
 | Use when | many boolean states, mostly tested not iterated | the set is small and iterated or joined | you need a bitmap outside the arena |
 
@@ -441,7 +453,7 @@ comp.idx(deadOrUnattached); // throws: idx() ... dead or does not hold this comp
 //    0x80000000 is accepted. hasFlags may omit `excluded`.
 arena.setFlags(e, F.tpyo); // throws here; in production a silent no-op returning true
 
-// 4. joinN() masks: a SUPPLIED reqMask / excMask must be a 32-bit integer (M-20),
+// 4. joinN() masks: a SUPPLIED reqMask / excMask (and reqMaskHi / excMaskHi) must be a 32-bit integer (M-20),
 //    and a supplied-but-undefined one (F.tpyo) throws too (M-25); an OMITTED
 //    mask is 0. (reqMask & excMask) !== 0 throws (M-13); in production it
 //    matches nothing, and a misspelled mask reads 0 (fails open).
@@ -516,7 +528,7 @@ Four levels of verification, depending on how deep you want to go.
 npm test
 ```
 
-Runs **315 test cases** (313 pass, 2 skipped without `--expose-gc`, on node v26.8.2; other node versions also skip the 5 version-pinned bytecode rows) under `node --test`, covering:
+Runs **379 test cases** (377 pass, 2 skipped without `--expose-gc`, on node v26.8.2, 2026-11-04; other node versions also skip the 5 version-pinned bytecode rows) under `node --test`, covering:
 
 | Group | What's tested |
 |---|---|
@@ -540,7 +552,7 @@ Runs **315 test cases** (313 pass, 2 skipped without `--expose-gc`, on node v26.
 | Tooling gates | the vendored V8 tools' `--self-test` + must-fail script mutants (`test/inlining-budget-diff.test.js`, `test/bytecode-budget.test.js`); hot-method bytecode-length pins on node v26.8.2 and the joinN <= 460 B ceiling |
 | Zero-allocation guarantee | 100k spawn/despawn → < 1 MB heap (requires `--expose-gc`) |
 
-Two zero-allocation cases require `--expose-gc`; without it they skip (`node --test` -> `313 passed, 2 skipped`, or `315 passed` under `node --expose-gc --test`, both on node v26.8.2; other node versions also skip the 5 version-pinned bytecode rows). Suitable for CI.
+Two zero-allocation cases require `--expose-gc`; without it they skip (`node --test` -> `377 passed, 2 skipped`, or `379 passed` under `node --expose-gc --test`, both on node v26.8.2, 2026-11-04; other node versions also skip the 5 version-pinned bytecode rows). Suitable for CI.
 
 ### 2. Torture gate — "does zero-GC actually hold under stress?"
 
@@ -548,7 +560,7 @@ Two zero-allocation cases require `--expose-gc`; without it they skip (`node --t
 npm run torture          # node --expose-gc test/torture.mjs
 ```
 
-The unit tests prove behaviour; the torture gate proves the *guarantees*. It prints exactly `ok` on stdout (plus one reported stderr line; exit 0) or fails loudly (non-zero), across twelve phases: retention (create/dispose 4096 cycles, cross-checked by an external leak tracker), GC budget (`maxMajor: 0` over a 200k-op hot tick), `join` zero-alloc, reserve-then-hot, a handle-space sign-bit sweep, a retirement soak that asserts the conservation law `activeCount + retiredCount + freeListLength === capacity` after every operation (plus a liveness census: `aliveCount === activeCount` at start, after each retirement and after `clear()`), caller-supplied-buffer parity, the transferable detach/rebind round-trip, `joinN` zero-alloc against a brute-force oracle, and lifecycle churn (200,000 spawn/add/despawn on `Arena(4096)`, zero major and zero minor GC; pause reported, not gated), entity flags (528,384 row-read / hasFlags / churn ops at zero GC, counts checked every frame against an independent mirror, retention leg back to 0), and masked `joinN` (Phase L: 200,000 `joinN(REQ, EXC, f0|f31, f5)` calls at zero major and zero minor GC, every per-call count equal to a brute-force `hasFlags` oracle; a 4,096-cycle retention leg back to 0, then `reserve(8192)` leaves the old flag row unreachable). Each phase is its own control -- the gate can fail. (`ARENA_TORTURE_LEAK=1 npm run torture` forces the retention phase to leak and exit non-zero; `ARENA_TORTURE_HLEAK=1` and `ARENA_TORTURE_JLEAK=1` do the same for the transfer and `joinN` phases, `ARENA_TORTURE_SLEAK=1` for the churn phase, `ARENA_TORTURE_FLEAK=1` for the flags phase, and `ARENA_TORTURE_MLEAK=1` for the masked `joinN` phase -- proving the gate bites.)
+The unit tests prove behaviour; the torture gate proves the *guarantees*. It prints exactly `ok` on stdout (plus one reported stderr line; exit 0) or fails loudly (non-zero), across thirteen phases: retention (create/dispose 4096 cycles, cross-checked by an external leak tracker), GC budget (`maxMajor: 0` over a 200k-op hot tick), `join` zero-alloc, reserve-then-hot, a handle-space sign-bit sweep, a retirement soak that asserts the conservation law `activeCount + retiredCount + freeListLength === capacity` after every operation (plus a liveness census: `aliveCount === activeCount` at start, after each retirement and after `clear()`), caller-supplied-buffer parity, the transferable detach/rebind round-trip, `joinN` zero-alloc against a brute-force oracle, and lifecycle churn (200,000 spawn/add/despawn on `Arena(4096)`, zero major and zero minor GC; pause reported, not gated), entity flags (528,384 row-read / hasFlags / churn ops at zero GC, counts checked every frame against an independent mirror, retention leg back to 0), masked `joinN` (Phase L: 200,000 `joinN(REQ, EXC, f0|f31, f5)` calls at zero major and zero minor GC, every per-call count equal to a brute-force `hasFlags` oracle; a 4,096-cycle retention leg back to 0, then `reserve(8192)` leaves the old flag row unreachable), and the second flag word (Phase M: 528,384 two-row ops plus 200,000 `joinN(REQ, EXC, f0|f31, f5, h31|h0, h2)` calls at zero major and zero minor GC, counts equal to a mirror oracle; a 4,096-cycle retention leg with the OR of both rows back to 0, then `reserve(8192)` leaves the old Hi row unreachable). Each phase is its own control -- the gate can fail. (`ARENA_TORTURE_LEAK=1 npm run torture` forces the retention phase to leak and exit non-zero; `ARENA_TORTURE_HLEAK=1` and `ARENA_TORTURE_JLEAK=1` do the same for the transfer and `joinN` phases, `ARENA_TORTURE_SLEAK=1` for the churn phase, `ARENA_TORTURE_FLEAK=1` for the flags phase, `ARENA_TORTURE_MLEAK=1` for the masked `joinN` phase, and `ARENA_TORTURE_WLEAK=1` for the two-word phase -- proving the gate bites.)
 
 ### 3. Benchmark — "does it perform as claimed?"
 
@@ -576,7 +588,7 @@ A 50,000-particle gravity simulation. Drag to move the gravity well; observe con
 
 | Command | What it does |
 |---|---|
-| `npm test` | Run the unit suite (315 cases) under `node --test` |
+| `npm test` | Run the unit suite (379 cases: 377 pass, 2 skipped without `--expose-gc`; `npm test` on node v26.8.2, 2026-11-04) under `node --test` |
 | `npm run test:watch` | Re-run on save |
 | `npm run torture` | Run the zero-GC torture gate (`node --expose-gc test/torture.mjs`) |
 | `npm run bench` | Run the Node benchmark, write `bench/bench-results.json` |
@@ -746,7 +758,7 @@ for (let i = 0; i < n; i++) {
 }
 ```
 
-**Flag masks (1.10.0).** `joinN(required, excluded, reqMask, excMask)` also carries two flag masks on the plan, so the same loop adds ONE row read per candidate (`F = arena.registerFlags([...])` first):
+**Flag masks (1.10.0).** `joinN(required, excluded, reqMask, excMask, reqMaskHi, excMaskHi)` (the last two since 1.11.0, below) also carries two flag masks on the plan, so the same loop adds ONE row read per candidate (`F = arena.registerFlags([...])` first):
 
 ```js
 const p = arena.joinN(REQ, EXC, F.visible, F.culled);
@@ -760,6 +772,24 @@ for (let i = 0; i < n; i++) {
   // e has every required set, no excluded set, every reqMask bit and no excMask bit
 }
 ```
+
+**Second word (1.11.0).** For 64 flags pass the Hi masks too (`H = arena.registerFlagsHi([...])` first); the plan carries `reqMaskHi`, `excMaskHi` and `flagsHi`, and the loop adds a second row read, `wh`, after the word-0 test (a Hi-only call passes `0, 0` for args 3-4):
+
+```js
+const p = arena.joinN(REQ, EXC, F.visible, F.culled, H.boss, H.elite);
+const row = p.flags, rowHi = p.flagsHi, m = arena.indexMask, rm = p.reqMask, xm = p.excMask, rh = p.reqMaskHi, xh = p.excMaskHi; // hoist
+// ... drv / n / oth / no / ex / nx hoisted as above ...
+for (let i = 0; i < n; i++) {
+  const e = drv.dense[i];
+  const w = row[e & m];
+  if ((w & rm) !== rm || (w & xm) !== 0) continue;
+  const wh = rowHi[e & m];
+  if ((wh & rh) !== rh || (wh & xh) !== 0) continue;
+  // ... then the others / excl has() checks as above ...
+}
+```
+
+The extra `joinN` cost for the Hi masks is O(1) per call (two more `| 0`, one no-row guard, three plan-field stores), not zero; with both Hi masks 0 the loop reads no Hi row. Precedence: empty `required` throws first (M-11); then a non-zero word-0 mask with no flag row (M-10); then a non-zero Hi mask with no Hi row (its own message naming `registerFlagsHi()`). In checked mode the mask type checks (M-20 / M-25) fire before either no-row error. In checked mode the Hi masks are validated like the word-0 ones (32-bit integers, a supplied `undefined` throws, M-20 / M-25). M-13 applies per word: `reqMaskHi & excMaskHi` != 0 matches nothing (throws in checked mode), while a bit shared across the two words (`reqMask` vs `excMaskHi`) is allowed. `reserve()` replaces `arena.flagsHi` too: take a new plan after growing. Nominal: Hi masks with bit 30 != bit 31 may be heap numbers on pointer-compressed engines; hoist them into locals as above (Node cannot measure it).
 
 The driver is still the smallest required **set**; masks never change the plan's sets. `p.flags` is `null` on an arena without `registerFlags()`; a non-zero mask there throws before any state write (M-10), and an empty `required` still throws the required-set error first (M-11). `(reqMask & excMask) !== 0` matches nothing in production and throws in checked mode (M-13). In checked mode a supplied-but-`undefined` mask (a misspelled `F.tpyo`) throws; in production it reads 0 and fails open (M-25). `reserve()` replaces `arena.flags` and refreshes the production plan's `flags` to the new row, but a hoisted `row` (and a checked plan) keeps the pre-reserve row: re-read after growing. There is no flags-only join: a scan with no required set is a caller loop over `arena.flags`, O(capacity) (M-11). Nominal: a mask outside [-2^30, 2^30 - 1] may be a heap number on pointer-compressed engines; hoist it into a local as above (Node cannot measure it).
 

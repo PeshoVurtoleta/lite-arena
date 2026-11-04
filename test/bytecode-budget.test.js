@@ -200,8 +200,11 @@ describe('bytecode-budget real runs (tiny driver)', { concurrency: true }, () =>
 
 // ---- (d) the Arena gate (M-30) ----
 // EXACT pins, node v26.8.2. A diff that grows one of these methods raises its pin in the same reviewed diff.
+// F1 (M-26): despawn 199 -> 215 (nested Hi-row zero, <= +24 B), joinN 423 -> 420 (Hi masks; checked-plan
+// stamp moved cold, M-28); the Hi methods are pinned EQUAL to their word-0 twins.
 const PINS = {
-    despawn: 199, joinN: 423, isAlive: 40, spawn: 93, setFlags: 45, hasFlags: 65, clearFlags: 47,
+    despawn: 215, joinN: 420, isAlive: 40, spawn: 93, setFlags: 45, hasFlags: 65, clearFlags: 47,
+    setFlagsHi: 45, hasFlagsHi: 65, clearFlagsHi: 47,
     add: 113, has: 66, remove: 140, idx: 16,
 };
 const JOINN_CEILING = 460;   // M-28: the TurboFan single-inline limit; joinN must stay inlinable. Never moves.
@@ -214,10 +217,12 @@ function arenaDriver(arenaPath) {
         'const a = new Arena(8);',
         'const P = a.registerComponent({ x: Float32Array });',
         'const F = a.registerFlags([\'f\']);',
+        'const H = a.registerFlagsHi([\'h\']);',
         'const e = a.spawn();',
         'P.add(e); P.has(e); P.idx(e); a.isAlive(e);',
         'a.setFlags(e, F.f); a.hasFlags(e, F.f); a.clearFlags(e, F.f);',
-        'a.joinN([P], null, F.f, 0);',
+        'a.setFlagsHi(e, H.h); a.hasFlagsHi(e, H.h); a.clearFlagsHi(e, H.h);',
+        'a.joinN([P], null, F.f, 0, H.h, 0);',
         'P.remove(e); a.despawn(e);',
         '',
     ].join('\n');
@@ -261,13 +266,13 @@ describe('Arena bytecode gate (M-30)', { concurrency: true }, () => {
             const r = await gate(SCRIPT, drv, maxList(PINS), PIN_NODE);
             assert.equal(r.status, 1, r.stdout + r.stderr);
             assert.match(r.stdout, /^VERDICT OVER$/m);
-            assert.match(r.stdout, /^ {2}despawn: OVER -- length\(s\) \d+ > max 199$/m);
+            assert.match(r.stdout, new RegExp(`^ {2}despawn: OVER -- length\\(s\\) \\d+ > max ${PINS.despawn}$`, 'm'));
             for (const fn of Object.keys(PINS)) if (fn !== 'despawn') assert.match(r.stdout, new RegExp(`^  ${fn}: WITHIN `, 'm'));
         }));
 
     test(`MUST FAIL: a joinN grown past ${JOINN_CEILING} B is OVER the fixed ceiling`, { skip: pinSkip },
         () => inTmp('bb-arena-joinN-', async (dir) => {
-            const copy = paddedArena(dir, '    joinN(required, excluded, reqMask, excMask) {\n', 2);   // 423 -> 469 B
+            const copy = paddedArena(dir, '    joinN(required, excluded, reqMask, excMask, reqMaskHi, excMaskHi) {\n', 2);   // 420 -> 466 B (expected)
             const drv = join(dir, 'driver.mjs');
             writeFileSync(drv, arenaDriver(copy));
             const r = await gate(SCRIPT, drv, `joinN=${JOINN_CEILING}`, PIN_NODE);

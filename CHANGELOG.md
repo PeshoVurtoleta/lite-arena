@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Second flag word (M-26 / M-27): `registerFlagsHi(names?, options?)`, `arena.flagsHi`, `setFlagsHi` /
+  `clearFlagsHi` / `hasFlagsHi`, and `joinN` Hi masks. 64 flags in two independent 32-name maps (a name may
+  appear in both); `registerFlagsHi()` throws unless `registerFlags()` was called first (`registerFlags([])`
+  for Hi-only). An arena that never registers it allocates no Hi row (0 B per slot; despawn() adds one nested null check). Capped at 64.
+
+### Changed
+- `joinN(required, excluded, reqMask, excMask, reqMaskHi, excMaskHi)`: two new optional args (existing calls
+  unchanged); the plan gains `reqMaskHi` / `excMaskHi` / `flagsHi`. The extra cost is O(1) per call (not
+  zero). Checked-plan construction moved to the cold function `stampCheckedJoinNPlan` (M-32) to keep `joinN`
+  TurboFan-inlinable (<= 460 B).
+- Tests: `test/flags-hi.test.js`, `test/flags-hi-checked.test.js`, `test/flags-hi-parity.test.js`, `test/joinN-hi.test.js` (+ golden `test/golden/joinN-mask.json` / `joinN-mask-workload.mjs`); `test/torture.mjs` Phase M (two-word flags: 528,384 frame ops + 200,000 `joinN(REQ, EXC, f0|f31, f5, h31|h0, h2)` calls at `{ maxMajor: 0, maxMinor: 0 }`, mirror oracle, 4,096-cycle retention leg with both rows' OR back to 0, `reserve(8192)` old Hi row unreachable), control `ARENA_TORTURE_WLEAK=1`.
+
 ### Tooling
 - `bench/inlining-budget-diff.sh`: the V8 TurboFan + Maglev inlining-decision diff, vendored from LiteUtils
   (as in lite-signal), with `bench/inline/run.sh` (frozen-before vs live `Arena.js`, plus a must-fail
@@ -15,7 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `bench/bytecode-budget.sh`: the V8 bytecode-length report / gate tool, vendored from LiteUtils (as in
   lite-signal), npm script `bytecode-budget`. `test/bytecode-budget.test.js` gates its `--self-test` (49-check
   pin, 8 must-fail script mutants), real runs on a tiny driver, and Arena's hot methods: exact bytecode-length
-  pins on node v26.8.2 (despawn 199, joinN 423, isAlive 40, spawn 93, setFlags 45, hasFlags 65, clearFlags 47,
+  pins on node v26.8.2 (as first vendored: despawn 199, joinN 423; the second-flag-word change raised despawn to 215 and
+  lowered joinN to 420; isAlive 40, spawn 93, setFlags 45, hasFlags 65, clearFlags 47, setFlagsHi 45,
+  clearFlagsHi 47, hasFlagsHi 65,
   SparseSet add 113 / has 66 / remove 140 / idx 16) plus a fixed joinN ceiling of 460 B (the TurboFan
   single-inline limit), with padded-copy must-fail rows. 315 tests (313 pass, 2 skipped without `--expose-gc`,
   on node v26.8.2; other node versions also skip the 5 version-pinned bytecode rows).

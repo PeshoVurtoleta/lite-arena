@@ -257,6 +257,47 @@ function checkMask(method, which, mask) {
     }
 }
 
+/**
+ * COLD: the validation shared by registerFlags() and registerFlagsHi() (M-7 / M-8 /
+ * M-9 / M-17). Throws before the caller allocates anything; returns the NOT yet
+ * frozen null-prototype map name i -> `1 << i`. `method` names the caller in every
+ * error message, so registerFlags()'s wording is unchanged.
+ * @param {string} method - 'registerFlags' or 'registerFlagsHi'.
+ * @param {string[]} [names]
+ * @param {Object} [options]
+ * @returns {Object<string, number>}
+ */
+function flagMap(method, names, options) {
+    if (options != null) {
+        const k = typeof options !== 'object' || Array.isArray(options)
+            ? describeSchemaValue(options) : Reflect.ownKeys(options)[0];
+        if (k !== undefined) throw new Error(`lite-arena: ${method} takes no options; got ${String(k)}`);
+        const proto = Object.getPrototypeOf(options);
+        if (proto !== Object.prototype && proto !== null) {
+            const c = Object.getOwnPropertyDescriptor(proto, 'constructor');
+            throw new Error(`lite-arena: ${method} options must be a plain object (prototype ` +
+                `Object.prototype or null), got ${c && typeof c.value === 'function' && c.value.name
+                    ? (c.value.name === 'Object' ? 'an Object from another realm' : 'a ' + c.value.name)
+                    : 'an object with a custom prototype'}`);
+        }
+    }
+    const list = names === undefined ? [] : names;
+    if (!Array.isArray(list) || list.length > 32) {
+        throw new Error(`lite-arena: ${method} names must be an array of <= 32 strings, got ${
+            Array.isArray(list) ? list.length + ' names' : describeSchemaValue(list)}`);
+    }
+    const map = Object.create(null);
+    for (let i = 0; i < list.length; i++) {
+        const name = list[i];
+        if (typeof name !== 'string' || name.length === 0 || name in map) {
+            throw new Error(`lite-arena: ${method} name #${i} (${typeof name === 'string'
+                ? JSON.stringify(name) : describeSchemaValue(name)}) is empty, not a string, or a duplicate`);
+        }
+        map[name] = 1 << i;
+    }
+    return map;
+}
+
 /** @this {Arena} */
 function checkedSetFlags(entity, mask) {
     checkMask('setFlags', 'the', mask);
@@ -276,18 +317,38 @@ function checkedHasFlags(entity, required, excluded) {
     return Object.getPrototypeOf(this).hasFlags.call(this, entity, required, excluded);
 }
 
+/** @this {Arena} The Hi-word twin of checkedSetFlags (M-26). */
+function checkedSetFlagsHi(entity, mask) {
+    checkMask('setFlagsHi', 'the', mask);
+    return Object.getPrototypeOf(this).setFlagsHi.call(this, entity, mask);
+}
+
+/** @this {Arena} The Hi-word twin of checkedClearFlags (M-26). */
+function checkedClearFlagsHi(entity, mask) {
+    checkMask('clearFlagsHi', 'the', mask);
+    return Object.getPrototypeOf(this).clearFlagsHi.call(this, entity, mask);
+}
+
+/** @this {Arena} The Hi-word twin of checkedHasFlags (M-26); `excluded` may be omitted. */
+function checkedHasFlagsHi(entity, required, excluded) {
+    checkMask('hasFlagsHi', 'the required', required);
+    if (excluded !== undefined) checkMask('hasFlagsHi', 'the excluded', excluded);
+    return Object.getPrototypeOf(this).hasFlagsHi.call(this, entity, required, excluded);
+}
+
 /**
  * CHECKED-mode joinN set validation (S7 / M-13 / M-22). Throws when a required or
  * excluded set is not registered with `arena` (foreign SparseSet), when a set is
- * both required and excluded, or when `reqMask & excMask` != 0 (masks already
- * normalised `| 0`). Read-only: writes no arena state, so a throw here leaves the
+ * both required and excluded, or when `reqMask & excMask` != 0 or `reqMaskHi &
+ * excMaskHi` != 0 (M-13 per word; a bit shared ACROSS the two words is fine;
+ * masks already normalised `| 0`). Read-only: writes no arena state, so a throw here leaves the
  * join scratch, the epoch and every earlier plan untouched. Cold: called from
  * checkedJoinN (before the prototype joinN) and, as a guard, from the
  * CheckedJoinNPlan constructor. Each call validates what ITS reads of `required`
  * / `excluded` return; checked mode assumes plain arrays, so a getter or Proxy
  * whose contents change between reads is not covered.
  */
-function checkJoinNSets(arena, required, excluded, reqMask, excMask) {
+function checkJoinNSets(arena, required, excluded, reqMask, excMask, reqMaskHi, excMaskHi) {
     const reg = arena.components;
     const rn = reg.length;
     for (let i = 0; i < required.length; i++) {
@@ -330,6 +391,12 @@ function checkJoinNSets(arena, required, excluded, reqMask, excMask) {
             'lite-arena: joinN() reqMask and excMask share bit(s) ' + (reqMask & excMask) +
             ' -- the match is always empty. Remove them from one mask. (checked mode.)');
     }
+    // The Hi word (M-26): the same rule within that word only.
+    if ((reqMaskHi & excMaskHi) !== 0) {
+        throw new Error(
+            'lite-arena: joinN() reqMaskHi and excMaskHi share bit(s) ' + (reqMaskHi & excMaskHi) +
+            ' -- the match is always empty. Remove them from one mask. (checked mode.)');
+    }
 }
 
 /**
@@ -342,17 +409,25 @@ function checkJoinNSets(arena, required, excluded, reqMask, excMask) {
  * is PRESENT (arguments.length, so a supplied `undefined` -- a misspelled flag --
  * throws, M-25) must be a 32-bit integer; an omitted mask is 0; (3) a non-zero
  * mask with no flag row -> the prototype's no-flags error (M-10); (4) foreign set,
- * set in both lists, shared mask bits (checkJoinNSets).
+ * set in both lists, shared mask bits (checkJoinNSets). The Hi masks (args 5-6,
+ * M-26) follow the same rules: 'the required Hi' / 'the excluded Hi' in (2), the
+ * Hi no-flags error in (3) (checkJoinNSets runs only when NEITHER word's no-flags
+ * error will fire), per-word shared bits in (4).
  */
-function checkedJoinN(required, excluded, reqMask, excMask) {
+function checkedJoinN(required, excluded, reqMask, excMask, reqMaskHi, excMaskHi) {
     if (required != null && required.length !== 0) {
         const argc = arguments.length;
         if (argc > 2) checkMask('joinN', 'the required', reqMask);
         if (argc > 3) checkMask('joinN', 'the excluded', excMask);
-        const rm = reqMask | 0, xm = excMask | 0;
-        if ((rm | xm) === 0 || this.flags !== null) checkJoinNSets(this, required, excluded, rm, xm);
+        if (argc > 4) checkMask('joinN', 'the required Hi', reqMaskHi);
+        if (argc > 5) checkMask('joinN', 'the excluded Hi', excMaskHi);
+        const rm = reqMask | 0, xm = excMask | 0, rh = reqMaskHi | 0, xh = excMaskHi | 0;
+        if (((rm | xm) === 0 || this.flags !== null) && ((rh | xh) === 0 || this.flagsHi !== null)) {
+            checkJoinNSets(this, required, excluded, rm, xm, rh, xh);
+        }
     }
-    return Object.getPrototypeOf(this).joinN.call(this, required, excluded, reqMask, excMask);
+    return Object.getPrototypeOf(this).joinN.call(
+        this, required, excluded, reqMask, excMask, reqMaskHi, excMaskHi);
 }
 
 export class Arena {
@@ -364,8 +439,8 @@ export class Arena {
      *   on development-mode assertions that are OFF and zero-cost in production:
      *   `join()` returns a plan that throws if read after a later `join()`
      *   superseded it, `idx()` throws on an entity that is dead or lacks the
-     *   component, and `setFlags()` / `clearFlags()` / `hasFlags()` throw
-     *   unless every mask is a 32-bit integer (M-16/M-18; any int32 or uint32,
+     *   component, and `setFlags()` / `clearFlags()` / `hasFlags()` (and their
+     *   Hi twins, M-26) throw unless every mask is a 32-bit integer (M-16/M-18; any int32 or uint32,
      *   so 0x80000000 passes; an omitted `hasFlags` excluded mask is fine).
      *   Leave it off in shipping builds -- the production hot paths (join()'s
      *   reused scratch, the prototype `idx()` and the prototype flag methods)
@@ -422,6 +497,7 @@ export class Arena {
             others: this._joinNOthers, othersCount: 0,
             excl: this._joinNExcl, exclCount: 0,
             reqMask: 0, excMask: 0, flags: null,
+            reqMaskHi: 0, excMaskHi: 0, flagsHi: null,
         };
 
         // Optional development-mode assertions (AR-09 / AR-11). OFF by default and
@@ -437,17 +513,22 @@ export class Arena {
         this._joinEpoch = 0 | 0;
 
         // Per-slot flag row (Int32Array, slot-indexed), null until registerFlags().
+        // flagsHi: the second word (bits 32..63, M-26), null until registerFlagsHi().
         // indexMask: hot loops hoist `const m = arena.indexMask`, read `row[e & m]`.
         this.flags = null;
+        this.flagsHi = null;
         this.indexMask = INDEX_MASK;
 
         // M-16 / M-20: checked mode only -- validating flag methods and joinN (mask
         // check) as OWN properties, so a production Arena keeps its exact instance
-        // shape and prototype methods.
+        // shape and prototype methods. The Hi word (M-26) mirrors them.
         if (this._checked) {
             this.setFlags = checkedSetFlags;
             this.clearFlags = checkedClearFlags;
             this.hasFlags = checkedHasFlags;
+            this.setFlagsHi = checkedSetFlagsHi;
+            this.clearFlagsHi = checkedClearFlagsHi;
+            this.hasFlagsHi = checkedHasFlagsHi;
             this.joinN = checkedJoinN;  // M-20 / M-22: validates masks + sets, then delegates
         }
     }
@@ -536,6 +617,21 @@ export class Arena {
     }
 
     /**
+     * COLD: builds the Error thrown by `joinN()` when a non-zero Hi flag mask is
+     * passed to an arena that never called `registerFlagsHi()` (M-10 for the Hi
+     * word, M-26 / M-27). The twin of `_noFlags()`.
+     * @param {number} rh - The normalised reqMaskHi.
+     * @param {number} xh - The normalised excMaskHi.
+     * @returns {Error}
+     */
+    _noFlagsHi(rh, xh) {
+        return new Error(
+            `lite-arena: joinN() got reqMaskHi=${rh}, excMaskHi=${xh}, but this arena has no Hi flag ` +
+            'row (arena.flagsHi is null). Call registerFlagsHi() before passing a non-zero reqMaskHi ' +
+            'or excMaskHi, or pass 0 / omit both Hi masks.');
+    }
+
+    /**
      * Verifies if a handle points to a living entity.
      * Safe to call on any 32-bit integer; never throws.
      * @param {number} entity - The 32-bit handle.
@@ -567,8 +663,12 @@ export class Arena {
 
         this.activeCount = (this.activeCount - 1) | 0;
 
-        // Zero the flag word before either exit: free and retired rows stay 0.
-        if (this.flags !== null) this.flags[index] = 0;
+        // Zero the flag words before either exit: free and retired rows stay 0. The
+        // Hi row exists only after the word-0 row (M-27), so its check nests inside.
+        if (this.flags !== null) {
+            this.flags[index] = 0;
+            if (this.flagsHi !== null) this.flagsHi[index] = 0;
+        }
 
         // 2. Advance the generation to invalidate stale handles in closures.
         //    A slot issues live generations 1..GEN_MASK. If this despawn returns
@@ -673,34 +773,34 @@ export class Arena {
      */
     registerFlags(names, options) {
         if (this.flags !== null) throw new Error('lite-arena: registerFlags() was already called on this arena');
-        if (options != null) {
-            const k = typeof options !== 'object' || Array.isArray(options)
-                ? describeSchemaValue(options) : Reflect.ownKeys(options)[0];
-            if (k !== undefined) throw new Error(`lite-arena: registerFlags takes no options; got ${String(k)}`);
-            const proto = Object.getPrototypeOf(options);
-            if (proto !== Object.prototype && proto !== null) {
-                const c = Object.getOwnPropertyDescriptor(proto, 'constructor');
-                throw new Error('lite-arena: registerFlags options must be a plain object (prototype ' +
-                    `Object.prototype or null), got ${c && typeof c.value === 'function' && c.value.name
-                        ? (c.value.name === 'Object' ? 'an Object from another realm' : 'a ' + c.value.name)
-                        : 'an object with a custom prototype'}`);
-            }
-        }
-        const list = names === undefined ? [] : names;
-        if (!Array.isArray(list) || list.length > 32) {
-            throw new Error(`lite-arena: registerFlags names must be an array of <= 32 strings, got ${
-                Array.isArray(list) ? list.length + ' names' : describeSchemaValue(list)}`);
-        }
-        const map = Object.create(null);
-        for (let i = 0; i < list.length; i++) {
-            const name = list[i];
-            if (typeof name !== 'string' || name.length === 0 || name in map) {
-                throw new Error(`lite-arena: registerFlags name #${i} (${typeof name === 'string'
-                    ? JSON.stringify(name) : describeSchemaValue(name)}) is empty, not a string, or a duplicate`);
-            }
-            map[name] = 1 << i;
-        }
+        const map = flagMap('registerFlags', names, options);
         this.flags = new Int32Array(this.capacity);
+        return Object.freeze(map);
+    }
+
+    /**
+     * COLD, once: the SECOND flag word (M-26) -- bits 32..63 as their own 32-name
+     * map. Allocates `arena.flagsHi` (Int32Array, one word per SLOT, all 0) and
+     * returns a frozen null-prototype map name i -> `1 << i` (#32 -> -2147483648),
+     * read and written with setFlagsHi / clearFlagsHi / hasFlagsHi and joinN()'s
+     * reqMaskHi / excMaskHi. Needs registerFlags() first (M-27; registerFlags([])
+     * for a Hi-only arena). The two maps are independent: a name may appear in
+     * both. Same validation as registerFlags(), before allocating (a throw leaves
+     * flagsHi null). reserve() REPLACES arena.flagsHi: re-read it.
+     * @param {string[]} [names] - <= 32 distinct non-empty strings.
+     * @param {Object} [options] - A plain object (prototype Object.prototype or null) with
+     *   no own keys in this version: any own key (Symbol / non-enumerable too) throws.
+     * @returns {Readonly<Object<string, number>>}
+     * @throws {Error} On a second call, before registerFlags(), or on invalid names / options.
+     */
+    registerFlagsHi(names, options) {
+        if (this.flagsHi !== null) throw new Error('lite-arena: registerFlagsHi() was already called on this arena');
+        if (this.flags === null) {
+            throw new Error('lite-arena: registerFlagsHi() needs registerFlags() first ' +
+                '(call registerFlags([]) for a Hi-only arena)');
+        }
+        const map = flagMap('registerFlagsHi', names, options);
+        this.flagsHi = new Int32Array(this.capacity);
         return Object.freeze(map);
     }
 
@@ -722,6 +822,27 @@ export class Arena {
     hasFlags(entity, required, excluded) {
         if (!this.isAlive(entity)) return false;
         const w = this.flags[entity & INDEX_MASK];
+        return (w & (required | 0)) === (required | 0) && (w & (excluded | 0)) === 0;
+    }
+
+    /** O(1): ORs `mask | 0` into e's Hi flag word; false (no write) if dead. Needs registerFlagsHi(). */
+    setFlagsHi(entity, mask) {
+        if (!this.isAlive(entity)) return false;
+        this.flagsHi[entity & INDEX_MASK] |= mask | 0;
+        return true;
+    }
+
+    /** O(1): clears `mask | 0` in e's Hi flag word; false (no write) if dead. Needs registerFlagsHi(). */
+    clearFlagsHi(entity, mask) {
+        if (!this.isAlive(entity)) return false;
+        this.flagsHi[entity & INDEX_MASK] &= ~(mask | 0);
+        return true;
+    }
+
+    /** O(1): alive, every `required` Hi bit set, no `excluded` Hi bit (omitted -> 0). Needs registerFlagsHi(). */
+    hasFlagsHi(entity, required, excluded) {
+        if (!this.isAlive(entity)) return false;
+        const w = this.flagsHi[entity & INDEX_MASK];
         return (w & (required | 0)) === (required | 0) && (w & (excluded | 0)) === 0;
     }
 
@@ -814,15 +935,24 @@ export class Arena {
      * NOMINAL: a mask outside [-2^30, 2^30 - 1] (bit 30 != bit 31) may be a heap
      * number on pointer-compressed engines, so the plan field may hold one
      * there; hoist it into a local once per system, as below.
+     * Hi word (M-26, optional): `reqMaskHi` / `excMaskHi` do the same against
+     * `arena.flagsHi` (registerFlagsHi()) and ride on the plan as `reqMaskHi` /
+     * `excMaskHi` / `flagsHi`; a non-zero Hi mask with no Hi row throws before
+     * any state write (the word-0 no-flags error fires first when both apply).
+     * Checked mode validates them like the word-0 masks ('the required Hi' /
+     * 'the excluded Hi'; a Hi-only call pads args 3-4 with 0, 0 -- M-27).
      *
      * @param {SparseSet[]} required  Non-empty; entities must be in ALL of these.
      * @param {SparseSet[]} [excluded]  Entities must be in NONE of these.
      * @param {number} [reqMask=0]  Every bit must be set in the entity's flag word.
      * @param {number} [excMask=0]  No bit may be set in the entity's flag word.
+     * @param {number} [reqMaskHi=0]  Every bit must be set in the entity's Hi flag word.
+     * @param {number} [excMaskHi=0]  No bit may be set in the entity's Hi flag word.
      * @returns {{ driver: SparseSet, count: number,
      *             others: SparseSet[], othersCount: number,
      *             excl: SparseSet[], exclCount: number,
-     *             reqMask: number, excMask: number, flags: Int32Array|null }}
+     *             reqMask: number, excMask: number, flags: Int32Array|null,
+     *             reqMaskHi: number, excMaskHi: number, flagsHi: Int32Array|null }}
      *
      * @example
      *   const REQ = [Renderable, Position, Visible], EXC = [Culled];  // hoist once
@@ -854,7 +984,7 @@ export class Arena {
      *       //     and no excMask bit ...
      *   }
      */
-    joinN(required, excluded, reqMask, excMask) {
+    joinN(required, excluded, reqMask, excMask, reqMaskHi, excMaskHi) {
         // Fail closed: no required set means no driver and no honest result. An
         // empty match must be requested explicitly, never inferred from nothing.
         if (required == null || required.length === 0) {
@@ -866,8 +996,12 @@ export class Arena {
 
         // Flag masks (M-4): normalised `| 0` (omitted -> 0). A non-zero mask with no
         // flag row fails closed BEFORE any scratch write or epoch bump (M-10).
-        const rm = reqMask | 0, xm = excMask | 0;
-        if ((rm | xm) !== 0 && this.flags === null) throw this._noFlags(rm, xm);
+        // The Hi masks (M-26) likewise; the word-0 error keeps precedence. An int32
+        // OR is falsy only when 0, so `(rm | xm) &&` tests "non-zero" in fewer
+        // bytes than `!== 0` (M-28: joinN stays <= 460 B, TurboFan-inlinable).
+        const rm = reqMask | 0, xm = excMask | 0, rh = reqMaskHi | 0, xh = excMaskHi | 0;
+        if ((rm | xm) && this.flags === null) throw this._noFlags(rm, xm);
+        if ((rh | xh) && this.flagsHi === null) throw this._noFlagsHi(rh, xh);
 
         // Pick the global-min-count driver among the required sets. Ties favour
         // the earlier set, matching join()'s "ties favour a".
@@ -906,16 +1040,16 @@ export class Arena {
         r.reqMask = rm;
         r.excMask = xm;
         r.flags = this.flags;
+        r.reqMaskHi = rh;
+        r.excMaskHi = xh;
+        r.flagsHi = this.flagsHi;
 
         // Production: hand back the reused scratch, zero allocation. Checked mode:
         // stamp a fresh, staleness-guarded plan (AR-09) that also validates every
         // set is registered here and that no set is both required and excluded.
-        if (this._checked) {
-            this._joinEpoch = (this._joinEpoch + 1) | 0;
-            return new CheckedJoinNPlan(
-                this, this._joinEpoch, required, excluded, driver, driver.count, others, oc, excl, xc,
-                rm, xm, this.flags);
-        }
+        // The stamp is a cold module function that reads the scratch just written
+        // (M-28: inline, the construction costs joinN 69 B -- 489 -> 420 on node v26.8.2).
+        if (this._checked) return stampCheckedJoinNPlan(this, required, excluded);
         return r;
     }
 
@@ -1030,6 +1164,13 @@ export class Arena {
             // reserve() is invalid anyway; this only drops the reference).
             this._joinNResult.flags = this.flags;
         }
+        // Hi flag row (M-26): same copy; replaces arena.flagsHi (re-read after growing).
+        if (this.flagsHi !== null) {
+            const newFlagsHi = new Int32Array(newCapacity);
+            newFlagsHi.set(this.flagsHi);
+            this.flagsHi = newFlagsHi;
+            this._joinNResult.flagsHi = this.flagsHi;
+        }
 
         this.capacity = newCapacity | 0;
         return true;
@@ -1083,6 +1224,7 @@ export class Arena {
         }
 
         if (this.flags !== null) this.flags.fill(0);
+        if (this.flagsHi !== null) this.flagsHi.fill(0);
 
         this.activeCount = 0 | 0;
         this.retiredCount = 0 | 0;
@@ -1497,6 +1639,25 @@ class CheckedJoinPlan {
 }
 
 /**
+ * COLD, checked mode only: the tail of the prototype joinN() when `arena._checked`.
+ * Bumps the shared epoch, then wraps the scratch joinN() has JUST written
+ * (`arena._joinNResult`: driver, count, others / excl and their counts, both
+ * words' masks and rows) in a fresh CheckedJoinNPlan. Same values and order as an
+ * inline construction; kept out of joinN() only for its bytecode budget (M-28).
+ * @param {Arena} arena
+ * @param {SparseSet[]} required
+ * @param {SparseSet[]|null|undefined} excluded
+ * @returns {CheckedJoinNPlan}
+ */
+function stampCheckedJoinNPlan(arena, required, excluded) {
+    const r = arena._joinNResult;
+    arena._joinEpoch = (arena._joinEpoch + 1) | 0;
+    return new CheckedJoinNPlan(
+        arena, arena._joinEpoch, required, excluded, r.driver, r.count, r.others, r.othersCount,
+        r.excl, r.exclCount, r.reqMask, r.excMask, r.flags, r.reqMaskHi, r.excMaskHi, r.flagsHi);
+}
+
+/**
  * Checked-mode wrapper for a `joinN()` plan (S7 / AR-09). Only ever constructed
  * when the arena was created with `{ checked: true }`; production `joinN()`
  * returns the plain reused scratch and never allocates one of these. Beyond the
@@ -1507,12 +1668,12 @@ class CheckedJoinPlan {
  * checkedJoinN before any state write (M-22) and re-run here as a guard.
  *
  * Structurally a `{ driver, count, others, othersCount, excl, exclCount,
- * reqMask, excMask, flags }`, so it is a drop-in for the production scratch at
+ * reqMask, excMask, flags, reqMaskHi, excMaskHi, flagsHi }`, so it is a drop-in for the production scratch at
  * every call site.
  */
 class CheckedJoinNPlan {
     constructor(arena, epoch, required, excluded, driver, count, others, othersCount, excl, exclCount,
-        reqMask, excMask, flags) {
+        reqMask, excMask, flags, reqMaskHi, excMaskHi, flagsHi) {
         // Fail-closed guard for a call that bypassed checkedJoinN (e.g.
         // `Arena.prototype.joinN.call(checkedArena, ...)`): the prototype has already
         // bumped the epoch, so a throw here stales every earlier plan (their reads
@@ -1524,7 +1685,7 @@ class CheckedJoinNPlan {
         // Proxy) can make a foreign set the driver, or put one into others /
         // excl, with no throw.
         // Checked mode assumes plain arrays; that case is not covered.
-        checkJoinNSets(arena, required, excluded, reqMask, excMask);
+        checkJoinNSets(arena, required, excluded, reqMask, excMask, reqMaskHi, excMaskHi);
 
         this._arena = arena;
         this._epoch = epoch;
@@ -1537,6 +1698,9 @@ class CheckedJoinNPlan {
         this._reqMask = reqMask;
         this._excMask = excMask;
         this._flags = flags;
+        this._reqMaskHi = reqMaskHi;
+        this._excMaskHi = excMaskHi;
+        this._flagsHi = flagsHi;
     }
 
     _live() {
@@ -1557,4 +1721,7 @@ class CheckedJoinNPlan {
     get reqMask()     { this._live(); return this._reqMask; }
     get excMask()     { this._live(); return this._excMask; }
     get flags()       { this._live(); return this._flags; }
+    get reqMaskHi()   { this._live(); return this._reqMaskHi; }
+    get excMaskHi()   { this._live(); return this._excMaskHi; }
+    get flagsHi()     { this._live(); return this._flagsHi; }
 }

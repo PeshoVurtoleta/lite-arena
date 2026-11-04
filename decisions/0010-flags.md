@@ -1,4 +1,4 @@
-# 0010 - Entity flags: one Int32 word per slot
+# 0010 - Entity flags: one Int32 word per slot (+ second word, 1.11.0)
 
 Status: accepted
 Date: 2026-10-27
@@ -106,3 +106,53 @@ loop does one row read per candidate: `w = row[e & indexMask]`, match when
   cannot measure it.
 - Gates: `test/joinN-masks.test.js`, `test/joinN-checked.test.js`,
   `test/joinN-parity.test.js` (no-mask golden).
+
+## Amendment: Second word (M-26, 1.11.0)
+
+The text above is the 1.10.0 decision and stays as history. This section adds
+what 1.11.0 changes.
+
+### Decision
+
+64 flags = a SECOND Int32 row with its own Hi API, not a wider type. Word 0 is
+unchanged (`registerFlags`, `arena.flags`, `setFlags` / `clearFlags` /
+`hasFlags`, `reqMask` / `excMask`). New: `registerFlagsHi(names)` -> its own
+frozen map + `arena.flagsHi` (one Int32 per slot), `setFlagsHi` /
+`clearFlagsHi` / `hasFlagsHi`, and `joinN(required, excluded, reqMask, excMask,
+reqMaskHi, excMaskHi)` with plan fields `reqMaskHi` / `excMaskHi` / `flagsHi`.
+Capped at 64; each word keeps its 32-name cap; Hi bit 31 is -2147483648. An
+arena that never calls `registerFlagsHi()` allocates no second row (0 B per slot;
+`despawn()` adds one nested null check); the extra `joinN` cost is O(1) per call (not zero).
+
+Rejected here: a BigInt row (BigInt64Array reads allocate), per-entity objects,
+and column bitsets. The latter two are F2 material, not this release.
+
+### M-27 rulings
+
+- Q1: `registerFlagsHi()` throws unless `registerFlags()` was called first;
+  `registerFlags([])` gives a Hi-only arena.
+- Q2: Hi-only `joinN` masks are allowed; under M-25 checked mode args 3-4 are
+  padded with `0, 0` (a supplied `undefined` throws).
+- Q3: checked-mode wording says "the required Hi" / "the excluded Hi" mask; a
+  non-zero Hi mask with no Hi row throws "joinN() got reqMaskHi=...,
+  excMaskHi=..., but this arena has no Hi flag row (arena.flagsHi is null). Call
+  registerFlagsHi() ...". The word-0 no-flags error fires first when both apply;
+  an empty `required` still throws first (M-11).
+- Q4: the same name may appear in the word-0 map and the Hi map; the maps are
+  independent and the arena stores neither. M-13 holds per word; a bit shared
+  across the words is allowed.
+
+### Inline budget (M-28) and checked-plan construction (M-32)
+
+`joinN` must stay TurboFan-inlinable: bytecode <= 460 B (V8 single-inline
+limit). 1.10.0 was 423 B. Constructing the checked plan inline would have cost
+69 B (489 -> 420), so it moved to the cold module function
+`stampCheckedJoinNPlan(arena, required, excluded)` (epoch bump + the
+`CheckedJoinNPlan` from the scratch), and the M-10 guards for both words use a
+truthy `(a | b) &&` test. A Hi guard moved to a cold helper was measured at 502 B
+and rejected.
+
+Deterministic bytecode lengths (node v26.8.2, measured 2026-11-04, pinned in
+`test/bytecode-budget.test.js`): joinN 420 B, despawn 215 B (199 before: the Hi
+word is zeroed), `setFlagsHi` 45, `clearFlagsHi` 47, `hasFlagsHi` 65 (equal to
+their word-0 twins).
