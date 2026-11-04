@@ -2,7 +2,7 @@
 
 Status: accepted
 Date: 2026-10-27
-Ships in: v1.10.0 (unreleased)
+Ships in: v1.10.0 (second flag word + M-33 amendment: v1.11.0)
 Supersedes: nothing. Builds on 0009 (a flag word is only meaningful for a live handle).
 
 ## Context

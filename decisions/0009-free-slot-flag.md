@@ -2,7 +2,7 @@
 
 Status: accepted
 Date: 2026-10-27
-Ships in: v1.10.0 (unreleased)
+Ships in: v1.10.0
 Supersedes: nothing. Amends 0001 (rollover) and 0004 section 3 (`clear()`).
 
 ## Context

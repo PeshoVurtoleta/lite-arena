@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-11-04
+
+F1 + M-33: a second 32-bit flag word (64 flags, Hi API, `joinN` Hi masks), the flag
+methods convert the mask before the alive check, re-entrant `register*` fails closed;
+vendored V8 inlining-diff and bytecode-budget tooling.
+
 ### Added
 - Second flag word (M-26 / M-27): `registerFlagsHi(names?, options?)`, `arena.flagsHi`, `setFlagsHi` /
   `clearFlagsHi` / `hasFlagsHi`, and `joinN` Hi masks. 64 flags in two independent 32-name maps (a name may
