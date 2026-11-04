@@ -18,7 +18,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged); the plan gains `reqMaskHi` / `excMaskHi` / `flagsHi`. The extra cost is O(1) per call (not
   zero). Checked-plan construction moved to the cold function `stampCheckedJoinNPlan` (M-32) to keep `joinN`
   TurboFan-inlinable (<= 460 B).
-- Tests: `test/flags-hi.test.js`, `test/flags-hi-checked.test.js`, `test/flags-hi-parity.test.js`, `test/joinN-hi.test.js` (+ golden `test/golden/joinN-mask.json` / `joinN-mask-workload.mjs`); `test/torture.mjs` Phase M (two-word flags: 528,384 frame ops + 200,000 `joinN(REQ, EXC, f0|f31, f5, h31|h0, h2)` calls at `{ maxMajor: 0, maxMinor: 0 }`, mirror oracle, 4,096-cycle retention leg with both rows' OR back to 0, `reserve(8192)` old Hi row unreachable), control `ARENA_TORTURE_WLEAK=1`.
+- Tests: `test/flags-hi.test.js`, `test/flags-hi-checked.test.js`, `test/flags-hi-parity.test.js`, `test/joinN-hi.test.js`, `test/flags-hi-qa.test.js` (16 tests), `test/flags-m33.test.js` (17 tests) (+ golden `test/golden/joinN-mask.json` / `joinN-mask-workload.mjs`); `test/torture.mjs` Phase M (two-word flags: 528,384 frame ops + 200,000 `joinN(REQ, EXC, f0|f31, f5, h31|h0, h2)` calls at `{ maxMajor: 0, maxMinor: 0 }`, mirror oracle, 4,096-cycle retention leg with both rows' OR back to 0, `reserve(8192)` old Hi row unreachable), control `ARENA_TORTURE_WLEAK=1`.
+
+### Fixed
+- Flag methods (M-33): `setFlags` / `clearFlags` / `hasFlags` and the Hi twins now convert the mask (`mask | 0`;
+  `hasFlags`: required and excluded, each once) BEFORE the alive check. A mask whose `valueOf()` despawns the
+  entity could write a freed slot, and `hasFlags` could return `true` for an entity its own mask despawned.
+- `registerFlags` / `registerFlagsHi` re-check "already called" after reading names / options: a names getter or
+  an options Proxy trap that re-enters the method now makes the OUTER call throw the existing "already called"
+  error (the inner call's map and row stand).
+- Behaviour change: a BigInt or Symbol mask now throws TypeError on a dead handle too (it returned `false`
+  before), live or dead. A number / undefined / plain-object mask on a dead handle still returns `false` with no
+  write, but an object mask's `valueOf` now runs once (it was never called before), so a throwing `valueOf`
+  propagates. Before `registerFlags()` on a live handle an object mask's `valueOf` runs once, then the TypeError.
+  Checked mode is unchanged. Cost: +3 B of bytecode per method.
 
 ### Tooling
 - `bench/inlining-budget-diff.sh`: the V8 TurboFan + Maglev inlining-decision diff, vendored from LiteUtils
@@ -29,11 +42,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lite-signal), npm script `bytecode-budget`. `test/bytecode-budget.test.js` gates its `--self-test` (49-check
   pin, 8 must-fail script mutants), real runs on a tiny driver, and Arena's hot methods: exact bytecode-length
   pins on node v26.8.2 (as first vendored: despawn 199, joinN 423; the second-flag-word change raised despawn to 215 and
-  lowered joinN to 420; isAlive 40, spawn 93, setFlags 45, hasFlags 65, clearFlags 47, setFlagsHi 45,
-  clearFlagsHi 47, hasFlagsHi 65,
+  lowered joinN to 420; isAlive 40, spawn 93, setFlags 48, hasFlags 68, clearFlags 50, setFlagsHi 48,
+  clearFlagsHi 50, hasFlagsHi 68 (M-33: were 45 / 65 / 47),
   SparseSet add 113 / has 66 / remove 140 / idx 16) plus a fixed joinN ceiling of 460 B (the TurboFan
-  single-inline limit), with padded-copy must-fail rows. 315 tests (313 pass, 2 skipped without `--expose-gc`,
-  on node v26.8.2; other node versions also skip the 5 version-pinned bytecode rows).
+  single-inline limit), with padded-copy must-fail rows.
+- Test counts: 409 tests (407 pass, 2 skipped without `--expose-gc`, node v26.8.2; other node versions also skip
+  the 5 version-pinned bytecode rows).
 
 ## [1.10.0] - 2026-10-27
 

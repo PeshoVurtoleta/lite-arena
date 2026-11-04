@@ -380,16 +380,20 @@ export class Arena {
      * @param names At most 32 distinct non-empty strings PER WORD (`'__proto__'` is allowed).
      * @param options `undefined` / `null` / a plain object with NO own keys (prototype
      *   Object.prototype or null).
-     * @throws Error on a second call, more than 32 names, a duplicate / empty /
+     * @throws Error on a second call (or if a names getter or an options Proxy trap
+     *   re-entered it: the OUTER call throws), more than 32 names, a duplicate / empty /
      *   non-string name, a non-plain options object, or any options key. A throw
-     *   leaves `flags` null.
+     *   allocates no row (on a re-entry the inner call's row stands).
      */
     registerFlags(names?: readonly string[], options?: Record<string, never> | null): Readonly<Record<string, number>>;
 
     /**
      * O(1): ORs `mask | 0` into the entity's flag word (0x80000000 works).
+     * `mask | 0` is converted BEFORE the alive check, so a mask whose valueOf() despawns the
+     * entity cannot write a freed slot; a BigInt or Symbol mask throws TypeError, live or dead.
      * Precondition: registerFlags() was called; before that, on a live handle, it throws a native
-     * TypeError (null row). A dead handle returns `false` and writes nothing;
+     * TypeError (null row; an object mask's valueOf runs once first). A dead handle with a
+     * number / undefined / object mask returns `false` and writes nothing;
      * `setFlags(e, 0)` on a live entity is a no-op returning `true`.
      * PRODUCTION fails open on a typo: `F.tpyo` is undefined, `undefined | 0` is 0,
      * so the call is a silent no-op that returns `true`. Checked mode throws instead.
@@ -406,8 +410,11 @@ export class Arena {
 
     /**
      * O(1): alive AND `(row & required) === required` AND `(row & excluded) === 0`.
-     * `excluded` defaults to 0. `hasFlags(e, 0)` on a live entity is `true`. A dead
-     * handle is `false`. Same precondition as {@link Arena.setFlags}; a typo'd mask
+     * Both masks are converted (`| 0`, each once) BEFORE the alive check, so it cannot
+     * return `true` for an entity its own mask despawned. `excluded` defaults to 0.
+     * `hasFlags(e, 0)` on a live entity is `true`. A dead
+     * handle is `false` (a BigInt or Symbol mask throws TypeError first, as in
+     * {@link Arena.setFlags}). Same precondition as {@link Arena.setFlags}; a typo'd mask
      * reads as 0 in production (so `hasFlags(e, F.tpyo)` is `true`), and throws in
      * checked mode. Checked mode does NOT reject unregistered bits.
      */
@@ -426,16 +433,20 @@ export class Arena {
      *
      * @param names At most 32 distinct non-empty strings (`'__proto__'` is allowed).
      * @param options `undefined` / `null` / a plain object with NO own keys.
-     * @throws Error on a second call, when `registerFlags()` was not called, more than
+     * @throws Error on a second call (or if a names getter or an options Proxy trap
+     *   re-entered it), when `registerFlags()` was not called, more than
      *   32 names, a duplicate / empty / non-string name, a non-plain options object, or
-     *   any options key. A validation throw leaves `flagsHi` null.
+     *   any options key. A validation throw allocates no row
+     *   (on a re-entry the inner call's row stands).
      */
     registerFlagsHi(names?: readonly string[], options?: Record<string, never> | null): Readonly<Record<string, number>>;
 
     /**
      * O(1): ORs `mask | 0` into the entity's Hi flag word. Twin of {@link Arena.setFlags}
      * for `flagsHi`; precondition: registerFlagsHi() was called (a live handle before
-     * that throws a native TypeError). A dead handle returns `false` and writes nothing.
+     * that throws a native TypeError). `mask | 0` is converted BEFORE the alive check (a
+     * BigInt or Symbol mask throws TypeError, live or dead). A dead handle returns `false`
+     * and writes nothing.
      * Production fails open on a typo (`undefined | 0` is 0); checked mode throws.
      * @returns `true` if the entity is alive.
      */

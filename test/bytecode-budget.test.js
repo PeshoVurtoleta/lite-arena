@@ -202,9 +202,11 @@ describe('bytecode-budget real runs (tiny driver)', { concurrency: true }, () =>
 // EXACT pins, node v26.8.2. A diff that grows one of these methods raises its pin in the same reviewed diff.
 // F1 (M-26): despawn 199 -> 215 (nested Hi-row zero, <= +24 B), joinN 423 -> 420 (Hi masks; checked-plan
 // stamp moved cold, M-28); the Hi methods are pinned EQUAL to their word-0 twins.
+// M-33 ("convert first"): setFlags 45 -> 48, clearFlags 47 -> 50, hasFlags 65 -> 68 (the mask conversion moved
+// before isAlive(); has converts required / excluded once each), Hi twins alike; nothing else moves.
 const PINS = {
-    despawn: 215, joinN: 420, isAlive: 40, spawn: 93, setFlags: 45, hasFlags: 65, clearFlags: 47,
-    setFlagsHi: 45, hasFlagsHi: 65, clearFlagsHi: 47,
+    despawn: 215, joinN: 420, isAlive: 40, spawn: 93, setFlags: 48, hasFlags: 68, clearFlags: 50,
+    setFlagsHi: 48, hasFlagsHi: 68, clearFlagsHi: 50,
     add: 113, has: 66, remove: 140, idx: 16,
 };
 const JOINN_CEILING = 460;   // M-28: the TurboFan single-inline limit; joinN must stay inlinable. Never moves.

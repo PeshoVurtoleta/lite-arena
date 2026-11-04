@@ -76,12 +76,10 @@ test('A4 no-mask golden cross-check (full record gate: test/joinN-parity.test.js
 
 // sha256 of Function.prototype.toString, cut from the frozen 1.10.0 build
 // (.handoff/evidence/F1-baseline.txt (a)).
+// M-33: the three flag methods convert first -- their bodies changed by design; 8 rows stay 1.10.0-identical.
 const SHA = [
     ['Arena', 'spawn', '9e59359a266fa0dc33fa4532b6a3c745f6ecd524f4dd094a2ed471427ca87916'],
     ['Arena', 'isAlive', '89c0703573d5870fe948eceaaf4ebc8af97f427973b7805df9476895a01668fc'],
-    ['Arena', 'setFlags', '71c32d5b84c363f81d554768e1f7ecf4cac4a7615f82e31cadd031bb9ecb3474'],
-    ['Arena', 'clearFlags', 'd943bbcebca6847c276b52d03b9c24e8e2fff42bd0b895db856e04694e8b1a98'],
-    ['Arena', 'hasFlags', '500a974d092591dc668ce2f27910b2852e787518638661aaebfada0af841c4a2'],
     ['Arena', 'join', '9f7c41254fec0dc6fe23827f21ebdf8de352b3897d76c223adf803d37e4bcc30'],
     ['Arena', 'registerTag', '266dbf8aa7c401b0cdea0c533d0a8d6035db59cadcac5fa64cb204ac210d66dc'],
     ['SparseSet', 'add', '6ba34630a15ed362828be9ca51398f905f10677d409835f576f600b88de15345'],

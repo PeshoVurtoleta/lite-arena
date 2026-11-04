@@ -123,21 +123,24 @@ for (let i = 0; i < n; i++) {
 
 // Entity flags: ONE Int32Array word per slot, up to 32 named bits per word (cold, once):
 const F = arena.registerFlags(['hot', 'dirty']);   // frozen { hot: 1, dirty: 2 }
-arena.setFlags(e, F.hot | F.dirty): boolean;       // O(1); false (no write) if dead
-arena.clearFlags(e, F.dirty): boolean;             // O(1); false if dead
-arena.hasFlags(e, F.hot, F.dirty): boolean;        // required all set, excluded none; false if dead
+arena.setFlags(e, F.hot | F.dirty): boolean;       // O(1); mask | 0 first, then false (no write) if dead
+arena.clearFlags(e, F.dirty): boolean;             // O(1); mask | 0 first, then false if dead
+arena.hasFlags(e, F.hot, F.dirty): boolean;        // required all set, excluded none; each mask | 0 first, then false if dead
 // Second word (1.11.0, M-26): 64 flags total. Needs registerFlags() first (registerFlags([]) = Hi-only).
 const H = arena.registerFlagsHi(['boss', 'elite']);   // own frozen map { boss: 1, elite: 2 }; arena.flagsHi row
-arena.setFlagsHi(e, H.boss): boolean;                 // O(1); false (no write) if dead
-arena.clearFlagsHi(e, H.boss): boolean;               // O(1); false if dead
-arena.hasFlagsHi(e, H.boss, H.elite): boolean;        // required all set, excluded none; false if dead
+arena.setFlagsHi(e, H.boss): boolean;                 // O(1); mask | 0 first, then false (no write) if dead
+arena.clearFlagsHi(e, H.boss): boolean;               // O(1); mask | 0 first, then false if dead
+arena.hasFlagsHi(e, H.boss, H.elite): boolean;        // required all set, excluded none; each mask | 0 first, then false if dead
 // Hot loop: hoist the row and the mask; never hard-code 0xFFFFF.
 const row = arena.flags, m = arena.indexMask;      // row is REPLACED by reserve(): re-read
 for (let i = 0; i < n; i++) {
     const e = dense[i];
     if ((row[e & m] & F.hot) !== 0) { /* ... */ }
 }
-// Calling the flag methods before registerFlags() on a live handle (a dead handle returns false first) throws a TypeError. Production
+// Calling the flag methods before registerFlags() on a live handle throws a TypeError (an object mask's valueOf runs once first).
+// Masks are converted before the alive check: a BigInt or Symbol mask throws TypeError even on a dead handle;
+// a number / undefined / object mask on a dead handle returns false. registerFlags / registerFlagsHi re-check
+// "already called" after reading names / options (a re-entrant getter or Proxy trap: the OUTER call throws). Production
 // fails OPEN on a typo: F.tpyo is undefined -> 0, so setFlags(e, F.tpyo) is a silent
 // no-op returning true. Use checked mode in development.
 

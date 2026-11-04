@@ -764,16 +764,19 @@ export class Arena {
     /**
      * COLD, once: allocates `arena.flags` (Int32Array, one word per SLOT, all 0)
      * and returns a frozen null-prototype map name i -> `1 << i` (#32 ->
-     * -2147483648). Validates before allocating (a throw leaves flags null).
-     * No names / [] -> frozen {}. reserve() REPLACES arena.flags: re-read it.
+     * -2147483648). Validates before allocating (a throw allocates no row; on a re-entry the
+     * inner call's row stands). No names / [] -> frozen {}. reserve() REPLACES arena.flags: re-read it.
      * @param {string[]} [names] - <= 32 distinct non-empty strings.
      * @param {Object} [options] - A plain object (prototype Object.prototype or null) with
      *   no own keys in this version: any own key (Symbol / non-enumerable too) throws.
      * @returns {Readonly<Object<string, number>>}
+     * @throws {Error} On a second call (or if a names getter or an options Proxy trap re-entered it),
+     *   or on invalid names / options.
      */
     registerFlags(names, options) {
         if (this.flags !== null) throw new Error('lite-arena: registerFlags() was already called on this arena');
         const map = flagMap('registerFlags', names, options);
+        if (this.flags !== null) throw new Error('lite-arena: registerFlags() was already called on this arena');
         this.flags = new Int32Array(this.capacity);
         return Object.freeze(map);
     }
@@ -785,13 +788,14 @@ export class Arena {
      * read and written with setFlagsHi / clearFlagsHi / hasFlagsHi and joinN()'s
      * reqMaskHi / excMaskHi. Needs registerFlags() first (M-27; registerFlags([])
      * for a Hi-only arena). The two maps are independent: a name may appear in
-     * both. Same validation as registerFlags(), before allocating (a throw leaves
-     * flagsHi null). reserve() REPLACES arena.flagsHi: re-read it.
+     * both. Same validation as registerFlags(), before allocating (a throw allocates no row;
+     * on a re-entry the inner call's row stands). reserve() REPLACES arena.flagsHi: re-read it.
      * @param {string[]} [names] - <= 32 distinct non-empty strings.
      * @param {Object} [options] - A plain object (prototype Object.prototype or null) with
      *   no own keys in this version: any own key (Symbol / non-enumerable too) throws.
      * @returns {Readonly<Object<string, number>>}
-     * @throws {Error} On a second call, before registerFlags(), or on invalid names / options.
+     * @throws {Error} On a second call (or if a names getter or an options Proxy trap re-entered it),
+     *   before registerFlags(), or on invalid names / options.
      */
     registerFlagsHi(names, options) {
         if (this.flagsHi !== null) throw new Error('lite-arena: registerFlagsHi() was already called on this arena');
@@ -800,50 +804,75 @@ export class Arena {
                 '(call registerFlags([]) for a Hi-only arena)');
         }
         const map = flagMap('registerFlagsHi', names, options);
+        if (this.flagsHi !== null) throw new Error('lite-arena: registerFlagsHi() was already called on this arena');
         this.flagsHi = new Int32Array(this.capacity);
         return Object.freeze(map);
     }
 
-    /** O(1): ORs `mask | 0` into e's flag word; false (no write) if dead. Needs registerFlags(). */
+    /**
+     * O(1): converts `mask | 0` first, then: false (no write) if dead, else ORs it into e's flag word. Needs
+     * registerFlags().
+     */
     setFlags(entity, mask) {
+        const m = mask | 0;
         if (!this.isAlive(entity)) return false;
-        this.flags[entity & INDEX_MASK] |= mask | 0;
+        this.flags[entity & INDEX_MASK] |= m;
         return true;
     }
 
-    /** O(1): clears `mask | 0` in e's flag word; false (no write) if dead. Needs registerFlags(). */
+    /**
+     * O(1): converts `mask | 0` first, then: false (no write) if dead, else clears it in e's flag word. Needs
+     * registerFlags().
+     */
     clearFlags(entity, mask) {
+        const m = mask | 0;
         if (!this.isAlive(entity)) return false;
-        this.flags[entity & INDEX_MASK] &= ~(mask | 0);
+        this.flags[entity & INDEX_MASK] &= ~m;
         return true;
     }
 
-    /** O(1): alive, every `required` bit set, no `excluded` bit (omitted -> 0). Needs registerFlags(). */
+    /**
+     * O(1): converts `required | 0` and `excluded | 0` first (each once), then: false if dead, else every
+     * `required` bit set and no `excluded` bit (omitted -> 0). Needs registerFlags().
+     */
     hasFlags(entity, required, excluded) {
+        const r = required | 0, x = excluded | 0;
         if (!this.isAlive(entity)) return false;
         const w = this.flags[entity & INDEX_MASK];
-        return (w & (required | 0)) === (required | 0) && (w & (excluded | 0)) === 0;
+        return (w & r) === r && (w & x) === 0;
     }
 
-    /** O(1): ORs `mask | 0` into e's Hi flag word; false (no write) if dead. Needs registerFlagsHi(). */
+    /**
+     * O(1): converts `mask | 0` first, then: false (no write) if dead, else ORs it into e's Hi flag word.
+     * Needs registerFlagsHi().
+     */
     setFlagsHi(entity, mask) {
+        const m = mask | 0;
         if (!this.isAlive(entity)) return false;
-        this.flagsHi[entity & INDEX_MASK] |= mask | 0;
+        this.flagsHi[entity & INDEX_MASK] |= m;
         return true;
     }
 
-    /** O(1): clears `mask | 0` in e's Hi flag word; false (no write) if dead. Needs registerFlagsHi(). */
+    /**
+     * O(1): converts `mask | 0` first, then: false (no write) if dead, else clears it in e's Hi flag word.
+     * Needs registerFlagsHi().
+     */
     clearFlagsHi(entity, mask) {
+        const m = mask | 0;
         if (!this.isAlive(entity)) return false;
-        this.flagsHi[entity & INDEX_MASK] &= ~(mask | 0);
+        this.flagsHi[entity & INDEX_MASK] &= ~m;
         return true;
     }
 
-    /** O(1): alive, every `required` Hi bit set, no `excluded` Hi bit (omitted -> 0). Needs registerFlagsHi(). */
+    /**
+     * O(1): converts `required | 0` and `excluded | 0` first (each once), then: false if dead, else every
+     * `required` Hi bit set and no `excluded` Hi bit (omitted -> 0). Needs registerFlagsHi().
+     */
     hasFlagsHi(entity, required, excluded) {
+        const r = required | 0, x = excluded | 0;
         if (!this.isAlive(entity)) return false;
         const w = this.flagsHi[entity & INDEX_MASK];
-        return (w & (required | 0)) === (required | 0) && (w & (excluded | 0)) === 0;
+        return (w & r) === r && (w & x) === 0;
     }
 
     /**

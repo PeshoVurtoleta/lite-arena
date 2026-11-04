@@ -30,7 +30,8 @@ allocate the row and return a frozen `{}`.
 - `registerFlags` throws on a second call, more than 32 names, a duplicate / empty
   / non-string name, an options object that is not plain (prototype
   Object.prototype or null), or any options key. `'__proto__'` is a legal name.
-  Validation runs before allocation, so a throw leaves `flags` null.
+  Validation runs before allocation, so a throw allocates no row (on a re-entry the
+  inner call's row stands; see M-33 below).
 - `arena.indexMask` (read-only, 0xFFFFF today) lets hot loops write
   `const m = arena.indexMask; row[e & m]`. Do not hard-code 0xFFFFF. This keeps
   callers correct if the handle split ever becomes configurable; it does not
@@ -155,4 +156,25 @@ and rejected.
 Deterministic bytecode lengths (node v26.8.2, measured 2026-11-04, pinned in
 `test/bytecode-budget.test.js`): joinN 420 B, despawn 215 B (199 before: the Hi
 word is zeroed), `setFlagsHi` 45, `clearFlagsHi` 47, `hasFlagsHi` 65 (equal to
-their word-0 twins).
+their word-0 twins; M-33 below raised these to 48 / 50 / 68).
+
+### M-33 (1.11.0): convert the mask before the alive check
+
+`setFlags` / `clearFlags` / `hasFlags` and the Hi twins now convert the mask
+(`mask | 0`; `hasFlags`: required and excluded, each once) BEFORE the alive
+check. A mask whose `valueOf()` despawns the entity can no longer write a freed
+slot, and `hasFlags` cannot return `true` for an entity its own mask despawned.
+On a dead handle a number / undefined / plain-object mask still returns `false`
+with no write (the object's `valueOf` runs once); a BigInt or Symbol mask now
+throws TypeError (was `false`), live or dead. Before `registerFlags()` on a live
+handle an object mask's `valueOf` runs once, then the TypeError (null row).
+Checked mode is unchanged (it rejects non-number masks first).
+
+`registerFlags` / `registerFlagsHi` re-check "already called" after reading
+names / options: a names getter or an options Proxy trap that re-enters the
+method makes the OUTER call throw the existing "already called" error (the
+inner call's map and row stand).
+
+Cost: +3 B of bytecode per method (node v26.8.2: setFlags 48, clearFlags 50,
+hasFlags 68, Hi twins identical; were 45 / 47 / 65). Gates: `test/flags-m33.test.js`,
+`test/flags-hi-qa.test.js`.
