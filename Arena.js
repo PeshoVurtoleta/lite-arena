@@ -868,6 +868,9 @@ export class Arena {
         // their high-water mark the first time a larger join appears, then never
         // reallocated -- callers read `othersCount` / `exclCount`, never `.length`,
         // so any stale tail beyond the live count is unobservable. See joinN().
+        // `driverFlag` / `driverFlagCount` (S6, M-38) are the indexed-flag driver
+        // hint: written by pickFlagDriver only on an arena with an indexed word-0
+        // flag; every other arena keeps the constructed 0 / -1.
         this._joinNOthers = [];
         this._joinNExcl = [];
         this._joinNResult = {
@@ -876,6 +879,7 @@ export class Arena {
             excl: this._joinNExcl, exclCount: 0,
             reqMask: 0, excMask: 0, flags: null,
             reqMaskHi: 0, excMaskHi: 0, flagsHi: null,
+            driverFlag: 0, driverFlagCount: -1,
         };
 
         // Optional development-mode assertions (AR-09 / AR-11). OFF by default and
@@ -1529,6 +1533,9 @@ export class Arena {
      * any state write (the word-0 no-flags error fires first when both apply).
      * Checked mode validates them like the word-0 masks ('the required Hi' /
      * 'the excluded Hi'; a Hi-only call pads args 3-4 with 0, 0 -- M-27).
+     * Indexed flags (S6, M-38): driverFlag / driverFlagCount = the MASK and live
+     * count of the rarest indexed required word-0 flag whose count is < count
+     * (lowest bit wins a tie), else 0 / -1.
      *
      * @param {SparseSet[]} required  Non-empty; entities must be in ALL of these.
      * @param {SparseSet[]} [excluded]  Entities must be in NONE of these.
@@ -1540,7 +1547,8 @@ export class Arena {
      *             others: SparseSet[], othersCount: number,
      *             excl: SparseSet[], exclCount: number,
      *             reqMask: number, excMask: number, flags: Int32Array|null,
-     *             reqMaskHi: number, excMaskHi: number, flagsHi: Int32Array|null }}
+     *             reqMaskHi: number, excMaskHi: number, flagsHi: Int32Array|null,
+     *             driverFlag: number, driverFlagCount: number }}
      *
      * @example
      *   const REQ = [Renderable, Position, Visible], EXC = [Culled];  // hoist once
@@ -1631,12 +1639,14 @@ export class Arena {
         r.reqMaskHi = rh;
         r.excMaskHi = xh;
         r.flagsHi = this.flagsHi;
+        if (this._ixMask) pickFlagDriver(this, r);
 
         // Production: hand back the reused scratch, zero allocation. Checked mode:
         // stamp a fresh, staleness-guarded plan (AR-09) that also validates every
         // set is registered here and that no set is both required and excluded.
         // The stamp is a cold module function that reads the scratch just written
-        // (M-28: inline, the construction costs joinN 69 B -- 489 -> 420 on node v26.8.2).
+        // (M-28, measured at F1: inline, the construction cost joinN 69 B -- 489 -> 420
+        // on node v26.8.2; joinN is 435 B since F2's hint call).
         if (this._checked) return stampCheckedJoinNPlan(this, required, excluded);
         return r;
     }
@@ -2235,11 +2245,41 @@ class CheckedJoinPlan {
 }
 
 /**
+ * COLD: the indexed-flag driver hint of joinN() (S6; M-38 / M-44). joinN() calls it
+ * only when `a._ixMask !== 0`, so `a._ixCnt` is allocated (A4); a Hi-only indexed
+ * arena never reaches it and keeps the constructed 0 / -1. Reads `r.reqMask`,
+ * `r.count` (the driver's count) and `a._ixCnt`; over the indexed required word-0
+ * bits `r.reqMask & a._ixMask` it picks the rarest bit b with `a._ixCnt[b] <
+ * r.count` (STRICT; the lowest bit wins a tie) and ALWAYS writes `r.driverFlag`
+ * (the MASK `1 << b`, so bit 31 is -2147483648) and `r.driverFlagCount`
+ * (`a._ixCnt[b]`); no qualifying bit writes 0 / -1. r.count, r.driver and every
+ * other field are unchanged. It reads r.reqMask itself so no bit-31 int32 crosses
+ * a call V8 may not inline as an argument (M-44). Ints only, zero allocation.
+ * @param {Arena} a
+ * @param {object} r - `a._joinNResult`, just written by joinN()
+ */
+function pickFlagDriver(a, r) {
+    const cnt = a._ixCnt, n = r.count;
+    let m = r.reqMask & a._ixMask;
+    let flag = 0, best = -1;
+    // High-to-low walk (the ixSetFlags idiom); `<=` lets a lower bit win a tie.
+    while (m !== 0) {
+        const b = 31 - Math.clz32(m);
+        m ^= 1 << b;
+        const c = cnt[b];
+        if (c < n && (best === -1 || c <= best)) { flag = 1 << b; best = c; }
+    }
+    r.driverFlag = flag;
+    r.driverFlagCount = best;
+}
+
+/**
  * COLD, checked mode only: the tail of the prototype joinN() when `arena._checked`.
  * Bumps the shared epoch, then wraps the scratch joinN() has JUST written
  * (`arena._joinNResult`: driver, count, others / excl and their counts, both
- * words' masks and rows) in a fresh CheckedJoinNPlan. Same values and order as an
- * inline construction; kept out of joinN() only for its bytecode budget (M-28).
+ * words' masks and rows, the driver-flag hint) in a fresh CheckedJoinNPlan. Same
+ * values and order as an inline construction; kept out of joinN() only for its
+ * bytecode budget (M-28).
  * @param {Arena} arena
  * @param {SparseSet[]} required
  * @param {SparseSet[]|null|undefined} excluded
@@ -2250,7 +2290,8 @@ function stampCheckedJoinNPlan(arena, required, excluded) {
     arena._joinEpoch = (arena._joinEpoch + 1) | 0;
     return new CheckedJoinNPlan(
         arena, arena._joinEpoch, required, excluded, r.driver, r.count, r.others, r.othersCount,
-        r.excl, r.exclCount, r.reqMask, r.excMask, r.flags, r.reqMaskHi, r.excMaskHi, r.flagsHi);
+        r.excl, r.exclCount, r.reqMask, r.excMask, r.flags, r.reqMaskHi, r.excMaskHi, r.flagsHi,
+        r.driverFlag, r.driverFlagCount);
 }
 
 /**
@@ -2264,12 +2305,12 @@ function stampCheckedJoinNPlan(arena, required, excluded) {
  * checkedJoinN before any state write (M-22) and re-run here as a guard.
  *
  * Structurally a `{ driver, count, others, othersCount, excl, exclCount,
- * reqMask, excMask, flags, reqMaskHi, excMaskHi, flagsHi }`, so it is a drop-in for the production scratch at
- * every call site.
+ * reqMask, excMask, flags, reqMaskHi, excMaskHi, flagsHi, driverFlag, driverFlagCount }`,
+ * so it is a drop-in for the production scratch at every call site (M-43).
  */
 class CheckedJoinNPlan {
     constructor(arena, epoch, required, excluded, driver, count, others, othersCount, excl, exclCount,
-        reqMask, excMask, flags, reqMaskHi, excMaskHi, flagsHi) {
+        reqMask, excMask, flags, reqMaskHi, excMaskHi, flagsHi, driverFlag, driverFlagCount) {
         // Fail-closed guard for a call that bypassed checkedJoinN (e.g.
         // `Arena.prototype.joinN.call(checkedArena, ...)`): the prototype has already
         // bumped the epoch, so a throw here stales every earlier plan (their reads
@@ -2297,6 +2338,8 @@ class CheckedJoinNPlan {
         this._reqMaskHi = reqMaskHi;
         this._excMaskHi = excMaskHi;
         this._flagsHi = flagsHi;
+        this._driverFlag = driverFlag;
+        this._driverFlagCount = driverFlagCount;
     }
 
     _live() {
@@ -2320,4 +2363,6 @@ class CheckedJoinNPlan {
     get reqMaskHi()   { this._live(); return this._reqMaskHi; }
     get excMaskHi()   { this._live(); return this._excMaskHi; }
     get flagsHi()     { this._live(); return this._flagsHi; }
+    get driverFlag()      { this._live(); return this._driverFlag; }
+    get driverFlagCount() { this._live(); return this._driverFlagCount; }
 }

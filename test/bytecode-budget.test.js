@@ -208,8 +208,10 @@ describe('bytecode-budget real runs (tiny driver)', { concurrency: true }, () =>
 // F2 (M-36 / M-41): IX_PINS = the 14 indexed-flag hot functions, measured on the B1 build 27c22d70, node v26.8.2
 // (.handoff/evidence/F2/bytecode-after-B1.log, re-measured through arenaDriver). The ix* write bodies are OWN
 // methods of an indexed arena only, so the plain arena keeps compiling the prototype twins pinned in PINS.
+// F2 (M-38 / M-44): joinN 420 -> 435 (one cold pickFlagDriver(this, r) call under `if (this._ixMask)`, the
+// joinN driver hint; ceiling 460 unchanged).
 const PINS = {
-    despawn: 215, joinN: 420, isAlive: 40, spawn: 93, setFlags: 48, hasFlags: 68, clearFlags: 50,
+    despawn: 215, joinN: 435, isAlive: 40, spawn: 93, setFlags: 48, hasFlags: 68, clearFlags: 50,
     setFlagsHi: 48, hasFlagsHi: 68, clearFlagsHi: 50,
     add: 113, has: 66, remove: 140, idx: 16,
 };
@@ -319,7 +321,7 @@ describe('Arena bytecode gate (M-30)', { concurrency: true }, () => {
 
     test(`MUST FAIL: a joinN grown past ${JOINN_CEILING} B is OVER the fixed ceiling`, { skip: pinSkip },
         () => inTmp('bb-arena-joinN-', async (dir) => {
-            const copy = paddedArena(dir, '    joinN(required, excluded, reqMask, excMask, reqMaskHi, excMaskHi) {\n', 2);   // 420 -> 466 B (expected)
+            const copy = paddedArena(dir, '    joinN(required, excluded, reqMask, excMask, reqMaskHi, excMaskHi) {\n', 2);   // 435 -> ~481 B (expected)
             const drv = join(dir, 'driver.mjs');
             writeFileSync(drv, arenaDriver(copy, false));
             const r = await gate(SCRIPT, drv, `joinN=${JOINN_CEILING}`, PIN_NODE);
