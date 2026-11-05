@@ -153,6 +153,33 @@
  *     to undefined after two awaited gc() passes. Its control is
  *     ARENA_TORTURE_WLEAK=1 (below).
  *
+ *   Phase N (indexed flags + joinN hint zero-GC + mirror oracle) -- the F2 gate.
+ *     registerFlags(names, { indexed }) / registerFlagsHi likewise: 4 indexed + 4
+ *     plain word-0 flags (indexed f31 = bit 31) and 2 indexed + 2 plain Hi flags
+ *     (indexed h31 = Hi bit 31). Five windows, each gated at RULES_N (maxMajor:0,
+ *     maxMinor:0). N1: Arena(4096) full, 64 frames x 4096 seeded ops (setFlags /
+ *     clearFlags / despawn+spawn / setFlagsHi / clearFlagsHi; op, slot and mask
+ *     from three independent xorshift32 streams) = 262,144 ops, clearFlagAll +
+ *     clearFlagAllHi in frame 7 of every 16, one firstFlagged / nextFlagged sweep
+ *     per frame despawning every 8th visit (M-39), then an allocation-free oracle
+ *     over the harness's own Int32Array mirrors: both rows == the mirrors, every
+ *     flagCount == the mirror count, every walk == the mirror's live handles
+ *     ascending (count + FNV-1a). N2: reserve(8192), fill the 4096 new slots, 16
+ *     frames whose walks must visit a slot >= 4096. N3: clear() -> all 6
+ *     flagCount 0 and firstFlagged -1, then refill + 16 frames inside the window.
+ *     N4: a { checked: true } arena on the same stream (16 frames), then a
+ *     non-int32 setFlags / setFlagsHi whose `| 0` is an indexed bit must throw
+ *     with the row, count and walk unchanged. N5: Phase I's population with
+ *     indexed f0 (a) and f31 (z); joinN(REQ, EXC, z|a) HOT_OPS_MIN times:
+ *     driverFlag === z and, every call, the flag-driven loop count == the driver
+ *     loop count == a brute-force count from index arithmetic. N6 (retention):
+ *     4096 cycles x 64 spawn / setFlags / setFlagsHi / lite-leak track, untrack /
+ *     despawn: tracker.size(), activeCount, every flagCount, every firstFlagged
+ *     (-1) and the OR of both rows return to 0. An oracle mismatch dies after its
+ *     window ("phaseN: column != row" when a count or walk disagrees with the
+ *     rows). Its controls are ARENA_TORTURE_NLEAK=1, ARENA_TORTURE_NLEAK=hint and
+ *     ARENA_TORTURE_NDESYNC=1 (below).
+ *
  * A pass means something only if the gate can fail. Run
  *
  *     ARENA_TORTURE_LEAK=1 node --expose-gc test/torture.mjs    (Phase A/retention)
@@ -162,10 +189,13 @@
  *     ARENA_TORTURE_FLEAK=1 node --expose-gc test/torture.mjs   (Phase K/flags)
  *     ARENA_TORTURE_MLEAK=1 node --expose-gc test/torture.mjs   (Phase L/masked joinN)
  *     ARENA_TORTURE_WLEAK=1 node --expose-gc test/torture.mjs   (Phase M/two-word joinN)
+ *     ARENA_TORTURE_NLEAK=1 node --expose-gc test/torture.mjs   (Phase N/N1 indexed ops)
+ *     ARENA_TORTURE_NLEAK=hint node --expose-gc test/torture.mjs   (Phase N/N5 joinN hint)
+ *     ARENA_TORTURE_NDESYNC=1 node --expose-gc test/torture.mjs   (Phase N/row-column desync)
  *
  * ARENA_TORTURE_LEAK skips every despawn: the retention oracles stay non-zero and
  * the process exits non-zero (Phase A, and the Phase K / Phase L / Phase M
- * retention legs).
+ * retention legs and Phase N's N6).
  * ARENA_TORTURE_HLEAK injects a retained per-frame
  * allocation into Phase H's hand-off loop, tripping maxArrayBuffersGrowth.
  * ARENA_TORTURE_JLEAK retains a per-call allocation in Phase I's join loop,
@@ -175,6 +205,17 @@
  * retains a per-call allocation in Phase L's masked joinN loop, tripping RULES_L.
  * ARENA_TORTURE_WLEAK retains a per-call allocation in Phase M's two-word masked
  * joinN loop, tripping RULES_M.
+ * ARENA_TORTURE_NLEAK=1 overwrites one sink slot with a fresh Int32Array(1) per
+ * N1 op -- a TRANSIENT allocation, never retained -- and trips RULES_N's
+ * maxMinor in N1 at the default 262,144-op window (14 scavenges on a solo run,
+ * 28 with 6 runs in parallel; measured 2026-11-05, Node v26.8.2; semi-space not
+ * pinned, so the count varies but is never 0; no enlargement needed).
+ * ARENA_TORTURE_NLEAK=hint does the same once per N5 joinN call (200,000 calls;
+ * 10 solo / 21 parallel scavenges, same runs).
+ * ARENA_TORTURE_NDESYNC=1 ORs the indexed f0 bit straight into arena.flags
+ * (bypassing setFlags; UNSUPPORTED, M-39) on one live slot at N1 frame 32 and
+ * mirrors it, so the rows still equal the mirror and the run dies with
+ * "phaseN: column != row".
  * Each is a control -- see CHANGELOG.md and the DONE-WHEN.
  *
  * Phase F runs FIRST, before Phase A, so its liveness census sees a fresh
@@ -1717,6 +1758,592 @@ async function phaseM() {
     };
 }
 
+// --- Phase N: indexed flags + the joinN driver-flag hint are zero-GC (F2) ------
+
+// Indexed flags (registerFlags(names, { indexed }), registerFlagsHi likewise):
+// own setFlags / clearFlags / despawn (+Hi) keep a per-bit column, two summary
+// levels and a live count in step with the row; flagCount / firstFlagged /
+// nextFlagged / clearFlagAll (+Hi) read them. Five windows, each gated at
+// RULES_N (zero major AND zero minor GC), then a retention leg:
+//   N1 -- Arena(CAP) full; 4 indexed word-0 flags (f31 = bit 31) + 4 plain, 2
+//     indexed Hi flags (h31 = Hi bit 31) + 2 plain. N_FRAMES frames x N_OPS seeded
+//     ops: setFlags / clearFlags / despawn+spawn / setFlagsHi / clearFlagsHi, the
+//     op, the slot and the mask each from its OWN xorshift32 stream. clearFlagAll +
+//     clearFlagAllHi in frame 7 of every 16 (rotating bits); one firstFlagged /
+//     nextFlagged sweep per frame (rotating over all 6 indexed bits) despawning
+//     every 8th visited entity (M-39), its visit count + FNV-1a checked against
+//     the mirror; refill to full. After each frame an allocation-free oracle over
+//     the harness MIRROR (never an arena read for the expected side): both rows ==
+//     the mirrors, every flagCount == the mirror count, every walk == the mirror's
+//     live handles ascending (count + FNV-1a over the handles).
+//   N2 -- reserve(N_GROW) on the same arena, fill the new slots (flagged), then
+//     N_FRAMES2 frames: some walk must visit a slot >= CAP (the old capacity).
+//   N3 -- clear(): all 6 flagCount 0 and firstFlagged -1; then refill + oracle +
+//     N_FRAMES3 frames inside the window.
+//   N4 -- a { checked: true } arena, the same seeds / stream, N_FRAMES4 frames;
+//     then (cold) setFlags(e, 1.5 / 2147483648.5) and setFlagsHi(e, 32.5 /
+//     2147483648.5) -- each would set an indexed bit through `| 0` -- must throw,
+//     and the row, flagCount and walk must still equal the mirror.
+//   N5 -- Phase I's population with indexed f0 (a, common) and f31 (z, rare);
+//     joinN(REQ, EXC, z | a) HOT_OPS_MIN times: driverFlag === z with
+//     driverFlagCount === the harness's z count, and every call the flag-driven
+//     loop (firstFlagged / nextFlagged over z) and the driver loop must both count
+//     the brute-force match total (index arithmetic only, no arena reads).
+//   N6 -- retention: N_CYCLES x N_CHURN spawn / setFlags (incl. bit 31) /
+//     setFlagsHi / lite-leak track, then untrack / despawn: tracker.size(),
+//     activeCount, every flagCount, every firstFlagged (-1) and the OR of both rows
+//     must return to 0. ARENA_TORTURE_LEAK=1 skips the release here too.
+// Oracle / sweep mismatches are recorded in an Int32Array and die() after the
+// window ("phaseN: column != row" when a count or walk disagrees with the rows).
+//
+// Controls: ARENA_TORTURE_NLEAK=1 overwrites ONE sink slot with a fresh
+// Int32Array(1) per N1 op (transient, never retained); ARENA_TORTURE_NLEAK=hint
+// does the same per N5 joinN call; ARENA_TORTURE_NDESYNC=1 ORs the indexed f0 bit
+// straight into arena.flags (bypassing setFlags) on one live slot at N1 frame 32.
+const NLEAK = process.env.ARENA_TORTURE_NLEAK === '1';
+const NLEAK_HINT = process.env.ARENA_TORTURE_NLEAK === 'hint';
+const NDESYNC = process.env.ARENA_TORTURE_NDESYNC === '1';
+const N_FRAMES = 64;       // N1 measured frames
+const N_WARM = 8;          // unmeasured warm-up frames (numbered 0..7: frame 7 runs clearFlagAll)
+const N_OPS = 4096;        // seeded ops per frame
+const N_GROW = 8192;       // N2 reserve() target
+const N_FRAMES2 = 16;      // N2 measured frames
+const N_FRAMES3 = 16;      // N3 measured frames (after the in-window refill)
+const N_FRAMES4 = 16;      // N4 measured frames (checked arena)
+const N_DESYNC_FRAME = 32; // the NDESYNC control's frame
+const N_CYCLES = 4096;     // N6 retention cycles
+const N_CHURN = 64;        // N6 entities per cycle
+const N_IXN = ['f0', 'f9', 'f22', 'f31'];                      // indexed word 0 (f31 = bit 31)
+const N_IXNH = ['h5', 'h31'];                                  // indexed Hi (h31 = Hi bit 31)
+const N_IX0 = new Int32Array([1, 1 << 9, 1 << 22, 1 << 31]);
+const N_IXH = new Int32Array([1 << 5, 1 << 31]);
+const N_OP0 = 1 | (1 << 9) | (1 << 22) | (1 << 31) |           // indexed word-0 bits
+    (1 << 3) | (1 << 14) | (1 << 27) | (1 << 30);              // + 4 plain word-0 bits
+const N_OPH = (1 << 5) | (1 << 31) | 1 | (1 << 17);            // 2 indexed + 2 plain Hi bits
+const N_Z = 1 << 31;       // N5: indexed f31, the rare flag (the expected driverFlag)
+const N_A = 1;             // N5: indexed f0, common
+const N_FNV = -2128831035; // FNV-1a 32-bit offset basis 0x811C9DC5 as an int32
+const RULES_N = { maxMajor: 0, maxMinor: 0 };
+const nSink = [null];      // NLEAK: ONE slot, overwritten per op -- transient, never retained
+
+// st (Int32Array(NS_LEN)) slots: three xorshift32 streams, the live capacity, the
+// first failure (code, frame, got, want, bit / slot) and the window's counters.
+const NS_RO = 0, NS_RK = 1, NS_RV = 2, NS_CAP = 3, NS_FAIL = 4, NS_FFRAME = 5, NS_GOT = 6;
+const NS_WANT = 7, NS_BIT = 8, NS_MAXSLOT = 9, NS_VISITS = 10, NS_SWEEPDS = 11, NS_CFA = 12;
+const NS_MH = 13, NS_WH = 14, NS_OPS = 15, NS_LEN = 16;
+
+function nFail(st, code, frame, got, want, j) {
+    if (st[NS_FAIL] !== 0) return;
+    st[NS_FAIL] = code; st[NS_FFRAME] = frame; st[NS_GOT] = got; st[NS_WANT] = want; st[NS_BIT] = j;
+}
+
+// FNV-1a over the 4 bytes of an int32 handle. Ints in, int out (Math.imul).
+function nFnv(h, x) {
+    h = Math.imul(h ^ (x & 255), 16777619);
+    h = Math.imul(h ^ ((x >>> 8) & 255), 16777619);
+    h = Math.imul(h ^ ((x >>> 16) & 255), 16777619);
+    return Math.imul(h ^ (x >>> 24), 16777619);
+}
+
+// The mirror's side of one indexed bit: count + FNV-1a (into st[NS_MH]) of the
+// live handles whose mirror word carries `bit`, slots ascending.
+function nMirror(mw, hs, cap, bit, st) {
+    let n = 0, h = N_FNV;
+    for (let s = 0; s < cap; s++) {
+        if ((mw[s] & bit) !== 0) { n++; h = nFnv(h, hs[s]); }
+    }
+    st[NS_MH] = h;
+    return n;
+}
+
+// The arena's side: a firstFlagged / nextFlagged walk, count + FNV-1a into
+// st[NS_WH]; tracks the highest slot visited. Bounded by capacity (a walk that
+// fails to advance reads as a mismatch, not a hang).
+function nWalk(a, hi, bit, st) {
+    const cap = st[NS_CAP];
+    let n = 0, h = N_FNV, mx = st[NS_MAXSLOT];
+    let e = hi ? a.firstFlaggedHi(bit) : a.firstFlagged(bit);
+    while (e !== -1 && n <= cap) {
+        n++;
+        h = nFnv(h, e);
+        const s = e & INDEX_MASK;
+        if (s > mx) mx = s;
+        e = hi ? a.nextFlaggedHi(bit, e) : a.nextFlagged(bit, e);
+    }
+    st[NS_WH] = h; st[NS_MAXSLOT] = mx;
+    return n;
+}
+
+// The oracle: rows == mirrors, then per indexed bit flagCount == mirror count and
+// walk == mirror handles (count + FNV-1a). Records the first failure only.
+function nOracle(a, hs, mir, mirH, st, frame) {
+    const cap = st[NS_CAP], row = a.flags, rowH = a.flagsHi;
+    for (let s = 0; s < cap; s++) {
+        if (row[s] !== mir[s]) { nFail(st, 1, frame, row[s], mir[s], s); break; }
+        if (rowH[s] !== mirH[s]) { nFail(st, 7, frame, rowH[s], mirH[s], s); break; }
+    }
+    for (let j = 0; j < 6; j++) {
+        const hi = j >= 4, bit = hi ? N_IXH[j - 4] : N_IX0[j];
+        const want = nMirror(hi ? mirH : mir, hs, cap, bit, st);
+        const cnt = hi ? a.flagCountHi(bit) : a.flagCount(bit);
+        const got = nWalk(a, hi, bit, st);
+        if (cnt !== want) nFail(st, 2, frame, cnt, want, j);
+        else if (got !== want || st[NS_WH] !== st[NS_MH]) nFail(st, 3, frame, got, want, j);
+        st[NS_VISITS] += got;
+    }
+}
+
+// Spawn to capacity; each new entity gets a seeded word-0 and Hi mask (stream rv).
+// Returns the number spawned.
+function nFill(a, hs, mir, mirH, st) {
+    const cap = st[NS_CAP];
+    let rv = st[NS_RV], n = 0;
+    while (a.activeCount < cap) {
+        const e = a.spawn(), s = e & INDEX_MASK;
+        rv ^= rv << 13; rv ^= rv >>> 17; rv ^= rv << 5;
+        const m = rv & N_OP0;
+        rv ^= rv << 13; rv ^= rv >>> 17; rv ^= rv << 5;
+        const mh = rv & N_OPH;
+        if (!a.setFlags(e, m) || !a.setFlagsHi(e, mh)) nFail(st, 5, -1, s, 0, -1);
+        hs[s] = e; mir[s] = m; mirH[s] = mh;
+        n++;
+    }
+    st[NS_RV] = rv;
+    return n;
+}
+
+// One sweep over indexed bit (frame % 6), despawning every 8th visit (M-39: the
+// walk continues from the despawned entity's slot). It must visit exactly the
+// mirror's live handles for that bit, ascending (count + FNV-1a).
+function nSweep(a, hs, mir, mirH, st, frame) {
+    const cap = st[NS_CAP], j = frame % 6, hi = j >= 4, bit = hi ? N_IXH[j - 4] : N_IX0[j];
+    const want = nMirror(hi ? mirH : mir, hs, cap, bit, st);
+    let n = 0, d = 0, h = N_FNV, mx = st[NS_MAXSLOT];
+    let e = hi ? a.firstFlaggedHi(bit) : a.firstFlagged(bit);
+    while (e !== -1 && n <= cap) {
+        n++;
+        h = nFnv(h, e);
+        const s = e & INDEX_MASK;
+        if (s > mx) mx = s;
+        if ((n & 7) === 0) {
+            a.despawn(e);
+            mir[s] = 0; mirH[s] = 0; hs[s] = -1;
+            d++;
+        }
+        e = hi ? a.nextFlaggedHi(bit, e) : a.nextFlagged(bit, e);
+    }
+    if (n !== want || h !== st[NS_MH]) nFail(st, 4, frame, n, want, j);
+    st[NS_MAXSLOT] = mx; st[NS_VISITS] += n; st[NS_SWEEPDS] += d;
+}
+
+// One frame: N_OPS seeded ops, clearFlagAll(+Hi) in frame 7 of every 16, the NDESYNC
+// poke (control only), one despawning sweep, refill to capacity, the oracle.
+function nFrame(a, hs, mir, mirH, st, frame, leak, desync) {
+    const cap = st[NS_CAP], km = cap - 1;
+    let ro = st[NS_RO], rk = st[NS_RK], rv = st[NS_RV];
+    for (let n = 0; n < N_OPS; n++) {
+        ro ^= ro << 13; ro ^= ro >>> 17; ro ^= ro << 5;
+        rk ^= rk << 13; rk ^= rk >>> 17; rk ^= rk << 5;
+        rv ^= rv << 13; rv ^= rv >>> 17; rv ^= rv << 5;
+        const s = rk & km, e = hs[s], op = ro >>> 29;
+        let ok = true;
+        if (op < 3) {
+            const m = rv & N_OP0;
+            ok = a.setFlags(e, m);
+            mir[s] = mir[s] | m;
+        } else if (op < 5) {
+            const m = rv & N_OP0;
+            ok = a.clearFlags(e, m);
+            mir[s] = mir[s] & ~m;
+        } else if (op === 5) {
+            ok = a.despawn(e);
+            mir[s] = 0; mirH[s] = 0;
+            const f = a.spawn();
+            if ((f & INDEX_MASK) !== s) nFail(st, 6, frame, f & INDEX_MASK, s, -1);
+            hs[s] = f;
+        } else if (op === 6) {
+            const m = rv & N_OPH;
+            ok = a.setFlagsHi(e, m);
+            mirH[s] = mirH[s] | m;
+        } else {
+            const m = rv & N_OPH;
+            ok = a.clearFlagsHi(e, m);
+            mirH[s] = mirH[s] & ~m;
+        }
+        if (!ok) nFail(st, 5, frame, s, op, -1);
+        if (leak) nSink[0] = new Int32Array(1); // control: transient per-op alloc
+    }
+    st[NS_RO] = ro; st[NS_RK] = rk; st[NS_RV] = rv; st[NS_OPS] += N_OPS;
+    if ((frame & 15) === 7) {
+        const b0 = N_IX0[(frame >> 4) & 3], bh = N_IXH[(frame >> 4) & 1];
+        a.clearFlagAll(b0);
+        a.clearFlagAllHi(bh);
+        for (let s = 0; s < cap; s++) { mir[s] = mir[s] & ~b0; mirH[s] = mirH[s] & ~bh; }
+        st[NS_CFA] += 2;
+    }
+    nSweep(a, hs, mir, mirH, st, frame);
+    for (let x = 0; a.activeCount < cap && x < cap; x++) {
+        const f = a.spawn();
+        hs[f & INDEX_MASK] = f;
+    }
+    if (desync) {
+        // Control: an indexed bit written straight into the row (UNSUPPORTED, M-39).
+        // The mirror models the row, so rows == mirror still holds and only the
+        // column-vs-row comparison can catch it.
+        const row = a.flags, b = N_IX0[0];
+        for (let s = 0; s < cap; s++) {
+            if (hs[s] !== -1 && (mir[s] & b) === 0) { row[s] |= b; mir[s] = mir[s] | b; break; }
+        }
+    }
+    nOracle(a, hs, mir, mirH, st, frame);
+}
+
+function nArena(checked) {
+    const a = checked ? new Arena(CAP, { checked: true }) : new Arena(CAP);
+    const F = a.registerFlags(lNames(), { indexed: N_IXN });
+    const FH = a.registerFlagsHi(mNamesHi(), { indexed: N_IXNH });
+    if (F.f31 !== -2147483648 || FH.h31 !== -2147483648) die('phaseN: flag #31 is not -2147483648');
+    for (let j = 0; j < 4; j++) if (F[N_IXN[j]] !== N_IX0[j]) die('phaseN: indexed flag ' + N_IXN[j] + ' bit wrong');
+    for (let j = 0; j < 2; j++) if (FH[N_IXNH[j]] !== N_IXH[j]) die('phaseN: indexed flag ' + N_IXNH[j] + ' bit wrong');
+    if ((F.f3 | F.f14 | F.f27 | F.f30 | F.f0 | F.f9 | F.f22 | F.f31) !== N_OP0 ||
+        (FH.h0 | FH.h17 | FH.h5 | FH.h31) !== N_OPH) die('phaseN: flag map bits wrong');
+    return a;
+}
+
+function nSeed(st, cap) {
+    st.fill(0);
+    st[NS_RO] = 0x2545F491; st[NS_RK] = 0x6B43A9B5; st[NS_RV] = 0x1F123BB5; st[NS_CAP] = cap;
+}
+
+function nZero(st) {
+    st[NS_OPS] = 0; st[NS_VISITS] = 0; st[NS_SWEEPDS] = 0; st[NS_CFA] = 0; st[NS_MAXSLOT] = 0;
+}
+
+// COLD, after a window: die() on the first recorded oracle failure.
+function nCheck(st, where) {
+    const c = st[NS_FAIL];
+    if (c === 0) return;
+    const j = st[NS_BIT], got = st[NS_GOT], want = st[NS_WANT];
+    const at = ' (' + where + ' frame ' + st[NS_FFRAME];
+    const name = j >= 4 && j < 6 ? N_IXNH[j - 4] : j >= 0 && j < 4 ? N_IXN[j] : '?';
+    if (c === 1 || c === 7) {
+        die('phaseN: row != mirror' + at + ', ' + (c === 7 ? 'Hi ' : '') + 'slot ' + j + ': row 0x' +
+            (got >>> 0).toString(16) + ' vs mirror 0x' + (want >>> 0).toString(16) + ')');
+    }
+    if (c === 2) {
+        die('phaseN: column != row' + at + ', flag ' + name + ': flagCount ' + got + ' vs row/mirror ' + want + ')');
+    }
+    if (c === 3) {
+        die('phaseN: column != row' + at + ', flag ' + name + ': walk visited ' + got +
+            ' vs row/mirror ' + want + ', count or FNV-1a over handles differs)');
+    }
+    if (c === 4) {
+        die('phaseN: despawning sweep != mirror' + at + ', flag ' + name + ': visited ' + got + ' vs ' + want +
+            ', count or FNV-1a differs; M-39)');
+    }
+    if (c === 5) die('phaseN: a write on a live handle returned false' + at + ', slot ' + got + ', op ' + want + ')');
+    die('phaseN: spawn after despawn landed on slot ' + got + ', expected ' + want + at + ')');
+}
+
+// COLD: every indexed bit populated but not saturated (a non-degenerate oracle).
+function nNonDegenerate(hs, mir, mirH, st, where) {
+    const cap = st[NS_CAP];
+    for (let j = 0; j < 6; j++) {
+        const hi = j >= 4, bit = hi ? N_IXH[j - 4] : N_IX0[j];
+        const n = nMirror(hi ? mirH : mir, hs, cap, bit, st);
+        if (!(n > 0) || !(n < cap)) {
+            die('phaseN: degenerate ' + where + ' mirror count ' + n + ' for ' + (hi ? N_IXNH[j - 4] : N_IXN[j]));
+        }
+    }
+    if (!(st[NS_SWEEPDS] > 0) || !(st[NS_CFA] > 0)) {
+        die('phaseN: ' + where + ' coverage: sweepDespawns ' + st[NS_SWEEPDS] + ', clearFlagAll ' + st[NS_CFA]);
+    }
+}
+
+function nOpen() {
+    globalThis.gc();
+    globalThis.gc();
+    const g = new GcProfiler(256, { heap: true }).start();
+    g.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
+    return g;
+}
+
+async function nClose(g) {
+    const mu = process.memoryUsage();
+    g.sampleHeap(performance.now(), mu.heapUsed, mu);
+    await g.settle();
+    const s = g.summary();
+    g.stop();
+    return s;
+}
+
+function nWin(name, summary, st, extra) {
+    return {
+        name, summary, report: checkNoGc(summary, RULES_N), ops: st[NS_OPS], visits: st[NS_VISITS],
+        sweepDespawns: st[NS_SWEEPDS], clearFlagAll: st[NS_CFA], maxSlot: st[NS_MAXSLOT], extra,
+    };
+}
+
+// N5: joinN(REQ, EXC, z | a) on Phase I's population; returns the window record.
+async function nHint() {
+    const ja = new Arena(CAP);
+    const A = ja.registerComponent({ x: Float32Array }); // required, largest
+    const B = ja.registerTag();                          // required, half
+    const C = ja.registerTag();                          // required, rarest set -> driver
+    const D = ja.registerTag();                          // excluded
+    const JF = ja.registerFlags(lNames(), { indexed: ['f0', 'f31'] });
+    if (JF.f31 !== N_Z || JF.f0 !== N_A) die('phaseN: N5 flag map bits wrong');
+    // z (f31): 16 entities on C (i = 64 + 256k) + 4 odd ones off B; a (f0): i % 3 !== 0.
+    let zc = 0, brute = 0;
+    for (let i = 0; i < CAP; i++) {
+        const e = ja.spawn();
+        if ((e & INDEX_MASK) !== i) die('phaseN: N5 fresh arena handed slot ' + (e & INDEX_MASK) + ' at ' + i);
+        A.add(e);
+        if ((i & 1) === 0) B.add(e);
+        if ((i & 63) === 0) C.add(e);
+        if ((i & 127) === 0) D.add(e);
+        const z = (i & 255) === 64 || (i & 1023) === 7;
+        const af = i % 3 !== 0;
+        if (z) zc++;
+        if (!ja.setFlags(e, (z ? N_Z : 0) | (af ? N_A : 0))) die('phaseN: N5 setFlags false on a live entity');
+        // Brute force from index arithmetic: in A, B, C, not D, carrying z and a.
+        if ((i & 1) === 0 && (i & 63) === 0 && (i & 127) !== 0 && z && af) brute++;
+    }
+    const REQ = [A, B, C];
+    const EXC = [D];
+    const ZA = N_Z | N_A;
+    if (!(brute > 0) || !(brute < zc) || !(zc < C.count)) {
+        die('phaseN: N5 degenerate (brute=' + brute + ' zCount=' + zc + ' C.count=' + C.count + ')');
+    }
+    const p0 = ja.joinN(REQ, EXC, ZA);
+    if (p0.driver !== C || p0.driverFlag !== N_Z || p0.driverFlagCount !== zc) {
+        die('phaseN: N5 hint driverFlag=' + p0.driverFlag + ' driverFlagCount=' + p0.driverFlagCount +
+            ' (expected ' + N_Z + ' / ' + zc + ', driver C ' + (p0.driver === C) + ')');
+    }
+    // [0] first call with a wrong hint + 1, [1] first miscounting call + 1, [2] its
+    // driver-loop count, [3] its flag-driven count.
+    const hst = new Int32Array(4);
+
+    const g = nOpen();
+    let acc = 0, accF = 0;
+    for (let n = 0; n < HOT_OPS_MIN; n++) {
+        const p = ja.joinN(REQ, EXC, ZA);
+        const zf = p.driverFlag;
+        if ((zf !== N_Z || p.driverFlagCount !== zc || p.driver !== C) && hst[0] === 0) hst[0] = n + 1;
+        const drv = p.driver, cnt = p.count;
+        const oth = p.others, no = p.othersCount;
+        const ex = p.excl, nx = p.exclCount;
+        const row = p.flags, m = ja.indexMask, rm = p.reqMask, xm = p.excMask;
+        // Driver loop: the rarest required set, masked.
+        let matched = 0;
+        for (let i = 0; i < cnt; i++) {
+            const e = drv.dense[i];
+            const w = row[e & m];
+            if ((w & rm) !== rm || (w & xm) !== 0) continue;
+            let ok = true;
+            for (let k = 0; k < no; k++) if (!oth[k].has(e)) { ok = false; break; }
+            if (ok) for (let k = 0; k < nx; k++) if (ex[k].has(e)) { ok = false; break; }
+            if (ok) matched++;
+        }
+        // Flag-driven loop: walk the hinted indexed flag, test every set + the mask.
+        let fm = 0;
+        for (let e = ja.firstFlagged(zf); e !== -1; e = ja.nextFlagged(zf, e)) {
+            const w = row[e & m];
+            if ((w & rm) !== rm || (w & xm) !== 0 || !drv.has(e)) continue;
+            let ok = true;
+            for (let k = 0; k < no; k++) if (!oth[k].has(e)) { ok = false; break; }
+            if (ok) for (let k = 0; k < nx; k++) if (ex[k].has(e)) { ok = false; break; }
+            if (ok) fm++;
+        }
+        if ((matched !== brute || fm !== brute) && hst[1] === 0) { hst[1] = n + 1; hst[2] = matched; hst[3] = fm; }
+        acc = acc + matched;
+        accF = accF + fm;
+        if (NLEAK_HINT) nSink[0] = new Int32Array(1); // control: transient per-call alloc
+    }
+    const summary = await nClose(g);
+    nSink[0] = null;
+
+    if (hst[0] !== 0) die('phaseN: N5 joinN hint wrong at call ' + (hst[0] - 1));
+    if (hst[1] !== 0) {
+        die('phaseN: N5 counts disagree at call ' + (hst[1] - 1) + ' (driver loop ' + hst[2] +
+            ', flag-driven ' + hst[3] + ', brute force ' + brute + ')');
+    }
+    if (acc !== brute * HOT_OPS_MIN || accF !== brute * HOT_OPS_MIN) die('phaseN: N5 match totals off');
+    return {
+        name: 'N5', summary, report: checkNoGc(summary, RULES_N), ops: HOT_OPS_MIN,
+        hint: p0.driverFlag, hintCount: p0.driverFlagCount, drvCount: p0.count, brute,
+    };
+}
+
+// N6: retention (unmeasured), Phase K's shape on an indexed arena.
+function nRetention() {
+    const ra = new Arena(CAP);
+    ra.registerFlags(lNames(), { indexed: N_IXN });
+    ra.registerFlagsHi(mNamesHi(), { indexed: N_IXNH });
+    const tracker = createLeakTracker({ name: 'arena-indexed-flags-retention' });
+    const leakHandles = new Array(CAP).fill(null);
+    const live = new Int32Array(N_CHURN);
+    for (let cycle = 0; cycle < N_CYCLES; cycle++) {
+        let n = 0;
+        for (let i = 0; i < N_CHURN; i++) {
+            if (ra.activeCount >= CAP) break; // LEAK control fills the arena: stop, do not throw
+            const e = ra.spawn();
+            if (!ra.setFlags(e, N_OP0) || !ra.setFlagsHi(e, N_OPH)) die('phaseN: N6 setFlags false on a live entity');
+            const slot = e & INDEX_MASK;
+            leakHandles[slot] = tracker.track({ slot }, NOOP, slot);
+            live[n++] = e;
+        }
+        if (LEAK) continue; // control: skip release entirely
+        for (let i = 0; i < n; i++) {
+            const e = live[i];
+            const slot = e & INDEX_MASK;
+            tracker.untrack(leakHandles[slot]);
+            leakHandles[slot] = null;
+            ra.despawn(e);
+        }
+    }
+    let countOr = 0, firstLive = 0, rowOr = 0;
+    for (let j = 0; j < 4; j++) {
+        countOr |= ra.flagCount(N_IX0[j]);
+        if (ra.firstFlagged(N_IX0[j]) !== -1) firstLive++;
+    }
+    for (let j = 0; j < 2; j++) {
+        countOr |= ra.flagCountHi(N_IXH[j]);
+        if (ra.firstFlaggedHi(N_IXH[j]) !== -1) firstLive++;
+    }
+    const row = ra.flags, rowH = ra.flagsHi;
+    for (let i = 0; i < CAP; i++) rowOr |= row[i] | rowH[i];
+    return { trackerSize: tracker.size(), activeCount: ra.activeCount, countOr, firstLive, rowOr };
+}
+
+async function phaseN() {
+    const hs = new Int32Array(N_GROW).fill(-1);
+    const mir = new Int32Array(N_GROW);
+    const mirH = new Int32Array(N_GROW);
+    const st = new Int32Array(NS_LEN);
+
+    // ---- N1: full Arena(CAP), seeded op stream ----
+    const a = nArena(false);
+    nSeed(st, CAP);
+    nFill(a, hs, mir, mirH, st);
+    if (a.activeCount !== CAP) die('phaseN: N1 arena not full (' + a.activeCount + ')');
+    nOracle(a, hs, mir, mirH, st, -1);
+    nCheck(st, 'N1 fill');
+    for (let f = 0; f < N_WARM; f++) nFrame(a, hs, mir, mirH, st, f, false, false);
+    nCheck(st, 'N1 warm-up');
+    nZero(st);
+    const g1 = nOpen();
+    for (let f = 0; f < N_FRAMES; f++) nFrame(a, hs, mir, mirH, st, f, NLEAK, NDESYNC && f === N_DESYNC_FRAME);
+    const s1 = await nClose(g1);
+    nSink[0] = null;
+    nCheck(st, 'N1');
+    nNonDegenerate(hs, mir, mirH, st, 'N1');
+    if (a.activeCount !== CAP) die('phaseN: N1 activeCount drifted to ' + a.activeCount);
+    const n1 = nWin('N1', s1, st, 0);
+
+    // ---- N2: reserve(N_GROW), fill the new slots, frames reach slots >= CAP ----
+    if (!a.reserve(N_GROW) || a.capacity !== N_GROW) die('phaseN: N2 reserve(' + N_GROW + ') failed');
+    st[NS_CAP] = N_GROW;
+    const grown = nFill(a, hs, mir, mirH, st);
+    if (grown < CAP) die('phaseN: N2 filled only ' + grown + ' new slots');
+    nOracle(a, hs, mir, mirH, st, -1);
+    nCheck(st, 'N2 fill');
+    nZero(st);
+    const g2 = nOpen();
+    for (let f = 0; f < N_FRAMES2; f++) nFrame(a, hs, mir, mirH, st, f, false, false);
+    const s2 = await nClose(g2);
+    nCheck(st, 'N2');
+    nNonDegenerate(hs, mir, mirH, st, 'N2');
+    if (st[NS_MAXSLOT] < CAP) die('phaseN: N2 walks never visited a slot >= ' + CAP + ' (max ' + st[NS_MAXSLOT] + ')');
+    const n2 = nWin('N2', s2, st, grown);
+
+    // ---- N3: clear() empties every column; refill inside the window ----
+    a.clear();
+    if (a.activeCount !== 0) die('phaseN: N3 activeCount ' + a.activeCount + ' after clear()');
+    for (let j = 0; j < 4; j++) {
+        if (a.flagCount(N_IX0[j]) !== 0 || a.firstFlagged(N_IX0[j]) !== -1) {
+            die('phaseN: N3 ' + N_IXN[j] + ' flagCount ' + a.flagCount(N_IX0[j]) + ' / firstFlagged ' +
+                a.firstFlagged(N_IX0[j]) + ' after clear() (expected 0 / -1)');
+        }
+    }
+    for (let j = 0; j < 2; j++) {
+        if (a.flagCountHi(N_IXH[j]) !== 0 || a.firstFlaggedHi(N_IXH[j]) !== -1) {
+            die('phaseN: N3 ' + N_IXNH[j] + ' flagCountHi ' + a.flagCountHi(N_IXH[j]) + ' / firstFlaggedHi ' +
+                a.firstFlaggedHi(N_IXH[j]) + ' after clear() (expected 0 / -1)');
+        }
+    }
+    hs.fill(-1); mir.fill(0); mirH.fill(0);
+    nZero(st);
+    const g3 = nOpen();
+    const refilled = nFill(a, hs, mir, mirH, st);
+    nOracle(a, hs, mir, mirH, st, -1);
+    for (let f = 0; f < N_FRAMES3; f++) nFrame(a, hs, mir, mirH, st, f, false, false);
+    const s3 = await nClose(g3);
+    nCheck(st, 'N3');
+    if (refilled !== N_GROW) die('phaseN: N3 refilled ' + refilled + ', expected ' + N_GROW);
+    nNonDegenerate(hs, mir, mirH, st, 'N3');
+    const n3 = nWin('N3', s3, st, refilled);
+
+    // ---- N4: checked arena, the same seeds and stream ----
+    const c = nArena(true);
+    hs.fill(-1); mir.fill(0); mirH.fill(0);
+    nSeed(st, CAP);
+    nFill(c, hs, mir, mirH, st);
+    nOracle(c, hs, mir, mirH, st, -1);
+    nCheck(st, 'N4 fill');
+    for (let f = 0; f < N_WARM; f++) nFrame(c, hs, mir, mirH, st, f, false, false);
+    nCheck(st, 'N4 warm-up');
+    nZero(st);
+    const g4 = nOpen();
+    for (let f = 0; f < N_FRAMES4; f++) nFrame(c, hs, mir, mirH, st, f, false, false);
+    const s4 = await nClose(g4);
+    nCheck(st, 'N4');
+    nNonDegenerate(hs, mir, mirH, st, 'N4');
+    const n4 = nWin('N4', s4, st, 0);
+    // Cold: a non-int32 mask whose `| 0` is an indexed bit must throw (M-18), and
+    // leave the row, the count and the walk equal to the (untouched) mirror.
+    let ts = -1;
+    for (let s = 0; s < CAP; s++) {
+        if ((mir[s] & (N_IX0[0] | N_IX0[3])) === 0 && (mirH[s] & (N_IXH[0] | N_IXH[1])) === 0) { ts = s; break; }
+    }
+    if (ts < 0) die('phaseN: N4 found no slot clear of f0 / f31 / h5 / h31');
+    const te = hs[ts];
+    let threw = 0;
+    try { c.setFlags(te, 1.5); } catch (err) { if (/32-bit integer/.test(err.message)) threw++; }
+    try { c.setFlags(te, 2147483648.5); } catch (err) { if (/32-bit integer/.test(err.message)) threw++; }
+    try { c.setFlagsHi(te, 32.5); } catch (err) { if (/32-bit integer/.test(err.message)) threw++; }
+    try { c.setFlagsHi(te, 2147483648.5); } catch (err) { if (/32-bit integer/.test(err.message)) threw++; }
+    if (threw !== 4) die('phaseN: N4 checked setFlags / setFlagsHi accepted a non-int32 mask (' + threw + '/4 threw)');
+    nOracle(c, hs, mir, mirH, st, -1);
+    nCheck(st, 'N4 after the non-int32 throws');
+
+    // ---- N5: the joinN driver-flag hint ----
+    const n5 = await nHint();
+
+    // ---- N6: retention ----
+    const r = nRetention();
+
+    return { win: [n1, n2, n3, n4, n5], ...r };
+}
+
+// COLD: Phase N's part of the one-line run log (stderr).
+function nSummary(nR) {
+    let s = '';
+    for (const w of nR.win) {
+        const g = w.summary.gc;
+        s += w.name + ' ops=' + w.ops + ' major=' + g.major + ' minor=' + g.minor;
+        if (w.name === 'N5') {
+            s += ' hint=' + w.hint + '/' + w.hintCount + ' drvCount=' + w.drvCount + ' matches=' + w.brute;
+        } else {
+            s += ' visits=' + w.visits + ' sweepDespawns=' + w.sweepDespawns + ' clearFlagAll=' + w.clearFlagAll +
+                ' maxSlot=' + w.maxSlot + (w.extra > 0 ? ' filled=' + w.extra : '');
+        }
+        s += ' ';
+    }
+    return s + 'N6 tracker=' + nR.trackerSize + ' active=' + nR.activeCount + ' countOr=' + nR.countOr +
+        ' rowOr=' + nR.rowOr;
+}
+
 // --- gate --------------------------------------------------------------------
 
 async function main() {
@@ -1741,9 +2368,10 @@ async function main() {
     const k = await phaseK();
     const l = await phaseL();
     const mR = await phaseM();
+    const nR = await phaseN();
 
     // REPORTED, never gated: Phase J's wall-clock pause (host noise), plus the
-    // Phase J / K / L counts for the run log. stderr, so stdout stays exactly "ok".
+    // Phase J / K / L / M / N counts for the run log. stderr, so stdout stays exactly "ok".
     process.stderr.write(
         'torture: phaseJ major=' + j.summary.gc.major + ' minor=' + j.summary.gc.minor +
         ' maxPauseMs=' + j.summary.gc.maxMs.toFixed(3) + ' (pause reported, not gated)' +
@@ -1756,7 +2384,8 @@ async function main() {
         ' oracle=' + mR.fOr + '/' + mR.fOrH +
         ' joinN ops=' + mR.ops + ' major=' + mR.summary.gc.major + ' minor=' + mR.summary.gc.minor +
         ' masked/lo/unmasked=' + mR.expected + '/' + mR.loMasked + '/' + mR.unmasked +
-        ' retention or=' + mR.flagOr + ' orHi=' + mR.flagOrHi + '\n');
+        ' retention or=' + mR.flagOr + ' orHi=' + mR.flagOrHi +
+        ' | phaseN ' + nSummary(nR) + '\n');
 
     const retentionOk = a.activeCount === 0 && a.trackerSize === 0;
     const budgetOk = b.report.ok;
@@ -1777,10 +2406,14 @@ async function main() {
     const hiJoinOk = mR.report.ok;
     const hiRetentionOk = mR.trackerSize === 0 && mR.activeCount === 0 &&
         mR.flagOr === 0 && mR.flagOrHi === 0;
+    let indexedOk = true;
+    for (const w of nR.win) if (!w.report.ok) indexedOk = false;
+    const indexedRetentionOk = nR.trackerSize === 0 && nR.activeCount === 0 && nR.countOr === 0 &&
+        nR.firstLive === 0 && nR.rowOr === 0;
 
     if (retentionOk && budgetOk && joinOk && reserveOk && sweepOk && conservationOk && sabOk && transferOk &&
         joinNOk && churnOk && flagsOk && flagsRetentionOk && maskedOk && maskedRetentionOk &&
-        hiFramesOk && hiFrameOracleOk && hiJoinOk && hiRetentionOk) {
+        hiFramesOk && hiFrameOracleOk && hiJoinOk && hiRetentionOk && indexedOk && indexedRetentionOk) {
         process.stdout.write('ok\n');
         process.exit(0);
     }
@@ -1900,7 +2533,24 @@ async function main() {
             ' activeCount=' + mR.activeCount + ' flagOr=' + mR.flagOr + ' flagOrHi=' + mR.flagOrHi +
             ' (all must be 0)\n');
     }
-    die('gate rejected' + (LEAK || HLEAK || JLEAK || SLEAK || FLEAK || MLEAK || WLEAK
+    for (const w of nR.win) {
+        if (w.report.ok) continue;
+        const gc = w.summary.gc;
+        process.stderr.write(
+            'torture: indexed-flags ' + w.name + ' (phaseN) -- verdict=' + w.report.verdict +
+            ' source=' + w.summary.source +
+            ' major=' + gc.major + ' minor=' + gc.minor + ' maxMs=' + gc.maxMs.toFixed(3) +
+            ' ops=' + w.ops +
+            ' (rules ' + JSON.stringify(RULES_N) + ')\n');
+    }
+    if (!indexedRetentionOk) {
+        process.stderr.write(
+            'torture: indexed-flags-retention N6 (phaseN) -- trackerSize=' + nR.trackerSize +
+            ' activeCount=' + nR.activeCount + ' flagCountOr=' + nR.countOr +
+            ' firstFlaggedLive=' + nR.firstLive + ' rowOr=' + nR.rowOr + ' (all must be 0)\n');
+    }
+    die('gate rejected' + (LEAK || HLEAK || JLEAK || SLEAK || FLEAK || MLEAK || WLEAK ||
+        NLEAK || NLEAK_HINT || NDESYNC
         ? ' (leaky control -- expected)' : ''));
 }
 
