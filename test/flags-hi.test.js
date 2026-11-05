@@ -84,7 +84,7 @@ test('A1 bad inputs throw, flagsHi stays null', () => {
             'lite-arena: registerFlagsHi name #0 ("") is empty, not a string, or a duplicate'],
         [() => ['ok', 5], undefined,
             'lite-arena: registerFlagsHi name #1 (number) is empty, not a string, or a duplicate'],
-        [() => ['p'], { k: 1 }, 'lite-arena: registerFlagsHi takes no options; got k'],
+        [() => ['p'], { k: 1 }, 'lite-arena: registerFlagsHi options accept only "indexed"; got k'], // M-40
         [() => 'abc', undefined,
             'lite-arena: registerFlagsHi names must be an array of <= 32 strings, got string'],
     ];
@@ -97,7 +97,7 @@ test('A1 bad inputs throw, flagsHi stays null', () => {
     assert.throws(() => a.registerFlagsHi(['p'], Object.create({})), /registerFlagsHi options must be a plain object/);
     assert.equal(a.flagsHi, null);
     assert.throws(() => a.registerFlagsHi(['p'], Object.create(null, { z: { value: 1, enumerable: false } })),
-        /registerFlagsHi takes no options; got z/);
+        /registerFlagsHi options accept only "indexed"; got z/); // M-40
     assert.equal(a.flagsHi, null);
     // a failed attempt does not burn the one allowed call
     assert.equal(a.registerFlagsHi(['p']).p, 1);

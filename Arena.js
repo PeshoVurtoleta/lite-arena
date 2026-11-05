@@ -261,7 +261,9 @@ function checkMask(method, which, mask) {
  * COLD: the validation shared by registerFlags() and registerFlagsHi() (M-7 / M-8 /
  * M-9 / M-17). Throws before the caller allocates anything; returns the NOT yet
  * frozen null-prototype map name i -> `1 << i`. `method` names the caller in every
- * error message, so registerFlags()'s wording is unchanged.
+ * error message, so registerFlags()'s wording is unchanged. M-40: `indexed` is the
+ * only allowed options key (any other own key, Symbol / non-enumerable too, throws
+ * R1); its VALUE is validated afterwards by ixMaskOf().
  * @param {string} method - 'registerFlags' or 'registerFlagsHi'.
  * @param {string[]} [names]
  * @param {Object} [options]
@@ -269,9 +271,16 @@ function checkMask(method, which, mask) {
  */
 function flagMap(method, names, options) {
     if (options != null) {
-        const k = typeof options !== 'object' || Array.isArray(options)
-            ? describeSchemaValue(options) : Reflect.ownKeys(options)[0];
-        if (k !== undefined) throw new Error(`lite-arena: ${method} takes no options; got ${String(k)}`);
+        let k;
+        if (typeof options !== 'object' || Array.isArray(options)) {
+            k = describeSchemaValue(options);
+        } else {
+            const keys = Reflect.ownKeys(options);
+            for (let i = 0; i < keys.length; i++) {
+                if (keys[i] !== 'indexed') { k = keys[i]; break; }
+            }
+        }
+        if (k !== undefined) throw new Error(`lite-arena: ${method} options accept only "indexed"; got ${String(k)}`);
         const proto = Object.getPrototypeOf(options);
         if (proto !== Object.prototype && proto !== null) {
             const c = Object.getOwnPropertyDescriptor(proto, 'constructor');
@@ -296,6 +305,36 @@ function flagMap(method, names, options) {
         map[name] = 1 << i;
     }
     return map;
+}
+
+/**
+ * COLD (F2, M-37): the indexed mask of registerFlags(Hi)(names, { indexed: [...] }).
+ * Runs after flagMap() and before anything is allocated. Reads `indexed` ONLY as an
+ * OWN key (an inherited Object.prototype.indexed is ignored); absent -> 0 (nothing
+ * indexed, nothing installed). Each entry must be one of the names, once.
+ * @param {string} method - 'registerFlags' or 'registerFlagsHi'.
+ * @param {Object<string, number>} map - flagMap()'s name -> bit map.
+ * @param {Object} [options]
+ * @returns {number} int32 mask of the indexed bits (bit 31 negative).
+ */
+function ixMaskOf(method, map, options) {
+    if (options == null || !Object.hasOwn(options, 'indexed')) return 0;
+    const v = options.indexed;
+    if (!Array.isArray(v)) {
+        throw new Error(
+            `lite-arena: ${method} options.indexed must be an array of flag names, got ${describeSchemaValue(v)}`);
+    }
+    let mask = 0;
+    for (let j = 0; j < v.length; j++) {
+        const x = v[j];
+        const bit = typeof x === 'string' && x in map ? map[x] : 0;
+        if (bit === 0 || (mask & bit) !== 0) {
+            throw new Error(`lite-arena: ${method} options.indexed #${j} (${typeof x === 'string'
+                ? JSON.stringify(x) : describeSchemaValue(x)}) is not one of the names, or a duplicate`);
+        }
+        mask |= bit;
+    }
+    return mask;
 }
 
 /** @this {Arena} */
@@ -430,6 +469,345 @@ function checkedJoinN(required, excluded, reqMask, excMask, reqMaskHi, excMaskHi
         this, required, excluded, reqMask, excMask, reqMaskHi, excMaskHi);
 }
 
+// ---- F2 indexed flags (M-35 .. M-42) -----------------------------------------
+// Per indexed bit b of a word: a column _ixW[b] (Int32Array, bit (i & 31) of word
+// i >>> 5 mirrors bit b of row[i]), a 2-level summary _ixS1[b] / _ixS2[b] (a
+// summary bit is set iff its child word != 0) and a live count _ixCnt[b]. The
+// helpers below take only small non-negative ints (slots, word indices); their -1
+// result is a Smi. 0xFFFFF in the hot bodies is INDEX_MASK written as a literal (no
+// context load / hole check, see spawn()); keep them equal.
+
+/** HOT: set bit i in column w and its summaries (caller: a real 0 -> 1 row transition). */
+function ixSet(w, s1, s2, i) {
+    const k = i >>> 5;
+    const v = w[k];
+    w[k] = v | (1 << (i & 31));
+    if (v === 0) {
+        const k1 = k >>> 5;
+        s1[k1] |= 1 << (k & 31);
+        s2[k1 >>> 5] |= 1 << (k1 & 31);
+    }
+}
+
+/** HOT: clear bit i in column w and its summaries (caller: a real 1 -> 0 row transition). */
+function ixUnset(w, s1, s2, i) {
+    const k = i >>> 5;
+    const v = w[k] & ~(1 << (i & 31));
+    w[k] = v;
+    if (v === 0) {
+        const k1 = k >>> 5;
+        const u = s1[k1] & ~(1 << (k & 31));
+        s1[k1] = u;
+        if (u === 0) s2[k1 >>> 5] &= ~(1 << (k1 & 31));
+    }
+}
+
+/** HOT: index of the first non-zero word of column w at or after word sw, or -1. */
+function ixWordFrom(w, s1, s2, sw) {
+    let k1 = sw >>> 5;
+    if (k1 >= s1.length) return -1;
+    let m = s1[k1] & (-1 << (sw & 31));
+    if (m === 0) {
+        const j = k1 + 1;
+        let k2 = j >>> 5;
+        const n2 = s2.length;
+        if (k2 >= n2) return -1;
+        let m2 = s2[k2] & (-1 << (j & 31));
+        while (m2 === 0) {
+            if (++k2 >= n2) return -1;
+            m2 = s2[k2];
+        }
+        k1 = (k2 << 5) | (31 - Math.clz32(m2 & -m2));
+        m = s1[k1];
+    }
+    return (k1 << 5) | (31 - Math.clz32(m & -m));
+}
+
+/**
+ * @this {Arena} HOT own setFlags of an arena with an indexed word-0 flag (M-36).
+ * Same contract as the prototype setFlags (M-33: convert first); the column changes
+ * only on a real 0 -> 1 transition of an indexed bit.
+ */
+function ixSetFlags(entity, mask) {
+    const m = mask | 0;
+    if (!this.isAlive(entity)) return false;
+    const s = entity & 0xFFFFF;
+    const row = this.flags;
+    const old = row[s];
+    row[s] = old | m;
+    let nw = m & ~old & this._ixMask;
+    while (nw !== 0) {
+        const b = 31 - Math.clz32(nw);
+        nw ^= 1 << b;
+        ixSet(this._ixW[b], this._ixS1[b], this._ixS2[b], s);
+        this._ixCnt[b]++;
+    }
+    return true;
+}
+
+/** @this {Arena} HOT own clearFlags (M-36): the column changes only on a real 1 -> 0 transition. */
+function ixClearFlags(entity, mask) {
+    const m = mask | 0;
+    if (!this.isAlive(entity)) return false;
+    const s = entity & 0xFFFFF;
+    const row = this.flags;
+    const old = row[s];
+    row[s] = old & ~m;
+    let gone = m & old & this._ixMask;
+    while (gone !== 0) {
+        const b = 31 - Math.clz32(gone);
+        gone ^= 1 << b;
+        ixUnset(this._ixW[b], this._ixS1[b], this._ixS2[b], s);
+        this._ixCnt[b]--;
+    }
+    return true;
+}
+
+/** @this {Arena} HOT own setFlagsHi (M-36): the Hi-word twin of ixSetFlags. */
+function ixSetFlagsHi(entity, mask) {
+    const m = mask | 0;
+    if (!this.isAlive(entity)) return false;
+    const s = entity & 0xFFFFF;
+    const row = this.flagsHi;
+    const old = row[s];
+    row[s] = old | m;
+    let nw = m & ~old & this._ixMaskHi;
+    while (nw !== 0) {
+        const b = 31 - Math.clz32(nw);
+        nw ^= 1 << b;
+        ixSet(this._ixWHi[b], this._ixS1Hi[b], this._ixS2Hi[b], s);
+        this._ixCntHi[b]++;
+    }
+    return true;
+}
+
+/** @this {Arena} HOT own clearFlagsHi (M-36): the Hi-word twin of ixClearFlags. */
+function ixClearFlagsHi(entity, mask) {
+    const m = mask | 0;
+    if (!this.isAlive(entity)) return false;
+    const s = entity & 0xFFFFF;
+    const row = this.flagsHi;
+    const old = row[s];
+    row[s] = old & ~m;
+    let gone = m & old & this._ixMaskHi;
+    while (gone !== 0) {
+        const b = 31 - Math.clz32(gone);
+        gone ^= 1 << b;
+        ixUnset(this._ixWHi[b], this._ixS1Hi[b], this._ixS2Hi[b], s);
+        this._ixCntHi[b]--;
+    }
+    return true;
+}
+
+/**
+ * @this {Arena} HOT own despawn of an indexed arena (M-36 / M-42): drops a live
+ * entity's indexed bits from the columns (word 0, then the Hi word when it has an
+ * indexed flag), then runs Arena.prototype.despawn, which zeroes the rows. A
+ * subclass despawn override is shadowed on an indexed arena (M-42).
+ */
+function ixDespawn(entity) {
+    if (!this.isAlive(entity)) return false;
+    const s = entity & 0xFFFFF;
+    let g = this.flags[s] & this._ixMask;
+    while (g !== 0) {
+        const b = 31 - Math.clz32(g);
+        g ^= 1 << b;
+        ixUnset(this._ixW[b], this._ixS1[b], this._ixS2[b], s);
+        this._ixCnt[b]--;
+    }
+    if (this._ixMaskHi !== 0) {
+        g = this.flagsHi[s] & this._ixMaskHi;
+        while (g !== 0) {
+            const b = 31 - Math.clz32(g);
+            g ^= 1 << b;
+            ixUnset(this._ixWHi[b], this._ixS1Hi[b], this._ixS2Hi[b], s);
+            this._ixCntHi[b]--;
+        }
+    }
+    return Arena.prototype.despawn.call(this, entity);
+}
+
+// Checked + indexed (M-36): the M-18 check, then the INSTALLED ix body -- never the
+// prototype (that would write the row and skip the column). Cold wrappers.
+/** @this {Arena} */
+function checkedIxSetFlags(entity, mask) {
+    checkMask('setFlags', 'the', mask);
+    return ixSetFlags.call(this, entity, mask);
+}
+
+/** @this {Arena} */
+function checkedIxClearFlags(entity, mask) {
+    checkMask('clearFlags', 'the', mask);
+    return ixClearFlags.call(this, entity, mask);
+}
+
+/** @this {Arena} */
+function checkedIxSetFlagsHi(entity, mask) {
+    checkMask('setFlagsHi', 'the', mask);
+    return ixSetFlagsHi.call(this, entity, mask);
+}
+
+/** @this {Arena} */
+function checkedIxClearFlagsHi(entity, mask) {
+    checkMask('clearFlagsHi', 'the', mask);
+    return ixClearFlagsHi.call(this, entity, mask);
+}
+
+// Checked query wrappers (S3, M-41): installed in the checked block of every checked
+// arena; the M-18 check on `flag`, then the prototype method (which validates the bit).
+/** @this {Arena} */
+function checkedFlagCount(flag) {
+    checkMask('flagCount', 'the flag', flag);
+    return Object.getPrototypeOf(this).flagCount.call(this, flag);
+}
+
+/** @this {Arena} */
+function checkedFirstFlagged(flag) {
+    checkMask('firstFlagged', 'the flag', flag);
+    return Object.getPrototypeOf(this).firstFlagged.call(this, flag);
+}
+
+/** @this {Arena} M-41: M-18 + E-BIT on `flag`, M-18 on `prev` (production trusts both). */
+function checkedNextFlagged(flag, prev) {
+    checkMask('nextFlagged', 'the flag', flag);
+    const f = flag | 0, mask = this._ixMask;
+    if (f !== 1 << (31 - Math.clz32(f)) || (f & mask) === 0) throw ixFlagError('nextFlagged', flag, mask, '');
+    checkMask('nextFlagged', 'the prev', prev);
+    return Object.getPrototypeOf(this).nextFlagged.call(this, flag, prev);
+}
+
+/** @this {Arena} */
+function checkedClearFlagAll(flag) {
+    checkMask('clearFlagAll', 'the flag', flag);
+    return Object.getPrototypeOf(this).clearFlagAll.call(this, flag);
+}
+
+/** @this {Arena} */
+function checkedFlagCountHi(flag) {
+    checkMask('flagCountHi', 'the flag', flag);
+    return Object.getPrototypeOf(this).flagCountHi.call(this, flag);
+}
+
+/** @this {Arena} */
+function checkedFirstFlaggedHi(flag) {
+    checkMask('firstFlaggedHi', 'the flag', flag);
+    return Object.getPrototypeOf(this).firstFlaggedHi.call(this, flag);
+}
+
+/** @this {Arena} M-41 for the Hi word. */
+function checkedNextFlaggedHi(flag, prev) {
+    checkMask('nextFlaggedHi', 'the flag', flag);
+    const f = flag | 0, mask = this._ixMaskHi;
+    if (f !== 1 << (31 - Math.clz32(f)) || (f & mask) === 0) throw ixFlagError('nextFlaggedHi', flag, mask, 'Hi');
+    checkMask('nextFlaggedHi', 'the prev', prev);
+    return Object.getPrototypeOf(this).nextFlaggedHi.call(this, flag, prev);
+}
+
+/** @this {Arena} */
+function checkedClearFlagAllHi(flag) {
+    checkMask('clearFlagAllHi', 'the flag', flag);
+    return Object.getPrototypeOf(this).clearFlagAllHi.call(this, flag);
+}
+
+/**
+ * COLD, once per word: installs the indexed write path as OWN methods (M-36; never
+ * `delete`). Checked arenas get the checkedIx* wrappers (M-18 check, then the ix body).
+ * @param {Arena} a
+ * @param {boolean} hi - the Hi word (setFlagsHi / clearFlagsHi) or word 0.
+ */
+function ixInstall(a, hi) {
+    const c = a._checked;
+    if (hi) {
+        a.setFlagsHi = c ? checkedIxSetFlagsHi : ixSetFlagsHi;
+        a.clearFlagsHi = c ? checkedIxClearFlagsHi : ixClearFlagsHi;
+    } else {
+        a.setFlags = c ? checkedIxSetFlags : ixSetFlags;
+        a.clearFlags = c ? checkedIxClearFlags : ixClearFlags;
+    }
+    a.despawn = ixDespawn;
+}
+
+/**
+ * COLD: allocates the columns of every bit in `mask` for `cap` slots:
+ * [W[32], S1[32], S2[32], count Int32Array(32)] (null for an unindexed bit).
+ */
+function ixColumns(mask, cap) {
+    const nw = (cap + 31) >>> 5, n1 = (nw + 31) >>> 5, n2 = (n1 + 31) >>> 5;
+    const w = [], s1 = [], s2 = [];
+    for (let b = 0; b < 32; b++) {
+        const on = (mask & (1 << b)) !== 0;
+        w.push(on ? new Int32Array(nw) : null);
+        s1.push(on ? new Int32Array(n1) : null);
+        s2.push(on ? new Int32Array(n2) : null);
+    }
+    return [w, s1, s2, new Int32Array(32)];
+}
+
+/**
+ * COLD: the Error of a bad `flag` argument. E-ROW when the word has no indexed flag
+ * (mask 0), else E-BIT (S7, verbatim).
+ * @param {string} m - the method name. @param {*} flag - as passed.
+ * @param {number} mask - the word's indexed mask. @param {string} hi - '' or 'Hi'.
+ * @returns {Error}
+ */
+function ixFlagError(m, flag, mask, hi) {
+    if (mask === 0) {
+        return new Error(`lite-arena: ${m}() needs registerFlags${hi}() with { indexed: [...] } first`);
+    }
+    return new Error(`lite-arena: ${m}() needs exactly one indexed flag bit (indexed mask 0x${
+        (mask >>> 0).toString(16).padStart(8, '0')}), got ${
+        typeof flag === 'number' ? String(flag) : describeSchemaValue(flag)}`);
+}
+
+/**
+ * clearFlagAll body: walks column w, clears bit b in each flagged row, zeroes the
+ * DATA words; the summaries are zeroed only AFTER the walk (the walk reads them, F-9a).
+ */
+function ixClearAll(row, w, s1, s2, b) {
+    const keep = ~(1 << b);
+    let k = ixWordFrom(w, s1, s2, 0);
+    while (k >= 0) {
+        let v = w[k];
+        const base = k << 5;
+        while (v !== 0) {
+            const j = 31 - Math.clz32(v);
+            v ^= 1 << j;
+            row[base | j] &= keep;
+        }
+        w[k] = 0;
+        k = ixWordFrom(w, s1, s2, k + 1);
+    }
+    s1.fill(0);
+    s2.fill(0);
+}
+
+/** COLD (reserve): grows every column of `mask` to `cap` slots in place (copy W, rebuild S1 / S2; counts kept). */
+function ixGrow(ws, s1s, s2s, mask, cap) {
+    const c = ixColumns(mask, cap);
+    for (let b = 0; b < 32; b++) {
+        if ((mask & (1 << b)) === 0) continue;
+        const w = c[0][b], s1 = c[1][b], s2 = c[2][b];
+        w.set(ws[b]);
+        for (let k = 0; k < w.length; k++) if (w[k] !== 0) s1[k >>> 5] |= 1 << (k & 31);
+        for (let k = 0; k < s1.length; k++) if (s1[k] !== 0) s2[k >>> 5] |= 1 << (k & 31);
+        ws[b] = w;
+        s1s[b] = s1;
+        s2s[b] = s2;
+    }
+}
+
+/** COLD (clear): zeroes every column, summary and count of `mask` (no-op for mask 0). */
+function ixReset(ws, s1s, s2s, cnt, mask) {
+    if (mask === 0) return;
+    for (let b = 0; b < 32; b++) {
+        if ((mask & (1 << b)) === 0) continue;
+        ws[b].fill(0);
+        s1s[b].fill(0);
+        s2s[b].fill(0);
+    }
+    cnt.fill(0);
+}
+
 export class Arena {
     /**
      * Allocates the memory pools for the ECS universe. Call once at setup.
@@ -519,6 +897,21 @@ export class Arena {
         this.flagsHi = null;
         this.indexMask = INDEX_MASK;
 
+        // F2 indexed flags (M-35 .. M-39): the indexed mask of each word and, per
+        // indexed bit, column / summaries / count (see ixSet). Every arena carries
+        // these 10 fields (one shape); all stay 0 / null until registerFlags(Hi) is
+        // given { indexed: [...] } naming a flag of that word. Private.
+        this._ixMask = 0;
+        this._ixW = null;
+        this._ixS1 = null;
+        this._ixS2 = null;
+        this._ixCnt = null;
+        this._ixMaskHi = 0;
+        this._ixWHi = null;
+        this._ixS1Hi = null;
+        this._ixS2Hi = null;
+        this._ixCntHi = null;
+
         // M-16 / M-20: checked mode only -- validating flag methods and joinN (mask
         // check) as OWN properties, so a production Arena keeps its exact instance
         // shape and prototype methods. The Hi word (M-26) mirrors them.
@@ -530,6 +923,16 @@ export class Arena {
             this.clearFlagsHi = checkedClearFlagsHi;
             this.hasFlagsHi = checkedHasFlagsHi;
             this.joinN = checkedJoinN;  // M-20 / M-22: validates masks + sets, then delegates
+            // F2 queries (S3 / M-41): the M-18 check on `flag` (nextFlagged also E-BIT, and
+            // M-18 on `prev`), then the prototype method.
+            this.flagCount = checkedFlagCount;
+            this.firstFlagged = checkedFirstFlagged;
+            this.nextFlagged = checkedNextFlagged;
+            this.clearFlagAll = checkedClearFlagAll;
+            this.flagCountHi = checkedFlagCountHi;
+            this.firstFlaggedHi = checkedFirstFlaggedHi;
+            this.nextFlaggedHi = checkedNextFlaggedHi;
+            this.clearFlagAllHi = checkedClearFlagAllHi;
         }
     }
 
@@ -766,18 +1169,35 @@ export class Arena {
      * and returns a frozen null-prototype map name i -> `1 << i` (#32 ->
      * -2147483648). Validates before allocating (a throw allocates no row; on a re-entry the
      * inner call's row stands). No names / [] -> frozen {}. reserve() REPLACES arena.flags: re-read it.
+     * F2 (M-37): `{ indexed: [names] }` INDEXES those flags -- flagCount / firstFlagged /
+     * nextFlagged / clearFlagAll read a per-flag column kept in step by setFlags / clearFlags /
+     * despawn, which become OWN methods of this arena (M-36; a subclass override of them is
+     * shadowed, M-42). Write indexed bits only through the API: a direct `flags[i]` write on an
+     * indexed bit desyncs the column (UNSUPPORTED, M-39). No `indexed` / [] installs nothing.
      * @param {string[]} [names] - <= 32 distinct non-empty strings.
-     * @param {Object} [options] - A plain object (prototype Object.prototype or null) with
-     *   no own keys in this version: any own key (Symbol / non-enumerable too) throws.
+     * @param {{ indexed?: string[] }} [options] - A plain object (prototype Object.prototype or
+     *   null) whose only allowed own key is `indexed` (M-40): any other own key (Symbol /
+     *   non-enumerable too) throws. `indexed` is read only as an own key: distinct names from `names`.
      * @returns {Readonly<Object<string, number>>}
      * @throws {Error} On a second call (or if a names getter or an options Proxy trap re-entered it),
-     *   or on invalid names / options.
+     *   or on invalid names / options. A throw leaves arena.flags null and allocates no column.
      */
     registerFlags(names, options) {
         if (this.flags !== null) throw new Error('lite-arena: registerFlags() was already called on this arena');
         const map = flagMap('registerFlags', names, options);
+        const ix = ixMaskOf('registerFlags', map, options);
         if (this.flags !== null) throw new Error('lite-arena: registerFlags() was already called on this arena');
-        this.flags = new Int32Array(this.capacity);
+        const row = new Int32Array(this.capacity);
+        const cols = ix !== 0 ? ixColumns(ix, this.capacity) : null;
+        this.flags = row;
+        if (cols !== null) {
+            this._ixW = cols[0];
+            this._ixS1 = cols[1];
+            this._ixS2 = cols[2];
+            this._ixCnt = cols[3];
+            this._ixMask = ix;
+            ixInstall(this, false);
+        }
         return Object.freeze(map);
     }
 
@@ -790,12 +1210,16 @@ export class Arena {
      * for a Hi-only arena). The two maps are independent: a name may appear in
      * both. Same validation as registerFlags(), before allocating (a throw allocates no row;
      * on a re-entry the inner call's row stands). reserve() REPLACES arena.flagsHi: re-read it.
+     * F2: `{ indexed: [names] }` indexes Hi flags exactly as registerFlags() does for word 0
+     * (flagCountHi / firstFlaggedHi / nextFlaggedHi / clearFlagAllHi; own setFlagsHi /
+     * clearFlagsHi / despawn).
      * @param {string[]} [names] - <= 32 distinct non-empty strings.
-     * @param {Object} [options] - A plain object (prototype Object.prototype or null) with
-     *   no own keys in this version: any own key (Symbol / non-enumerable too) throws.
+     * @param {{ indexed?: string[] }} [options] - A plain object (prototype Object.prototype or
+     *   null) whose only allowed own key is `indexed` (M-40): any other own key (Symbol /
+     *   non-enumerable too) throws.
      * @returns {Readonly<Object<string, number>>}
      * @throws {Error} On a second call (or if a names getter or an options Proxy trap re-entered it),
-     *   before registerFlags(), or on invalid names / options.
+     *   before registerFlags(), or on invalid names / options. A throw leaves arena.flagsHi null.
      */
     registerFlagsHi(names, options) {
         if (this.flagsHi !== null) throw new Error('lite-arena: registerFlagsHi() was already called on this arena');
@@ -804,8 +1228,19 @@ export class Arena {
                 '(call registerFlags([]) for a Hi-only arena)');
         }
         const map = flagMap('registerFlagsHi', names, options);
+        const ix = ixMaskOf('registerFlagsHi', map, options);
         if (this.flagsHi !== null) throw new Error('lite-arena: registerFlagsHi() was already called on this arena');
-        this.flagsHi = new Int32Array(this.capacity);
+        const row = new Int32Array(this.capacity);
+        const cols = ix !== 0 ? ixColumns(ix, this.capacity) : null;
+        this.flagsHi = row;
+        if (cols !== null) {
+            this._ixWHi = cols[0];
+            this._ixS1Hi = cols[1];
+            this._ixS2Hi = cols[2];
+            this._ixCntHi = cols[3];
+            this._ixMaskHi = ix;
+            ixInstall(this, true);
+        }
         return Object.freeze(map);
     }
 
@@ -873,6 +1308,130 @@ export class Arena {
         if (!this.isAlive(entity)) return false;
         const w = this.flagsHi[entity & INDEX_MASK];
         return (w & r) === r && (w & x) === 0;
+    }
+
+    /**
+     * F2, O(1): the number of live entities carrying the INDEXED word-0 flag `flag`
+     * (a one-bit mask from registerFlags(names, { indexed })). Converts `flag | 0`
+     * first; throws unless it is exactly one indexed bit (M-39), or when no word-0
+     * flag is indexed.
+     * @param {number} flag
+     * @returns {number}
+     */
+    flagCount(flag) {
+        const f = flag | 0, b = 31 - Math.clz32(f);
+        if (f !== 1 << b || (f & this._ixMask) === 0) throw ixFlagError('flagCount', flag, this._ixMask, '');
+        return this._ixCnt[b];
+    }
+
+    /**
+     * F2: the handle of the lowest-slot live entity carrying the indexed flag, or -1.
+     * Validates `flag` like flagCount(). Loop:
+     * `for (let e = a.firstFlagged(F.x); e !== -1; e = a.nextFlagged(F.x, e))`.
+     * @param {number} flag
+     * @returns {number} entity handle or -1.
+     */
+    firstFlagged(flag) {
+        const f = flag | 0, b = 31 - Math.clz32(f);
+        if (f !== 1 << b || (f & this._ixMask) === 0) throw ixFlagError('firstFlagged', flag, this._ixMask, '');
+        const w = this._ixW[b];
+        let k = 0, v = w[0];
+        if (v === 0) {
+            k = ixWordFrom(w, this._ixS1[b], this._ixS2[b], 1);
+            if (k < 0) return -1;
+            v = w[k];
+        }
+        const i = (k << 5) | (31 - Math.clz32(v & -v));
+        return (this.generations[i] << 20) | i;
+    }
+
+    /**
+     * F2, HOT: the handle of the next live entity with the indexed flag in a slot
+     * above `prev`'s SLOT, or -1. Continues from the slot and ignores prev's
+     * generation (M-39): despawning or un-flagging `prev` inside the loop is fine; a
+     * flag set mid-loop on a higher slot is visited, on a lower slot not. Production
+     * TRUSTS `flag` (the one its loop gave firstFlagged); checked mode validates it.
+     * @param {number} flag
+     * @param {number} prev - the previous handle.
+     * @returns {number} entity handle or -1.
+     */
+    nextFlagged(flag, prev) {
+        const s = (prev & 0xFFFFF) + 1;
+        if (s >= this.capacity) return -1;
+        const b = 31 - Math.clz32(flag);
+        const w = this._ixW[b];
+        let k = s >>> 5;
+        let v = w[k] & (-1 << (s & 31));
+        if (v === 0) {
+            k = ixWordFrom(w, this._ixS1[b], this._ixS2[b], k + 1);
+            if (k < 0) return -1;
+            v = w[k];
+        }
+        const i = (k << 5) | (31 - Math.clz32(v & -v));
+        return (this.generations[i] << 20) | i;
+    }
+
+    /**
+     * F2, O(flagged): clears the indexed flag on every entity carrying it (rows and
+     * column); flagCount(flag) is 0 afterwards. Validates `flag` like flagCount().
+     * @param {number} flag
+     */
+    clearFlagAll(flag) {
+        const f = flag | 0, b = 31 - Math.clz32(f);
+        if (f !== 1 << b || (f & this._ixMask) === 0) throw ixFlagError('clearFlagAll', flag, this._ixMask, '');
+        ixClearAll(this.flags, this._ixW[b], this._ixS1[b], this._ixS2[b], b);
+        this._ixCnt[b] = 0;
+    }
+
+    /** F2: the Hi-word twin of flagCount() (registerFlagsHi(names, { indexed })). */
+    flagCountHi(flag) {
+        const f = flag | 0, b = 31 - Math.clz32(f);
+        if (f !== 1 << b || (f & this._ixMaskHi) === 0) throw ixFlagError('flagCountHi', flag, this._ixMaskHi, 'Hi');
+        return this._ixCntHi[b];
+    }
+
+    /** F2: the Hi-word twin of firstFlagged(). */
+    firstFlaggedHi(flag) {
+        const f = flag | 0, b = 31 - Math.clz32(f);
+        if (f !== 1 << b || (f & this._ixMaskHi) === 0) {
+            throw ixFlagError('firstFlaggedHi', flag, this._ixMaskHi, 'Hi');
+        }
+        const w = this._ixWHi[b];
+        let k = 0, v = w[0];
+        if (v === 0) {
+            k = ixWordFrom(w, this._ixS1Hi[b], this._ixS2Hi[b], 1);
+            if (k < 0) return -1;
+            v = w[k];
+        }
+        const i = (k << 5) | (31 - Math.clz32(v & -v));
+        return (this.generations[i] << 20) | i;
+    }
+
+    /** F2, HOT: the Hi-word twin of nextFlagged() (same M-39 contract). */
+    nextFlaggedHi(flag, prev) {
+        const s = (prev & 0xFFFFF) + 1;
+        if (s >= this.capacity) return -1;
+        const b = 31 - Math.clz32(flag);
+        const w = this._ixWHi[b];
+        let k = s >>> 5;
+        let v = w[k] & (-1 << (s & 31));
+        if (v === 0) {
+            k = ixWordFrom(w, this._ixS1Hi[b], this._ixS2Hi[b], k + 1);
+            if (k < 0) return -1;
+            v = w[k];
+        }
+        const i = (k << 5) | (31 - Math.clz32(v & -v));
+        return (this.generations[i] << 20) | i;
+    }
+
+    /** F2: the Hi-word twin of clearFlagAll(). */
+    clearFlagAllHi(flag) {
+        const f = flag | 0, b = 31 - Math.clz32(f);
+        if (f !== 1 << b || (f & this._ixMaskHi) === 0) {
+            throw ixFlagError('clearFlagAllHi', flag, this._ixMaskHi, 'Hi');
+        }
+        ixClearAll(this.flagsHi, this._ixWHi[b], this._ixS1Hi[b], this._ixS2Hi[b], b);
+        this._ixCntHi[b] = 0;
     }
 
     /**
@@ -1200,6 +1759,9 @@ export class Arena {
             this.flagsHi = newFlagsHi;
             this._joinNResult.flagsHi = this.flagsHi;
         }
+        // F2 indexed columns (S5): copy each column, rebuild its summaries; counts kept.
+        if (this._ixMask !== 0) ixGrow(this._ixW, this._ixS1, this._ixS2, this._ixMask, newCapacity);
+        if (this._ixMaskHi !== 0) ixGrow(this._ixWHi, this._ixS1Hi, this._ixS2Hi, this._ixMaskHi, newCapacity);
 
         this.capacity = newCapacity | 0;
         return true;
@@ -1254,6 +1816,11 @@ export class Arena {
 
         if (this.flags !== null) this.flags.fill(0);
         if (this.flagsHi !== null) this.flagsHi.fill(0);
+        // F2 (S5): every indexed column, summary and count -> 0, in step with the rows.
+        if ((this._ixMask | this._ixMaskHi) !== 0) {
+            ixReset(this._ixW, this._ixS1, this._ixS2, this._ixCnt, this._ixMask);
+            ixReset(this._ixWHi, this._ixS1Hi, this._ixS2Hi, this._ixCntHi, this._ixMaskHi);
+        }
 
         this.activeCount = 0 | 0;
         this.retiredCount = 0 | 0;

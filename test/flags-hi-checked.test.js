@@ -192,7 +192,8 @@ test('A3 a stale plan throws on flagsHi, reqMaskHi and excMaskHi', () => {
     assert.throws(() => q.flagsHi, /stale/);
 });
 
-test('A3 own *Hi function keys: production arena 0, checked arena exactly the three Hi methods', () => {
+const HI_CHK = ['clearFlagAllHi', 'clearFlagsHi', 'firstFlaggedHi', 'flagCountHi', 'hasFlagsHi', 'nextFlaggedHi', 'setFlagsHi'];
+test('A3 own *Hi function keys: production arena 0, checked arena exactly the three Hi flag methods + the four F2 Hi query wrappers', () => {
     const own = (a) => Object.getOwnPropertyNames(a)
         .filter((k) => k.endsWith('Hi') && typeof a[k] === 'function').sort();
     const prod = new Arena(8);
@@ -203,10 +204,10 @@ test('A3 own *Hi function keys: production arena 0, checked arena exactly the th
     assert.deepEqual(own(prod), []);
     assert.equal(Object.prototype.hasOwnProperty.call(prod, 'setFlagsHi'), false);
     const chk = new Arena(8, { checked: true });
-    assert.deepEqual(own(chk), ['clearFlagsHi', 'hasFlagsHi', 'setFlagsHi']);
+    assert.deepEqual(own(chk), HI_CHK);
     chk.registerFlags(['a']);
     chk.registerFlagsHi(['p']);
-    assert.deepEqual(own(chk), ['clearFlagsHi', 'hasFlagsHi', 'setFlagsHi']);
+    assert.deepEqual(own(chk), HI_CHK);
     // the checked wrappers are not the prototype methods
     assert.notEqual(chk.setFlagsHi, Arena.prototype.setFlagsHi);
     assert.equal(prod.setFlagsHi, Arena.prototype.setFlagsHi);

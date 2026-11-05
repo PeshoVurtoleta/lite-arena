@@ -388,8 +388,8 @@ test('QA cross-word overlap with every bit: checked allows rm & xh / xm & rh, pr
     }
 });
 
-test('QA own keys: production arena has no own *Hi key except the flagsHi row; checked adds exactly 3', () => {
-    const hiKeys = (a) => Reflect.ownKeys(a).filter((k) => typeof k === 'string' && /Hi$/.test(k)).sort();
+test('QA own keys: production arena has no own *Hi key except the flagsHi row; checked adds exactly 7 (3 flag methods + 4 F2 query wrappers); _ix private fields excluded', () => {
+    const hiKeys = (a) => Reflect.ownKeys(a).filter((k) => typeof k === 'string' && /Hi$/.test(k) && !k.startsWith('_ix')).sort();
     const p = new Arena(4);
     assert.deepEqual(hiKeys(p), ['flagsHi']);
     p.registerFlags([]);
@@ -401,7 +401,7 @@ test('QA own keys: production arena has no own *Hi key except the flagsHi row; c
     p.clear();
     assert.deepEqual(hiKeys(p), ['flagsHi']);
     const c = new Arena(4, { checked: true });
-    assert.deepEqual(hiKeys(c), ['clearFlagsHi', 'flagsHi', 'hasFlagsHi', 'setFlagsHi']);
+    assert.deepEqual(hiKeys(c), ['clearFlagAllHi', 'clearFlagsHi', 'firstFlaggedHi', 'flagCountHi', 'flagsHi', 'hasFlagsHi', 'nextFlaggedHi', 'setFlagsHi']);
 });
 
 // Adversarial cases the plan did not list. Both inherited defects are FIXED by M-33

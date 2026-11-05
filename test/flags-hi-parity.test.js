@@ -7,7 +7,11 @@
  *      rows, cut from the frozen 2c7af47 / e53d0573 build by .handoff/evidence/
  *      F1-cut.mjs, which never imports the live Arena.js): every data record and
  *      every error row byte-for-byte; for rows labelled 'v8:' (engine TypeError
- *      wording) only the constructor name.
+ *      wording) only the constructor name. M-40 (PLAN-F2 T10): the DECLARED
+ *      allow-list M40_ROWS below -- golden file lines 14, 15, 18 (errors[6], [7],
+ *      [10]), the unknown-options-key rows -- is compared against the F2 R1 text
+ *      instead; the golden file is untouched. A pre-F2 build (the control) fails
+ *      exactly those three rows.
  *  (2) the 1,200-record no-mask golden is gated 1:1 by test/joinN-parity.test.js;
  *      here only a single whole-array cross-check.
  *  (3) toString sha256 of the 11 hot methods the Hi word must leave byte-identical
@@ -52,18 +56,43 @@ test('A4 every word-0-masked joinN record equals the golden', () => {
     assert.deepEqual(out.flagMap, golden.flagMap);
 });
 
-test('A4 every error row is byte-identical (v8: rows by constructor name only)', () => {
+// M-40 (PLAN-F2 T10) DECLARED allow-list: errors index -> [label, golden (pre-F2) text, F2 R1 text].
+// joinN-mask.json lines 14, 15, 18. Every other row stays byte-identical.
+const M40_ROWS = new Map([
+    [6, ['registerFlags options unknown key',
+        'lite-arena: registerFlags takes no options; got k',
+        'lite-arena: registerFlags options accept only "indexed"; got k']],
+    [7, ['registerFlags options symbol key',
+        'lite-arena: registerFlags takes no options; got Symbol(s)',
+        'lite-arena: registerFlags options accept only "indexed"; got Symbol(s)']],
+    [10, ['registerFlags options is an array',
+        'lite-arena: registerFlags takes no options; got object',
+        'lite-arena: registerFlags options accept only "indexed"; got object']],
+]);
+
+test('A4 every error row is byte-identical (v8: rows by constructor name only; M-40 rows declared)', () => {
     const out = runMask(Arena);
     assert.equal(out.errors.length, golden.errors.length);
+    let m40 = 0;
     for (let i = 0; i < golden.errors.length; i++) {
         const g = golden.errors[i], o = out.errors[i];
         assert.equal(o[0], g[0], 'label #' + i);
-        if (g[0].startsWith('v8:')) {
+        const d = M40_ROWS.get(i);
+        if (d !== undefined) {
+            // the allow-list is pinned to exactly these golden rows ...
+            assert.deepEqual(g, [d[0], 'Error', d[1], true], 'M-40 golden row #' + i);
+            // ... and the build under test gives the R1 text there, nothing else changed
+            assert.deepEqual(o, [d[0], 'Error', d[2], true], 'M-40 row ' + g[0]);
+            m40++;
+        } else if (g[2].includes('takes no options')) {
+            assert.fail('undeclared M-40 row #' + i + ' ' + g[0]);
+        } else if (g[0].startsWith('v8:')) {
             assert.equal(o[1], g[1], 'ctor ' + g[0]);
         } else {
             assert.deepEqual(o, g, 'row ' + g[0]);
         }
     }
+    assert.equal(m40, 3);
 });
 
 test('A4 no-mask golden cross-check (full record gate: test/joinN-parity.test.js)', () => {

@@ -131,7 +131,7 @@ test('M-17 registerFlags: non-plain options throw and leave flags null', () => {
     for (const [name, o] of cases) {
         const a = new Arena(4);
         // one matcher per input; [] is rejected by the own-key door
-        const re = name === 'array' ? /takes no options/ : /plain object/;
+        const re = name === 'array' ? /options accept only "indexed"; got object/ : /plain object/; // M-40
         assert.throws(() => a.registerFlags(['a'], o), re, name);
         assert.equal(a.flags, null, name);
     }
@@ -148,10 +148,10 @@ test('M-17 registerFlags: plain options accepted', () => {
 
 test('M-9 registerFlags: own keys of any kind still throw', () => {
     const ne = {}; Object.defineProperty(ne, 'h', { value: 1, enumerable: false });
-    const cases = [{ str: 1 }, { [Symbol('s')]: 1 }, ne];
+    const cases = [{ str: 1 }, { [Symbol('s')]: 1 }, ne, { indexed: ['a'], k: 1 }, { indexed: ['a'], [Symbol('s')]: 1 }];
     for (const o of cases) {
         const a = new Arena(4);
-        assert.throws(() => a.registerFlags(['a'], o), /takes no options/);
+        assert.throws(() => a.registerFlags(['a'], o), /options accept only "indexed"; got /); // M-40
         assert.equal(a.flags, null);
     }
 });
