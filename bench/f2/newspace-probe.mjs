@@ -5,7 +5,8 @@
  *   --expose-gc --trace-gc --min-semi-space-size=1 --max-semi-space-size=1
  * FAILS CLOSED (exit 2) unless both semi-space flags are in process.execArgv, gc() is
  * exposed and v8.GCProfiler exists; exit 2 too when the build has no indexed API
- * (e.g. fe8d7d5). Exit 1 = harness error (bad knob, a lane precondition broke).
+ * (e.g. fe8d7d5). Exit 1 = harness error (bad knob, a lane precondition broke, or a pair
+ * lane does not reach the indexed write path).
  *
  * A1 count lanes: per lane 20,000 warm-up ops, a `LANE-START <name>` line, 500,000 ops
  *   (20,000 for walk and clearAll), a `LANE-END <name>` line. The test counts the
@@ -13,13 +14,20 @@
  *   ixPair1, ixPair4 (f0 f1 f2 f31), hiPair (h0 h31), ixChurn (set + despawn + spawn),
  *   flagCount, firstFlagged, joinNHint (joinN + a driverFlag-driven walk), checkedPair,
  *   walk (first / nextFlagged), clearAll (clearFlagAll + refill), box (must-fail).
+ *   The pair lanes (ixPair1, ixPair4, checkedPair) prove the indexed write is reached: after
+ *   LANE-END, OUTSIDE every window, a reach check runs per bit b of the lane's mask on the
+ *   first entity -- setFlags, firstFlagged(b) === it, flagCount(b) === 1, clearFlags,
+ *   flagCount(b) === 0. A miss or a throw (E-BIT: b is not indexed, so the op drove the plain
+ *   write path) exits 1.
  * M-51 byte lanes: new-space used bytes (v8.getHeapSpaceStatistics) across a window of
  *   400,000 ops with NO GC inside it (v8.GCProfiler; a window that saw a GC is re-armed,
  *   at most 8 tries, then NaN = fail closed). 4 windows per lane, window 0 discarded,
  *   steady state = the minimum of windows 1..3. Lanes: noop, ixSet1 (one ixSetFlags +
  *   one ixClearFlags per op), ctl1k (noop + one new Int32Array(1) per 1,000 ops: the
  *   harness's own must-fail, same rate as the once-per-1,000 mutant). Each window is
- *   bracketed by `BWIN-START` / `BWIN-END ... ok|rearm <bytes>` lines.
+ *   bracketed by `BWIN-START` / `BWIN-END ... ok|rearm <bytes>` lines. After its 4 windows
+ *   (OUTSIDE every window) ixSet1 runs the same check + reach check as the pair lanes, so a
+ *   0 B read is from the indexed write path; a miss or a throw exits 1.
  * A2 retention: 64 cycles of Arena(4096), indexed a (word 0) and h (Hi), 100 entities
  *   flagged; the old _ixW / _ixS1 / _ixWHi / _ixS1Hi columns are tracked (256), then
  *   reserve(8192) and clear(). tracker.size() after a settled GC, arenas alive and dropped.
@@ -89,6 +97,25 @@ function mkPair(opts, ix, m) {
     const es = spawnAll(a, N);
     const op = function (i) { const e = es[i & MASK]; a.setFlags(e, m); a.clearFlags(e, m); };
     op.check = () => (a.flagCount(1) === 0 ? null : 'pair left f0 set');
+    // COLD reach check (run OUTSIDE every window): each bit of m goes through the index.
+    op.reach = () => {
+        const e = es[0];
+        try {
+            for (let r = m; r !== 0; r &= r - 1) {
+                const b = r & -r, x = (b >>> 0).toString(16);
+                a.setFlags(e, b);
+                if (a.firstFlagged(b) !== e) return 'firstFlagged(0x' + x + ') != es[0] after setFlags';
+                const c1 = a.flagCount(b);
+                if (c1 !== 1) return 'flagCount(0x' + x + ') ' + c1 + ' != 1 after setFlags';
+                a.clearFlags(e, b);
+                const c0 = a.flagCount(b);
+                if (c0 !== 0) return 'flagCount(0x' + x + ') ' + c0 + ' != 0 after clearFlags';
+            }
+        } catch (err) {
+            return 'indexed write not reached: ' + (err && err.message);
+        }
+        return null;
+    };
     return op;
 }
 function mkHiPair() {
@@ -190,6 +217,19 @@ const boxed = (op) => function (i) { op(i); HOLD[0] = { a: i }; };
 /** Shared driver (warm-up and windows): its op call site is megamorphic across lanes by design. */
 function drive(op, n) { for (let i = 0; i < n; i++) op(i); }
 
+/** COLD, after a lane (never inside a window): op.check then op.reach; a throw from check fails closed. */
+function verdict(op) {
+    let bad = null;
+    try {
+        bad = typeof op.check === 'function' ? op.check() : null;
+    } catch (err) {
+        bad = 'check threw: ' + (err && err.message);
+    }
+    const r = typeof op.reach === 'function' ? op.reach() : null;
+    if (r !== null) bad = (bad === null ? '' : bad + '; ') + 'reach: ' + r;
+    return bad;
+}
+
 function lane(name, op, ops) {
     const f = BOX === name ? boxed(op) : op;
     gc();                                    // a major GC OUTSIDE the window (Mark-Compact must not land inside)
@@ -197,7 +237,7 @@ function lane(name, op, ops) {
     say('LANE-START ' + name);
     drive(f, ops);
     say('LANE-END ' + name);
-    const bad = typeof op.check === 'function' ? op.check() : null;
+    const bad = verdict(op);
     if (bad !== null) fail(1, 'lane ' + name + ': ' + bad);
 }
 
@@ -246,6 +286,8 @@ function byteLane(name, op) {
     const m = Math.min(w[1], w[2], w[3]);                     // window 0 discarded; a NaN window -> NaN (fail closed)
     out.bytes[name] = Array.from(w);
     out.bytesMin[name] = m;
+    const bad = verdict(op);
+    if (bad !== null) fail(1, 'byte lane ' + name + ': ' + bad);
 }
 const ctl1k = function (i) { S[0] = i; if ((i % 1000) === 999) HOLD[0] = new Int32Array(1); };
 byteLane('noop', noop);
