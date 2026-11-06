@@ -2,7 +2,7 @@
 
 Status: accepted
 Date: 2026-11-05
-Ships in: v1.12.0 (the ROADMAP target, M-49; `/release` verifies the label)
+Ships in: v1.12.0
 Supersedes: nothing. Amends 0010 (see its "Amendment: Indexed flags (F2)").
 Rulings: M-35 .. M-52 (the F2 research burst, the planner pass, and the U3 / U5 / U8 maintainer rulings).
 

@@ -5,9 +5,9 @@ All notable changes to `@zakkster/lite-arena` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.12.0] - 2026-11-06
 
-F2: indexed flags (1.12.0). A flag can be registered as indexed, which gives O(1) counts and an
+F2: indexed flags. A flag can be registered as indexed, which gives O(1) counts and an
 ascending-slot walk over just the entities that carry it.
 
 ### Added
