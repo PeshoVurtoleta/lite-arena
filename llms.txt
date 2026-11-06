@@ -131,7 +131,8 @@ const H = arena.registerFlagsHi(['boss', 'elite']);   // own frozen map { boss: 
 arena.setFlagsHi(e, H.boss): boolean;                 // O(1); mask | 0 first, then false (no write) if dead
 arena.clearFlagsHi(e, H.boss): boolean;               // O(1); mask | 0 first, then false if dead
 arena.hasFlagsHi(e, H.boss, H.elite): boolean;        // required all set, excluded none; each mask | 0 first, then false if dead
-// Indexed flags (1.12.0): the SAME one-time registerFlags / registerFlagsHi call with `indexed` (instead of the plain calls above; a 2nd call throws):
+// Indexed flags (1.12.0): the SAME one-time registerFlags / registerFlagsHi call with `indexed`
+// (instead of the plain calls above; a 2nd call throws):
 const FX = arena.registerFlags(['hot', 'dirty'], { indexed: ['hot'] });   // 'hot' is indexed; 'dirty' is not
 const HX = arena.registerFlagsHi(['boss', 'elite'], { indexed: ['boss'] });   // same option on the Hi word
 // flagCount / firstFlagged / clearFlagAll (+Hi) throw unless the flag is exactly ONE indexed bit;
@@ -144,7 +145,10 @@ arena.flagCountHi(HX.boss): number;             // (1.12.0) Hi-word twin of flag
 arena.firstFlaggedHi(HX.boss): number;          // (1.12.0) Hi-word twin of firstFlagged
 arena.nextFlaggedHi(HX.boss, prev): number;     // (1.12.0) Hi-word twin of nextFlagged
 arena.clearFlagAllHi(HX.boss);                  // (1.12.0) Hi-word twin of clearFlagAll
-// nextFlagged continues from prev's SLOT, so prev may be despawned or un-flagged inside the loop:
+// nextFlagged continues from prev's SLOT, so prev may be despawned or un-flagged inside the loop.
+// (M-52) Start with firstFlagged(F) and pass only a handle firstFlagged / nextFlagged returned. A non-int
+// prev (undefined / NaN / null) in PRODUCTION is UNSUPPORTED: it silently resumes after slot 0, skipping a
+// flagged slot 0. Checked mode throws the M-18 non-int32 error instead.
 for (let e = arena.firstFlagged(FX.hot); e !== -1; e = arena.nextFlagged(FX.hot, e)) { /* ... */ }
 // Hot loop: hoist the row and the mask; never hard-code 0xFFFFF.
 const row = arena.flags, m = arena.indexMask;      // row is REPLACED by reserve(): re-read
@@ -222,7 +226,9 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
   The checked `idx` shadows the prototype method as an own property, so the production `idx()` fast path is
   byte-for-byte unchanged.
 - Flags: `registerFlags(names)` once (<= 32 distinct non-empty strings in this word; name i ->
-  `1 << i`, #32 -> -2147483648); a second call or any options key throws.
+  `1 << i`, #32 -> -2147483648); a second call throws, and so does an options key other than `indexed`
+  (R1: `options accept only "indexed"; got <key>`; R2: `options.indexed must be an array of flag names`;
+  R3: an indexed name that `is not one of the names, or a duplicate`; M-40). See "Indexed flags" below.
   `despawn()` zeroes the slot's word and `clear()` zeroes all, so a respawned slot
   starts with no flags. See decisions/0010-flags.md.
 - Second flag word (1.11.0, M-26 / M-27): `registerFlagsHi(names)` once allocates `arena.flagsHi`
@@ -262,7 +268,7 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
 - `joinN(required, excluded, reqMask, excMask, reqMaskHi, excMaskHi)` generalizes `join` to k required sets plus a NOT
   list ("A AND B AND C, WITHOUT D"). It returns a REUSED scratch
   `{driver, count, others, othersCount, excl, exclCount, reqMask, excMask, flags,
-  reqMaskHi, excMaskHi, flagsHi}` -- driver = the rarest
+  reqMaskHi, excMaskHi, flagsHi, driverFlag, driverFlagCount}` -- driver = the rarest
   required set (ties favour the first), `others` = the remaining required sets to
   `has()`-check, `excl` = the excluded sets to `!has()`-check. Loop to
   `othersCount`/`exclCount`, never `.length` (the arrays are grow-once scratch
@@ -275,7 +281,8 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
   `reserve()` refreshes the production plan's `flags`, but a hoisted row or a checked
   plan keeps the pre-reserve row -- re-read after growing). A non-zero mask
   without `registerFlags()` throws (M-10); empty `required` still throws first
-  (M-11: a flags-only scan is a caller loop over `arena.flags`, O(capacity));
+  (M-11: a flags-only scan is a caller loop over `arena.flags`, O(capacity); for ONE rare indexed
+  flag, walk firstFlagged / nextFlagged instead);
   `(reqMask & excMask) !== 0` matches nothing (throws in checked mode, M-13).
   NOMINAL: a mask outside [-2^30, 2^30 - 1] may be a heap number on
   pointer-compressed engines. Hi masks (1.11.0, M-26, args 5-6): the same test against
@@ -289,6 +296,23 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
   `0, 0` (M-27). M-13 holds PER WORD: `reqMaskHi & excMaskHi` != 0 matches nothing (throws in
   checked mode); a bit shared ACROSS the words is allowed. `reserve()` replaces `arena.flagsHi` too.
   `join(a, b)` is untouched -- the fast two-set path stays exactly as it was.
+  Rare-flag driver hint (1.12.0, M-38): `driverFlag` is the MASK (`1 << b`, so bit 31 is -2147483648) of
+  the rarest indexed word-0 bit inside `reqMask` whose live count is below `count` (lowest bit wins a tie),
+  and `driverFlagCount` that count; otherwise 0 / -1 (also on arenas with no indexed bit, and for Hi-only
+  indexing). driver / count are unchanged. A caller may walk firstFlagged(driverFlag) instead of dense[], then has()-check
+  the driver set itself plus others / excl and the other mask bits per entity (the walk replaces the dense
+  loop, not the driver test).
+  The checked plan carries both fields through getters, and a stale read (after a later join / joinN)
+  throws (M-43). joinN bytecode 420 -> 435 B (ceiling 460).
+- Indexed flags (1.12.0, ADR 0011): `registerFlags(names, { indexed: [...] })` (and the Hi twin) keeps a
+  column plus a 2-level summary (131,072 + 4,096 + 128 B at capacity 1,048,575) per indexed bit, so
+  flagCount is O(1) and the firstFlagged / nextFlagged walk costs about matches + capacity/1024 summary
+  words, not an O(capacity) row scan (derived from the code, not timed). Memory: 4 x (W + S1 + S2) with
+  W = ceil(capacity / 32), S1 = ceil(W / 32), S2 = ceil(S1 / 32) Int32 words =
+  135,296 B per indexed flag at capacity 1,048,575, plus a 128 B count table per word; 0 B unindexed.
+  Direct indexed row writes (`arena.flags[s] |= F.x`) are UNSUPPORTED: the summaries do not see them
+  (M-39); use setFlags / clearFlags. On an indexed arena setFlags / clearFlags / despawn are own methods
+  installed at registration (M-42; the Hi twins too), so a subclass override of them is bypassed (shadowed).
 - The arena NEVER auto-grows. `spawn()` at capacity throws; growth happens only
   through an explicit, between-frames `reserve(newCap)`. `reserve()` reallocates
   every backing buffer (copying live contents; all handles/memberships/dense

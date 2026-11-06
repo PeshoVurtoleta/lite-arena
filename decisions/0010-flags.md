@@ -2,7 +2,7 @@
 
 Status: accepted
 Date: 2026-10-27
-Ships in: v1.10.0 (second flag word + M-33 amendment: v1.11.0)
+Ships in: v1.10.0 (second flag word + M-33 amendment: v1.11.0; indexed flags amendment: v1.12.0)
 Supersedes: nothing. Builds on 0009 (a flag word is only meaningful for a live handle).
 
 ## Context
@@ -178,3 +178,50 @@ inner call's map and row stand).
 Cost: +3 B of bytecode per method (node v26.8.2: setFlags 48, clearFlags 50,
 hasFlags 68, Hi twins identical; were 45 / 47 / 65). Gates: `test/flags-m33.test.js`,
 `test/flags-hi-qa.test.js`.
+
+## Amendment: Indexed flags (F2)
+
+The text above is history and stays. 0011 is the decision; this section lists which
+statements above it overrides in 1.12.0, by the lines they appear on in the 1.11.0 text.
+
+- Options (the "any options key" clause under Decision, and the M-17 line under
+  Consequences, "no options exist in 1.10.0"): the options object now accepts ONE key,
+  `indexed`, a `string[]` of names from the same call. Any other own key (Symbol and
+  non-enumerable too) throws `lite-arena: registerFlags options accept only "indexed"; got
+  <key>` (R1, M-40); `registerFlagsHi` says its own name. The plain-object rule is
+  unchanged (prototype Object.prototype or null).
+- Column bitset (the Alternatives table's "Column bitset" column, "1 bit per flag ...
+  caller-owned", "scan O(capacity / 32) words", and the sentence "A column bitset is a recipe
+  ... it is not an API here"): an indexed flag IS that column, as an API. It is not
+  caller-owned: it is declared at registration and kept in step by `setFlags` / `clearFlags`
+  / `despawn` / `reserve` / `clear`. It costs 135,296 B per indexed flag at capacity
+  1,048,575 (column 131,072 + summaries 4,096 + 128) plus a 128 B count table per word, and
+  0 B when nothing is indexed. Iteration walks matches plus capacity / 1024 summary words;
+  this is derived from the code, not timed. The Alternatives comparison is otherwise
+  unchanged: tags stay the tool for small, iterated or joined sets.
+- "Rejected here: ... column bitsets ... F2 material" (Amendment: Second word): F2 shipped
+  them in 1.12.0.
+- M-11 (the joinN section: "A flags-only scan is a caller loop over `arena.flags`,
+  O(capacity); it is not an API here"): `required = []` still throws. For an INDEXED flag a
+  flags-only walk is now `firstFlagged(F)` / `nextFlagged(F, h)`; for an unindexed flag it
+  is still a caller loop over `arena.flags`.
+- M-12 (the plan fields): the plan also carries `driverFlag` / `driverFlagCount` (M-38,
+  M-43): the MASK and live count of the rarest indexed required word-0 flag rarer than the
+  driver, else `0` / `-1`. The other fields are unchanged.
+- Checked-mode shadowing ("The checked methods are own properties that shadow the prototype
+  ones ... subclass overrides are honoured"): still true for a plain arena. On an arena that
+  indexes a flag, `setFlags` / `clearFlags` (word 0), `setFlagsHi` / `clearFlagsHi` (Hi)
+  and `despawn` (either word) are OWN methods and a subclass override of them is SHADOWED
+  (M-42); production and checked mode alike. The checked wrappers delegate to the installed
+  indexed body, so the M-18 check is kept (M-36).
+- Direct row writes: unchanged for unindexed bits (the row is the API's own data). A direct
+  write to an indexed bit leaves the column and count out of step: UNSUPPORTED, undetected
+  in every mode (M-39).
+- Inline budget ("joinN 420 B", Deterministic bytecode lengths): joinN is 435 B on the 1.12.0
+  build (one cold `pickFlagDriver(this, r)` call under `if (this._ixMask)`, M-44); the
+  M-28 ceiling 460 never moves. The other pinned lengths (despawn 215, setFlags 48,
+  clearFlags 50, hasFlags 68, the Hi twins) are unchanged: indexed arenas use own methods
+  with their own pins, listed in 0011.
+- Precondition M-6 and the typo fail-open note are unchanged. The new flag methods
+  (`flagCount`, `firstFlagged`, `clearFlagAll` + Hi) throw E-ROW when nothing is indexed;
+  production `nextFlagged` trusts both arguments (M-39, M-52).

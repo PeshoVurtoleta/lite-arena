@@ -109,6 +109,32 @@ export interface JoinNPlan {
      * caveat as `flags`: a hoisted row (and a checked plan) keeps the pre-reserve row.
      */
     flagsHi: Int32Array | null;
+    /**
+     * (1.12.0) The indexed-flag driver hint: the MASK (`1 << b`; bit 31 is -2147483648) of
+     * the rarest INDEXED word-0 flag in `reqMask` whose live count is STRICTLY below `count`
+     * (the lowest bit wins a tie), else 0. When it is not 0, walk
+     * `firstFlagged(driverFlag)` / `nextFlagged(driverFlag, e)` instead of `driver.dense`, and test driver.has(e) plus every others / excl set and the other mask bits per entity.
+     * Always written on an arena with an indexed word-0 flag; an arena with none (and a
+     * Hi-only indexed arena) keeps the constructed 0. `driver`, `count` and every other
+     * field are unchanged. A checked plan has the same field as a getter: a stale read
+     * throws like every other field (M-43).
+     */
+    driverFlag: number;
+    /**
+     * (1.12.0) The live count of the `driverFlag` flag (`flagCount(driverFlag)`), or -1
+     * when `driverFlag` is 0. Same writer and same stale-read rule as `driverFlag`.
+     */
+    driverFlagCount: number;
+}
+
+/**
+ * The options of {@link Arena.registerFlags} / {@link Arena.registerFlagsHi} (1.12.0).
+ * A plain object (prototype Object.prototype or null); `indexed` is the only allowed own
+ * key and is read as an own key only.
+ */
+export interface RegisterFlagsOptions {
+    /** Names (from the same call's `names`, each once) whose flags get a column and a count. */
+    indexed?: readonly string[];
 }
 
 export class Arena {
@@ -138,7 +164,9 @@ export class Arena {
      * Per-slot flag words (Int32Array, slot-indexed, length = capacity), or
      * `null` until {@link Arena.registerFlags} is called. Index with `e & indexMask`.
      * Like `data.x`, `reserve()` REPLACES this array: re-read it after growing.
-     * Read-only from user code; write through setFlags / clearFlags.
+     * Read-only from user code; write through setFlags / clearFlags. A direct write to a bit
+     * registered with `{ indexed }` (e.g. `flags[s] |= F.x`) is UNSUPPORTED: it leaves the
+     * column and `flagCount` out of step, and no mode detects it (M-39).
      * Bits 30-31 are plain int32 inside the array; held in a JS variable they may be
      * heap numbers on pointer-compressed engines (nominal; Node cannot observe it).
      */
@@ -148,7 +176,8 @@ export class Arena {
      * The SECOND flag word (bits 32..63, M-26): per-slot Int32Array, length =
      * capacity, or `null` until {@link Arena.registerFlagsHi} is called. Index with
      * `e & indexMask`. `reserve()` REPLACES this array: re-read it after growing.
-     * Read-only from user code; write through setFlagsHi / clearFlagsHi. An arena
+     * Read-only from user code; write through setFlagsHi / clearFlagsHi (a direct write to an
+     * indexed Hi bit is UNSUPPORTED, as for {@link Arena.flags}). An arena
      * that never registers it allocates no Hi row (0 B per slot; despawn() adds one nested null check). Bits 30-31 carry the same
      * nominal pointer-compressed boxing note as {@link Arena.flags}.
      */
@@ -196,6 +225,10 @@ export class Arena {
      * to the free list.
      * @returns true if the entity was alive, false if the handle was already stale
      *   or names a free slot (nothing changes in that case).
+     *
+     * On an arena with an indexed flag (1.12.0) this is an OWN method that drops the
+     * entity's indexed bits from the columns and counts, then runs `Arena.prototype.despawn`;
+     * a subclass `despawn` override is shadowed there (M-42).
      */
     despawn(entity: Entity): boolean;
 
@@ -288,7 +321,8 @@ export class Arena {
      * `flags[e & arena.indexMask]` read per candidate and tests
      * `(w & rm) === rm && (w & xm) === 0`. A non-zero mask on an arena without
      * `registerFlags()` throws before any state write (M-10); an empty `required`
-     * still throws the required-set error first (M-11 -- a flags-only scan is a
+     * still throws the required-set error first (M-11 -- there is no driver set; a
+     * flags-only walk is `firstFlagged` / `nextFlagged` on an INDEXED flag (1.12.0), or a
      * caller loop over `arena.flags`, O(capacity)). `reqMask & excMask` != 0
      * matches nothing in production and throws in checked mode (M-13). Checked
      * mode also throws when a SUPPLIED mask is not a 32-bit integer (M-20),
@@ -310,6 +344,10 @@ export class Arena {
      * the word-0 ones (M-20 / M-25; a supplied `undefined` throws). NOMINAL: Hi
      * masks with bit 30 != bit 31 may be heap numbers on pointer-compressed
      * engines; hoist them into locals.
+     *
+     * Indexed driver hint (1.12.0, M-38): on an arena with an indexed word-0 flag, the plan
+     * also carries `driverFlag` / `driverFlagCount` (see {@link JoinNPlan}); the sets,
+     * `driver` and `count` are unchanged.
      *
      * @param required Non-empty; entities must be in ALL of these.
      * @param excluded Entities must be in NONE of these (default: empty).
@@ -377,15 +415,39 @@ export class Arena {
      * -2147483648, the Int32 sign bit). `registerFlags()` and `registerFlags([])`
      * allocate the row and return a frozen `{}`.
      *
+     * Indexed flags (1.12.0, M-37): `{ indexed: ['a', ...] }` INDEXES those flags (a flag
+     * can be indexed ONLY here, at registration). Per indexed flag the arena keeps a column
+     * and a live count, so {@link Arena.flagCount}, {@link Arena.firstFlagged},
+     * {@link Arena.nextFlagged} and {@link Arena.clearFlagAll} work on it. `indexed` is read
+     * as an OWN key only; omitted or `[]` indexes nothing and installs nothing (the arena
+     * is the plain one). On an arena with an indexed flag, `setFlags`, `clearFlags` and
+     * `despawn` are installed as OWN methods, so a subclass override of them is SHADOWED
+     * (M-42; `despawn` still runs the prototype `despawn` last). Write indexed bits only
+     * through the API: a direct `flags[i] |= F.x` on an indexed bit desyncs the column and
+     * the count, which is UNSUPPORTED and undetected, even in checked mode (M-39). Memory:
+     * 135,296 B per indexed flag at capacity 1,048,575 (column 131,072 + two summaries
+     * 4,096 + 128), plus a 128 B count table per word; 0 B when nothing is indexed.
+     *
      * @param names At most 32 distinct non-empty strings PER WORD (`'__proto__'` is allowed).
-     * @param options `undefined` / `null` / a plain object with NO own keys (prototype
-     *   Object.prototype or null).
+     * @param options `undefined` / `null` / a plain object (prototype Object.prototype or
+     *   null) whose only allowed own key is `indexed`, a `readonly string[]` of distinct
+     *   entries of `names`.
+     * @throws Error (R1) `lite-arena: registerFlags options accept only "indexed"; got <key>`
+     *   on any other own key (Symbol and non-enumerable keys too), or on a non-object /
+     *   array options value.
+     * @throws Error (R2) when an own `indexed` is not an array:
+     *   `lite-arena: registerFlags options.indexed must be an array of flag names, got <value>`
+     * @throws Error (R3) when an entry is unknown or repeated (<entry> is the quoted name):
+     *   `lite-arena: registerFlags options.indexed #<j> (<entry>)`
+     *   followed by ` is not one of the names, or a duplicate`
      * @throws Error on a second call (or if a names getter or an options Proxy trap
      *   re-entered it: the OUTER call throws), more than 32 names, a duplicate / empty /
-     *   non-string name, a non-plain options object, or any options key. A throw
-     *   allocates no row (on a re-entry the inner call's row stands).
+     *   non-string name, or a non-plain options object. A throw allocates no row and no
+     *   column (on a re-entry the inner call's row stands).
      */
-    registerFlags(names?: readonly string[], options?: Record<string, never> | null): Readonly<Record<string, number>>;
+    registerFlags(
+        names?: readonly string[], options?: RegisterFlagsOptions | null,
+    ): Readonly<Record<string, number>>;
 
     /**
      * O(1): ORs `mask | 0` into the entity's flag word (0x80000000 works).
@@ -397,13 +459,17 @@ export class Arena {
      * `setFlags(e, 0)` on a live entity is a no-op returning `true`.
      * PRODUCTION fails open on a typo: `F.tpyo` is undefined, `undefined | 0` is 0,
      * so the call is a silent no-op that returns `true`. Checked mode throws instead.
+     * On an arena with an indexed word-0 flag (1.12.0) this is an OWN method that also keeps
+     * the columns and counts in step on a real 0 -> 1 change; a subclass override is
+     * shadowed (M-42).
      * @returns `true` if the entity is alive.
      */
     setFlags(entity: Entity, mask: number): boolean;
 
     /**
      * O(1): clears `mask | 0` in the entity's flag word. Same precondition,
-     * dead-handle and typo behaviour as {@link Arena.setFlags}.
+     * dead-handle and typo behaviour as {@link Arena.setFlags}, including the indexed OWN
+     * method and the M-42 shadowing.
      * @returns `true` if the entity is alive.
      */
     clearFlags(entity: Entity, mask: number): boolean;
@@ -432,14 +498,30 @@ export class Arena {
      * `registerFlags([])` for a Hi-only arena.
      *
      * @param names At most 32 distinct non-empty strings (`'__proto__'` is allowed).
-     * @param options `undefined` / `null` / a plain object with NO own keys.
+     * Indexed flags (1.12.0): `{ indexed: [...] }` indexes Hi flags exactly as
+     * {@link Arena.registerFlags} does for word 0 ({@link Arena.flagCountHi},
+     * {@link Arena.firstFlaggedHi}, {@link Arena.nextFlaggedHi}, {@link Arena.clearFlagAllHi};
+     * own `setFlagsHi`, `clearFlagsHi` and `despawn`; M-42 shadowing applies). The joinN
+     * driver hint reads word-0 flags only, so a Hi-only indexed arena keeps `driverFlag` 0.
+     *
+     * @param names At most 32 distinct non-empty strings (`'__proto__'` is allowed).
+     * @param options `undefined` / `null` / a plain object whose only allowed own key is
+     *   `indexed` (see {@link RegisterFlagsOptions}).
+     * @throws Error (R1) `lite-arena: registerFlagsHi options accept only "indexed"; got <key>`.
+     * @throws Error (R2) when an own `indexed` is not an array:
+     *   `lite-arena: registerFlagsHi options.indexed must be an array of flag names, got <value>`.
+     * @throws Error (R3) when an entry is unknown or repeated (<entry> is the quoted name):
+     *   `lite-arena: registerFlagsHi options.indexed #<j> (<entry>)`
+     *   followed by ` is not one of the names, or a duplicate`
      * @throws Error on a second call (or if a names getter or an options Proxy trap
      *   re-entered it), when `registerFlags()` was not called, more than
-     *   32 names, a duplicate / empty / non-string name, a non-plain options object, or
-     *   any options key. A validation throw allocates no row
+     *   32 names, a duplicate / empty / non-string name, or a non-plain options object.
+     *   A validation throw allocates no row and no column
      *   (on a re-entry the inner call's row stands).
      */
-    registerFlagsHi(names?: readonly string[], options?: Record<string, never> | null): Readonly<Record<string, number>>;
+    registerFlagsHi(
+        names?: readonly string[], options?: RegisterFlagsOptions | null,
+    ): Readonly<Record<string, number>>;
 
     /**
      * O(1): ORs `mask | 0` into the entity's Hi flag word. Twin of {@link Arena.setFlags}
@@ -465,6 +547,73 @@ export class Arena {
      * precondition as {@link Arena.setFlagsHi}.
      */
     hasFlagsHi(entity: Entity, required: number, excluded?: number): boolean;
+    /**
+     * (1.12.0) O(1): the number of live entities carrying the INDEXED word-0 flag `flag`
+     * (a one-bit value from the map `registerFlags(names, { indexed })` returned).
+     * Converts `flag | 0`, then checks it is exactly one indexed bit. Production and
+     * checked mode both check; checked mode first applies the M-18 32-bit-integer check.
+     * @throws Error (E-ROW) when no word-0 flag is indexed:
+     *   `lite-arena: flagCount() needs registerFlags() with { indexed: [...] } first`
+     * @throws Error (E-BIT) `lite-arena: flagCount() needs exactly one indexed flag bit
+     *   (indexed mask 0x<8 hex digits>), got <flag>` for 0, several bits or an unindexed bit.
+     */
+    flagCount(flag: number): number;
+
+    /**
+     * (1.12.0) The handle of the lowest-slot live entity carrying the indexed flag, or -1.
+     * Validates `flag` like {@link Arena.flagCount} (E-ROW / E-BIT, same texts with the
+     * method name `firstFlagged`). The walk, M-39 / M-52:
+     * `for (let e = a.firstFlagged(F.x); e !== -1; e = a.nextFlagged(F.x, e)) { ... }`
+     * Visit cost is about matches + capacity / 1024 summary words, derived from the code,
+     * not timed.
+     */
+    firstFlagged(flag: number): number;
+
+    /**
+     * (1.12.0) HOT: the handle of the next live entity with the indexed flag in a slot
+     * ABOVE `prev`'s slot, or -1 at the end. It continues from the SLOT of `prev` and
+     * ignores its generation (M-39), so despawning or un-flagging `prev` inside the loop is
+     * supported, and a flag set mid-loop on a HIGHER slot is visited (on a lower slot, not).
+     *
+     * Start every walk with `firstFlagged(flag)` and pass only a handle that `firstFlagged`
+     * or `nextFlagged` returned (M-52). PRODUCTION TRUSTS both arguments and does not
+     * validate them: a `flag` that is not exactly one indexed bit is UNSUPPORTED (may throw a TypeError or walk another flag's column), and a
+     * non-integer `prev` (undefined / NaN / null) is UNSUPPORTED and silently resumes after
+     * slot 0, skipping a flagged slot 0. CHECKED mode validates (M-41): the M-18 32-bit
+     * integer check on `flag` and on `prev`, and E-ROW / E-BIT on `flag`.
+     * @throws Error (checked mode only) the E-ROW / E-BIT texts of {@link Arena.flagCount}
+     *   with the method name `nextFlagged`, or the M-18 `must be a 32-bit integer` error
+     *   for a bad `flag` or `prev`.
+     */
+    nextFlagged(flag: number, prev: number): number;
+
+    /**
+     * (1.12.0) O(flagged): clears the indexed flag on every entity carrying it (rows and
+     * column); `flagCount(flag)` is 0 afterwards. Validates `flag` like
+     * {@link Arena.flagCount} (E-ROW / E-BIT, method name `clearFlagAll`).
+     */
+    clearFlagAll(flag: number): void;
+
+    /**
+     * (1.12.0) Hi-word twin of {@link Arena.flagCount} (`registerFlagsHi(names, { indexed })`).
+     * @throws Error (E-ROW) when no Hi flag is indexed:
+     *   `lite-arena: flagCountHi() needs registerFlagsHi() with { indexed: [...] } first`
+     * @throws Error (E-BIT) `lite-arena: flagCountHi() needs exactly one indexed flag bit
+     *   (indexed mask 0x<8 hex digits>), got <flag>`.
+     */
+    flagCountHi(flag: number): number;
+
+    /** (1.12.0) Hi-word twin of {@link Arena.firstFlagged} (E-ROW / E-BIT as `flagCountHi`). */
+    firstFlaggedHi(flag: number): number;
+
+    /**
+     * (1.12.0) HOT: Hi-word twin of {@link Arena.nextFlagged}, same M-39 / M-41 / M-52
+     * contract (production trusts `flag` and `prev`; checked mode validates both).
+     */
+    nextFlaggedHi(flag: number, prev: number): number;
+
+    /** (1.12.0) Hi-word twin of {@link Arena.clearFlagAll} (E-ROW / E-BIT as `flagCountHi`). */
+    clearFlagAllHi(flag: number): void;
 }
 
 export class SparseSet<T extends Record<string, TypedArrayConstructor>> {

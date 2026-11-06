@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+F2: indexed flags (1.12.0). A flag can be registered as indexed, which gives O(1) counts and an
+ascending-slot walk over just the entities that carry it.
+
+### Added
+- Indexed flags (ADR 0011, M-35..M-44): `registerFlags(names, { indexed: [...] })` and
+  `registerFlagsHi(names, { indexed: [...] })` (the same one-time call; unindexed arenas pay 0 B).
+  Eight new methods: `flagCount`, `firstFlagged`, `nextFlagged`, `clearFlagAll` and the Hi twins
+  `flagCountHi`, `firstFlaggedHi`, `nextFlaggedHi`, `clearFlagAllHi`. `firstFlagged` / `nextFlagged`
+  return entity handles, -1 = end; `nextFlagged` continues from prev's slot (M-39).
+- `joinN` plan fields `driverFlag` / `driverFlagCount`: a rare-flag driver hint (the mask and live count of
+  the rarest indexed word-0 required bit, else 0 / -1). The checked plan exposes them via getters; a stale
+  read throws (M-43).
+
+### Changed
+- `registerFlags` / `registerFlagsHi` options error text (M-40): an unknown key now throws
+  `options accept only "indexed"; got <key>` (it was a bare "throws"). `options.indexed` must be an
+  array of flag names; an entry that is not one of the names, or is a duplicate, throws.
+- Indexed arenas install own `setFlags` / `clearFlags` / `despawn` (and Hi twins) at registration (M-42): a
+  subclass override of these is bypassed on an indexed arena. Direct writes to an indexed flag row
+  (`arena.flags[s] |= F.x`) are UNSUPPORTED (M-39).
+- `joinN` bytecode 420 -> 435 B (fixed ceiling 460 unchanged).
+
+### Tests
+- `test/flags-indexed*.test.js`, `test/flags-f2-parity.test.js` (+ goldens), `test/joinN-hint.test.js`,
+  `test/flags-indexed-alloc.test.js` (new-space allocation gate), `test/f2-bench-a.test.js` /
+  `test/f2-bench-b.test.js`, `test/f2-qa-*.test.js`; `test/torture.mjs` Phase N (indexed flags + joinN
+  hint, zero-GC).
+
 ## [1.11.0] - 2026-11-04
 
 F1 + M-33: a second 32-bit flag word (64 flags, Hi API, `joinN` Hi masks), the flag

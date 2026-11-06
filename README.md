@@ -328,20 +328,24 @@ Throws if `maxEntities` is out of range or non-integer.
 |---|---|---|
 | `spawn()` | `Entity` | O(1) allocation. Throws when no slot is free; the message names the cause — full vs. retirement-exhausted — and reports `capacity` / `activeCount` / `retiredCount` inline. |
 | `isAlive(e)` | `boolean` | O(1). Safe on any 32-bit integer; never throws. |
-| `despawn(e)` | `boolean` | O(registered components). Removes from every component; returns false if already dead or if `e` names a free slot (nothing changes). |
+| `despawn(e)` | `boolean` | O(registered components). Removes from every component; returns false if already dead or if `e` names a free slot (nothing changes). On an arena with [indexed flags](#indexed-flags-1120) it also drops the entity from the indexed columns (an own method there, M-42: a subclass `despawn` override is not called). |
 | `remainingCapacity()` | `number` | O(1). Slots still spawnable right now: `capacity - activeCount - retiredCount`. Equals the free-list length, so `activeCount + retiredCount + remainingCapacity() === capacity` always holds. Falls below `capacity - activeCount` once slots retire. |
 | `registerComponent(schema)` | `SparseSet` | Mounts a new SoA component. Schema: `{ key: TypedArrayConstructor }`. **Validated at registration** (a cold path): every field type must be one of the nine numeric TypedArray constructors, or it throws a library error naming the offending key (see [Schema validation](#schema-validation)). |
 | `registerTag()` | `SparseSet` | Zero-size tag component (membership only). `registerComponent({})` with intent. `data` is an empty null-prototype object. |
 | `join(a, b)` | `{ driver, other, count }` | Cold-path join planner. Returns a **reused** scratch with the smaller-count set as `driver`; allocates nothing. Not an iterator — you write the loop. In [checked mode](#checked-mode-development-only) it returns a plan that throws if read after the next `join()`. |
-| `joinN(required, excluded?, reqMask?, excMask?, reqMaskHi?, excMaskHi?)` | `{ driver, count, others, othersCount, excl, exclCount, reqMask, excMask, flags, reqMaskHi, excMaskHi, flagsHi }` | Cold-path **k-way + exclusion** planner: "in every `required` set AND in none of `excluded`". The k-input sibling of `join` (which is untouched). Picks the rarest `required` set as `driver` (ties favour the first); `others`/`excl` are **grow-once reused** scratch arrays — loop to `othersCount`/`exclCount`, never `.length`. Zero-alloc steady-state. Fail-closed: empty/null `required` throws; a set in both lists is empty (throws in checked mode). Optional **flag masks** (1.10.0): `reqMask` bits must all be set and `excMask` bits all clear in the entity's flag word; the plan carries both (normalised `\| 0`) plus `flags` (`arena.flags`, `null` without `registerFlags()`; `reserve()` refreshes the production plan's `flags`, a hoisted row keeps the old one). Optional **Hi masks** (1.11.0, args 5-6): the same test against the second word `arena.flagsHi`; the plan also carries `reqMaskHi` / `excMaskHi` / `flagsHi`. The extra cost is O(1) per call (not zero); with both Hi masks 0 the loop reads no Hi row. See [Entity flags](#entity-flags). |
-| `registerFlags(names?, options?)` | frozen `{ name: bit }` | Cold, once: allocates `arena.flags` and returns name i -> `1 << i`. Throws on a second call, > 32 names (per word), a duplicate / empty / non-string name, or any options key. See [Entity flags](#entity-flags). |
+| `joinN(required, excluded?, reqMask?, excMask?, reqMaskHi?, excMaskHi?)` | `{ driver, count, driverFlag, driverFlagCount, others, othersCount, excl, exclCount, reqMask, excMask, flags, reqMaskHi, excMaskHi, flagsHi }` | Cold-path **k-way + exclusion** planner: "in every `required` set AND in none of `excluded`". The k-input sibling of `join` (which is untouched). Picks the rarest `required` set as `driver` (ties favour the first); `others`/`excl` are **grow-once reused** scratch arrays -- loop to `othersCount`/`exclCount`, never `.length`. Zero-alloc steady-state. Fail-closed: empty/null `required` throws; a set in both lists is empty (throws in checked mode). Optional **flag masks** (1.10.0): `reqMask` bits must all be set and `excMask` bits all clear in the entity's flag word; the plan carries both (normalised `\| 0`) plus `flags` (`arena.flags`, `null` without `registerFlags()`; `reserve()` refreshes the production plan's `flags`, a hoisted row keeps the old one). Optional **Hi masks** (1.11.0, args 5-6): the same test against the second word `arena.flagsHi`; the plan also carries `reqMaskHi` / `excMaskHi` / `flagsHi`. The extra cost is O(1) per call (not zero); with both Hi masks 0 the loop reads no Hi row. **Driver hint (1.12.0):** on an arena with an indexed word-0 flag the plan also carries `driverFlag` (the mask of the rarest indexed required flag that is rarer than the driver set, else `0`) and `driverFlagCount` (that flag's `flagCount`, else `-1`); a non-indexed arena keeps `0` / `-1`. See [Indexed flags](#indexed-flags-1120) and [Entity flags](#entity-flags). |
+| `registerFlags(names?, options?)` | frozen `{ name: bit }` | Cold, once: allocates `arena.flags` and returns name i -> `1 << i`. `options` accepts one key, `indexed` (1.12.0): an array of flag names to [index](#indexed-flags-1120). Throws on a second call, > 32 names (per word), a duplicate / empty / non-string name, a bad `indexed` array, or any other options key. See [Entity flags](#entity-flags). |
 | `setFlags(e, mask)` / `clearFlags(e, mask)` | `boolean` | O(1). Set / clear bits in the entity's flag word; `false` (nothing written) if `e` is dead. |
 | `hasFlags(e, required, excluded = 0)` | `boolean` | O(1). Alive, every `required` bit set, no `excluded` bit set. |
-| `registerFlagsHi(names?, options?)` | frozen `{ name: bit }` | Cold, once (1.11.0, M-26): allocates `arena.flagsHi`, the second 32-name word (64 flags total). Needs `registerFlags()` first (`registerFlags([])` for a Hi-only arena). Same validation as `registerFlags`; a name may appear in both maps. |
+| `registerFlagsHi(names?, options?)` | frozen `{ name: bit }` | Cold, once (1.11.0, M-26): allocates `arena.flagsHi`, the second 32-name word (64 flags total). Needs `registerFlags()` first (`registerFlags([])` for a Hi-only arena). Same validation and the same `{ indexed: [...] }` option as `registerFlags` (1.12.0); a name may appear in both maps. |
 | `setFlagsHi(e, mask)` / `clearFlagsHi(e, mask)` | `boolean` | O(1). Set / clear bits in the entity's Hi flag word; `false` (nothing written) if `e` is dead. |
 | `hasFlagsHi(e, required, excluded = 0)` | `boolean` | O(1). Alive, every `required` Hi bit set, no `excluded` Hi bit set. |
-| `reserve(newCap)` | `boolean` | **Explicit, between-frames capacity growth** — the only way the arena grows. Reallocates every backing buffer (all handles/data preserved); `false` no-op if `newCap <= capacity`. Invalidates hoisted refs — re-read `data.x`, `arena.flags` and `arena.flagsHi` after. |
-| `clear()` | `void` | Resets the arena to empty **without reallocating** — rebuilds the free list, bumps every generation, revives every retired slot, zeroes each component's `count`. O(capacity), allocates nothing. **Every handle minted before `clear()` is invalid afterward.** |
+| `flagCount(flag)` / `flagCountHi(flag)` | `number` | (1.12.0) O(1). Live entities carrying the INDEXED flag. Throws unless `flag` is exactly one indexed bit of that word. See [Indexed flags](#indexed-flags-1120). |
+| `firstFlagged(flag)` / `firstFlaggedHi(flag)` | `Entity` | (1.12.0) The handle of the lowest-slot live entity carrying the indexed flag, or `-1`. Same `flag` validation as `flagCount`. |
+| `nextFlagged(flag, prev)` / `nextFlaggedHi(flag, prev)` | `Entity` | (1.12.0) The next flagged handle above `prev`'s slot, or `-1`. Hot: production trusts `flag` and `prev` (pass only a handle `firstFlagged` / `nextFlagged` returned). Checked mode validates both. |
+| `clearFlagAll(flag)` / `clearFlagAllHi(flag)` | `void` | (1.12.0) O(flagged). Clears the indexed flag on every entity carrying it; `flagCount(flag)` is `0` afterwards. Same `flag` validation as `flagCount`. |
+| `reserve(newCap)` | `boolean` | **Explicit, between-frames capacity growth** -- the only way the arena grows. Reallocates every backing buffer (all handles/data preserved); `false` no-op if `newCap <= capacity`. Invalidates hoisted refs -- re-read `data.x`, `arena.flags` and `arena.flagsHi` after. Indexed columns are grown and their counts kept. |
+| `clear()` | `void` | Resets the arena to empty **without reallocating** -- rebuilds the free list, bumps every generation, revives every retired slot, zeroes each component's `count` (and every indexed column and `flagCount`). O(capacity), allocates nothing. **Every handle minted before `clear()` is invalid afterward.** |
 
 ### `SparseSet<T>` instance members
 
@@ -383,7 +387,7 @@ for (let i = 0, n = Pos.count; i < n; i++) {
 }
 ```
 
-- `registerFlags(names?)` is called once. Name `i` maps to `1 << i`; the 32nd name is `-2147483648` (the Int32 sign bit). `registerFlags()` and `registerFlags([])` allocate the row and return a frozen `{}`. It throws on a second call, more than 32 names, a duplicate, empty or non-string name, a non-plain options object, or any options key. `'__proto__'` is allowed as a name.
+- `registerFlags(names?)` is called once. Name `i` maps to `1 << i`; the 32nd name is `-2147483648` (the Int32 sign bit). `registerFlags()` and `registerFlags([])` allocate the row and return a frozen `{}`. It throws on a second call, more than 32 names, a duplicate, empty or non-string name, a non-plain options object, or an options key other than `indexed`. `'__proto__'` is allowed as a name. `{ indexed: [...] }` (1.12.0) is covered in [Indexed flags](#indexed-flags-1120).
 - Masks are normalised with `| 0`, so `0x80000000` works. `hasFlags(e, 0)` on a live entity is `true`; `setFlags(e, 0)` is a no-op returning `true`.
 - The mask is converted (`mask | 0`; `hasFlags`: required and excluded, each once) BEFORE the alive check. A mask whose `valueOf()` despawns the entity can no longer write a freed slot, and `hasFlags` cannot return `true` for an entity its own mask despawned. A dead handle: `setFlags` / `clearFlags` return `false` and write nothing; `hasFlags` returns `false` (a number, `undefined` or plain-object mask; the object's `valueOf` runs once). A BigInt or Symbol mask throws a `TypeError`, live or dead (a dead handle used to return `false`). Checked mode is unchanged (it rejects non-number masks first). The same holds for the `Hi` twins.
 - `registerFlags()` / `registerFlagsHi()` re-check "already called" after reading `names` / `options`: a `names` getter or an options Proxy trap that re-enters the method makes the OUTER call throw the "already called" error (the inner call's map and row stand).
@@ -400,20 +404,52 @@ arena.setFlagsHi(e, H.boss);
 arena.hasFlagsHi(e, H.boss, H.elite);                        // true
 ```
 
-`joinN` takes flag masks since 1.10.0 (masked-loop example in the `joinN` section below). Rationale and alternatives: [decisions/0010-flags.md](decisions/0010-flags.md).
+`joinN` takes flag masks since 1.10.0 (masked-loop example in the `joinN` section below). Rationale and alternatives: [decisions/0010-flags.md](decisions/0010-flags.md); indexed flags: [decisions/0011-indexed-flags.md](decisions/0011-indexed-flags.md).
+
+### Indexed flags (1.12.0)
+
+Scanning `arena.flags` for a RARE flag costs O(capacity) per pass. Name the flag at registration and the arena keeps a per-flag bit column plus two summary levels and a live count, in step with every write, so you can count it in O(1) and walk only the flagged entities. Opt in per flag, once, in `registerFlags` / `registerFlagsHi`:
+
+```js
+const arena = new Arena(100_000);
+const F = arena.registerFlags(['hot', 'dirty', 'boss'], { indexed: ['boss'] });   // only 'boss' is indexed
+
+const a = arena.spawn(), b = arena.spawn();
+arena.setFlags(a, F.boss | F.hot);
+arena.setFlags(b, F.hot);
+
+arena.flagCount(F.boss);                    // 1: O(1)
+// The walk: start with firstFlagged, then pass only a handle firstFlagged / nextFlagged returned.
+for (let e = arena.firstFlagged(F.boss); e !== -1; e = arena.nextFlagged(F.boss, e)) {
+    // e is a live handle with the boss flag; despawning or un-flagging e here is fine
+}
+arena.clearFlagAll(F.boss);                 // O(flagged); flagCount(F.boss) is 0 afterwards
+```
+
+- **Surface.** `flagCount(flag)`, `firstFlagged(flag)`, `nextFlagged(flag, prev)`, `clearFlagAll(flag)` and the `Hi` twins (`registerFlagsHi(names, { indexed })` indexes second-word flags the same way). Iteration yields entity handles; `-1` ends the walk.
+- **Registration.** `indexed` is the only options key. Unindexed flags cost nothing: an arena with no `indexed` option installs nothing and keeps the prototype methods. Errors are thrown before anything is allocated, with these texts:
+  - an unknown options key: `options accept only "indexed"`
+  - `indexed` not an array: `options.indexed must be an array of flag names`
+  - an entry that is not one of the names, or a repeat: `is not one of the names, or a duplicate`
+- **Bad `flag` argument.** `flagCount`, `firstFlagged` and `clearFlagAll` throw, in production too, unless `flag` is exactly one indexed bit of that word: `needs registerFlags() with { indexed: [...] } first` when the word has no indexed flag at all (`registerFlagsHi()` for the `Hi` twins), else `needs exactly one indexed flag bit`. `nextFlagged` is the hot call and trusts its `flag` in production; checked mode validates it (and `prev`) before running.
+- **The walk contract (M-39 / M-52).** `nextFlagged` continues from `prev`'s SLOT and ignores its generation, so despawning or un-flagging `prev` inside the loop is supported. A flag set mid-loop on a higher slot is visited; on a lower slot it is not. Always start with `firstFlagged(F)` and pass only a handle `firstFlagged` / `nextFlagged` returned. A non-integer `prev` (`undefined`, `NaN`, `null`) is UNSUPPORTED in production: it resumes after slot 0 and silently skips a flagged slot 0. Checked mode throws instead (the M-18 non-32-bit-integer error).
+- **Direct writes are unsupported (M-39).** Write an indexed bit only through `setFlags` / `clearFlags` / `despawn` / `clearFlagAll` (and the `Hi` twins). `arena.flags[s] |= F.boss` or `arena.flagsHi[s] |= ...` on an indexed bit changes the row but not the column, so `flagCount` and the walk disagree with the row; checked mode does not detect it. Unindexed bits in the same word may still be written directly.
+- **Subclass overrides are shadowed (M-42).** On an indexed arena `setFlags`, `clearFlags`, `despawn` (and the `Hi` twins) are own-property installs, so a subclass override of them is NOT called. On a plain arena it is. If you must hook those calls, do not index the arena's flags.
+- **Memory.** One indexed flag allocates 4 x (W + S1 + S2) bytes: the bit column W, and two summary levels S1 and S2. At capacity 1,048,575 that is 135,296 B per indexed flag (W 32,768 + S1 1,024 + S2 32 Int32 words = 131,072 + 4,096 + 128 B). Each word with an indexed bit also holds a 128 B count table; it is absent when no bit is indexed. Unindexed flags: 0 B. `reserve()` grows the columns and keeps the counts; `clear()` zeroes them.
+- **Complexity** (derived from the code, not timed). A walk over a flag with `m` matches reads about `m` + capacity / 1024 summary words, against an O(capacity) row scan, so it pays when the flag is rare; a flag set on most entities is cheaper to test in the row loop above. `flagCount` is a single read; `clearFlagAll` is O(flagged).
+- **Write cost** is bytecode bytes in the function bodies on node v26.8.2 (pins in `test/bytecode-budget.test.js`; no timing is claimed). The indexed bodies are own methods of an indexed arena only: `setFlags` 48 -> 178, `clearFlags` 50 -> 178, `despawn` 215 -> 319 (the `Hi` twins match). A plain arena keeps the byte-identical prototype bodies. For the query side: `nextFlagged` 209 B, `firstFlagged` 215 B, `flagCount` 90 B.
+- **`joinN` driver hint.** On an arena with an indexed word-0 flag, `joinN` writes `plan.driverFlag` / `plan.driverFlagCount` (see the method table): when a required flag is rarer than the driver set, walk that flag instead of `driver.dense`. See the [FAQ](#faq) loop. The plan helper is a cold call under `if (this._ixMask)`; `joinN` is 435 B against the 460 B ceiling. In [checked mode](#checked-mode-development-only) the plan exposes both fields as getters that throw when read after the next `joinN()`.
 
 **Structural comparison** (no timings were measured; these are counts derived from the code):
 
-| | Flags row | One `SparseSet` tag per flag | Column bitset (caller-owned recipe) |
+| | Flags row | One `SparseSet` tag per flag | Indexed flag (1.12.0) |
 |---|---|---|---|
-| Bytes per slot | 4 B per Int32 word: 4 B for 32 flags, 8 B for all 64 (two words; the Hi row exists only if registered) | 8 B per tag (`sparse` Uint32Array + `dense` Int32Array, each `capacity` long) | 1 bit per flag (4 B per 32 flags), in your own `Uint32Array`s |
-| Membership test | `isAlive` + one row read (`hasFlags`), or one read in a hoisted loop | `has(e)` | your own index + mask; no liveness check |
-| Iterate the flagged entities | scan `arena.flags`, O(capacity) | dense list, O(count) | scan your words, O(capacity / 32) words |
-| `joinN` participation | yes (1.10.0: `reqMask` / `excMask`; 1.11.0: `reqMaskHi` / `excMaskHi`) | yes | no |
-| Cleared on despawn | yes (word zeroed) | yes (cascade remove) | no, you must do it |
-| Use when | many boolean states, mostly tested not iterated | the set is small and iterated or joined | you need a bitmap outside the arena |
-
-The column bitset is a sketch, not an API: allocate one `new Uint32Array(Math.ceil(capacity / 32))` per flag; slot `s = e & indexMask` is word `s >>> 5`, bit `1 << (s & 31)`.
+| Bytes per slot | 4 B per Int32 word: 4 B for 32 flags, 8 B for all 64 (two words; the Hi row exists only if registered) | 8 B per tag (`sparse` Uint32Array + `dense` Int32Array, each `capacity` long) | 0 B unindexed; 135,296 B per indexed flag at capacity 1,048,575 (column + summaries), on top of the row |
+| Membership test | `isAlive` + one row read (`hasFlags`), or one read in a hoisted loop | `has(e)` | `flagCount` is O(1); the row test above stays the per-entity check |
+| Iterate the flagged entities | scan `arena.flags`, O(capacity) | dense list, O(count) | `firstFlagged` / `nextFlagged` walk: about matches + capacity / 1024 summary words (derived, not timed) |
+| `joinN` participation | yes (1.10.0: `reqMask` / `excMask`; 1.11.0: `reqMaskHi` / `excMaskHi`) | yes | yes (same row masks, plus the `driverFlag` hint) |
+| Cleared on despawn | yes (word zeroed) | yes (cascade remove) | yes (`despawn` drops the column bit) |
+| Use when | many boolean states, mostly tested not iterated | the set is small and iterated or joined | one flag is rare and you iterate or count it |
 
 ### Entity handle layout
 
@@ -434,7 +470,7 @@ A lying schema used to silently produce a polymorphic `Array` or a boxed `Number
 
 ### Checked mode (development only)
 
-`new Arena(n, { checked: true })` turns on assertions that catch silent API misuse: a stale `join()` plan, a misused `idx()`, and a flag mask (or `joinN` mask) that is not a 32-bit integer (a supplied-but-`undefined` `joinN` mask included). All are **off by default and byte-for-byte zero-cost in production** — the production `join()` scratch, the prototype `idx()` and the prototype flag methods are unaffected by the flag (the checked versions are own properties that shadow them). Turn it on in tests, off in shipping builds.
+`new Arena(n, { checked: true })` turns on assertions that catch silent API misuse: a stale `join()` plan, a misused `idx()`, and a flag mask (or `joinN` mask) that is not a 32-bit integer (a supplied-but-`undefined` `joinN` mask included), and a bad `flag` / `prev` passed to `nextFlagged` / the other indexed-flag methods. All are **off by default and byte-for-byte zero-cost in production** -- the production `join()` scratch, the prototype `idx()` and the prototype flag methods are unaffected by the flag (the checked versions are own properties that shadow them; on an indexed arena they delegate to the installed indexed bodies). Turn it on in tests, off in shipping builds.
 
 ```js
 const arena = new Arena(1000, { checked: true });
@@ -469,6 +505,12 @@ arena.joinN(REQ, EXC, F.tpyo);        // throws: ... must be a 32-bit integer, g
 const keep = arena.joinN(REQ, EXC);
 try { arena.joinN([foreignSet], EXC); } catch (err) { /* expected */ }
 keep.count;                           // still valid
+
+// 6. Indexed flags: nextFlagged validates `flag` (one indexed bit, a 32-bit integer) and `prev`
+//    (a 32-bit integer); production trusts both. The joinN driverFlag / driverFlagCount
+//    getters throw when read after the next joinN().
+//    (F was registered with { indexed: ['boss'] })
+arena.nextFlagged(F.boss, undefined);  // throws here; in production it resumes after slot 0 (M-52)
 ```
 
 In production those same calls take the fast path: `join()` returns the reused scratch, `idx()` returns `sparse[index]` with no checks, and a typo'd flag mask is read as 0. (See [decisions/0004](decisions/0004-retirement-observability-and-clear.md).)
@@ -544,6 +586,7 @@ Runs **409 test cases** (407 pass, 2 skipped without `--expose-gc`, on node v26.
 | Free-slot flag | a free slot's next handle is not alive; census `aliveCount === activeCount`; generation-stream parity (`test/free-slot.test.js`) |
 | Retirement observability | `remainingCapacity()` exactness, exhaustion message names full vs. retired, `clear()` resets + revives + invalidates prior handles |
 | Checked mode | stale `join()` plan throws; `idx()` on dead/non-member throws; non-32-bit-integer flag or `joinN` masks throw, `joinN` `(reqMask & excMask) !== 0` throws; a throwing checked `joinN` leaves earlier plans valid; a non-SparseSet `required` entry gets the foreign-set error; prototype `idx()` untouched |
+| Indexed flags (1.12.0) | oracle suites against a harness row scan (`test/flags-indexed.test.js`, `test/flags-indexed-hi.test.js`, `test/flags-indexed-checked.test.js`); the walk, error texts and M-52 `prev` contract; the new-space allocation gate (`test/flags-indexed-alloc.test.js`: scavenge COUNTS at a pinned 1 MiB semi-space, every lane <= noop + 1 Scavenge, a byte-delta lane and a reserve-retention check); the `joinN` hint (`test/joinN-hint.test.js`); qa boundary matrices (`test/f2-qa-boundary.test.js`, `test/f2-qa-scan-fullcap.test.js`) |
 | Entity flags | register / set / clear / has semantics, 32nd-bit mask, dead handles (`test/flags.test.js`); checked-mode mask validation (`test/flags-checked.test.js`); mask converted before the alive check, re-entrant register (`test/flags-m33.test.js`, 17 tests); qa boundary suite (`test/flags-hi-qa.test.js`, 16 tests) |
 | `remove()` allocation | scavenge-count gate per 500,000 swapping removes: 1-col, 4-col and tag sets <= noop + 1, must-fail control (`test/remove-alloc.test.js`) |
 | `remove()` parity | a seeded 7,000-op trace (reserve, transfer-while-detached, rebind, caller-backed) hashes to the sha256 pinned on e675a64 and matches a plain-JS model (`test/remove-parity.test.js`) |
@@ -561,7 +604,7 @@ Two zero-allocation cases require `--expose-gc`; without it they skip (`node --t
 npm run torture          # node --expose-gc test/torture.mjs
 ```
 
-The unit tests prove behaviour; the torture gate proves the *guarantees*. It prints exactly `ok` on stdout (plus one reported stderr line; exit 0) or fails loudly (non-zero), across thirteen phases: retention (create/dispose 4096 cycles, cross-checked by an external leak tracker), GC budget (`maxMajor: 0` over a 200k-op hot tick), `join` zero-alloc, reserve-then-hot, a handle-space sign-bit sweep, a retirement soak that asserts the conservation law `activeCount + retiredCount + freeListLength === capacity` after every operation (plus a liveness census: `aliveCount === activeCount` at start, after each retirement and after `clear()`), caller-supplied-buffer parity, the transferable detach/rebind round-trip, `joinN` zero-alloc against a brute-force oracle, and lifecycle churn (200,000 spawn/add/despawn on `Arena(4096)`, zero major and zero minor GC; pause reported, not gated), entity flags (528,384 row-read / hasFlags / churn ops at zero GC, counts checked every frame against an independent mirror, retention leg back to 0), masked `joinN` (Phase L: 200,000 `joinN(REQ, EXC, f0|f31, f5)` calls at zero major and zero minor GC, every per-call count equal to a brute-force `hasFlags` oracle; a 4,096-cycle retention leg back to 0, then `reserve(8192)` leaves the old flag row unreachable), and the second flag word (Phase M: 528,384 two-row ops plus 200,000 `joinN(REQ, EXC, f0|f31, f5, h31|h0, h2)` calls at zero major and zero minor GC, counts equal to a mirror oracle; a 4,096-cycle retention leg with the OR of both rows back to 0, then `reserve(8192)` leaves the old Hi row unreachable). Each phase is its own control -- the gate can fail. (`ARENA_TORTURE_LEAK=1 npm run torture` forces the retention phase to leak and exit non-zero; `ARENA_TORTURE_HLEAK=1` and `ARENA_TORTURE_JLEAK=1` do the same for the transfer and `joinN` phases, `ARENA_TORTURE_SLEAK=1` for the churn phase, `ARENA_TORTURE_FLEAK=1` for the flags phase, `ARENA_TORTURE_MLEAK=1` for the masked `joinN` phase, and `ARENA_TORTURE_WLEAK=1` for the two-word phase -- proving the gate bites.)
+The unit tests prove behaviour; the torture gate proves the *guarantees*. It prints exactly `ok` on stdout (plus one reported stderr line; exit 0) or fails loudly (non-zero), across fourteen phases: retention (create/dispose 4096 cycles, cross-checked by an external leak tracker), GC budget (`maxMajor: 0` over a 200k-op hot tick), `join` zero-alloc, reserve-then-hot, a handle-space sign-bit sweep, a retirement soak that asserts the conservation law `activeCount + retiredCount + freeListLength === capacity` after every operation (plus a liveness census: `aliveCount === activeCount` at start, after each retirement and after `clear()`), caller-supplied-buffer parity, the transferable detach/rebind round-trip, `joinN` zero-alloc against a brute-force oracle, and lifecycle churn (200,000 spawn/add/despawn on `Arena(4096)`, zero major and zero minor GC; pause reported, not gated), entity flags (528,384 row-read / hasFlags / churn ops at zero GC, counts checked every frame against an independent mirror, retention leg back to 0), masked `joinN` (Phase L: 200,000 `joinN(REQ, EXC, f0|f31, f5)` calls at zero major and zero minor GC, every per-call count equal to a brute-force `hasFlags` oracle; a 4,096-cycle retention leg back to 0, then `reserve(8192)` leaves the old flag row unreachable), and the second flag word (Phase M: 528,384 two-row ops plus 200,000 `joinN(REQ, EXC, f0|f31, f5, h31|h0, h2)` calls at zero major and zero minor GC, counts equal to a mirror oracle; a 4,096-cycle retention leg with the OR of both rows back to 0, then `reserve(8192)` leaves the old Hi row unreachable), and indexed flags (Phase N, 1.12.0: seeded `setFlags` / `clearFlags` / despawn / `Hi` ops, `clearFlagAll`, `firstFlagged` / `nextFlagged` sweeps and the `joinN` driver hint at zero major and zero minor GC (`RULES_N`: `maxMajor: 0`, `maxMinor: 0`), `reserve()`, `clear()` and checked-mode windows, every `flagCount` and walk equal to an independent mirror of the rows; N6 retention: after 4,096 spawn / flag / despawn cycles the leak tracker's `size()` is `0`). Each phase is its own control -- the gate can fail. (`ARENA_TORTURE_LEAK=1 npm run torture` forces the retention phase to leak and exit non-zero; `ARENA_TORTURE_HLEAK=1` and `ARENA_TORTURE_JLEAK=1` do the same for the transfer and `joinN` phases, `ARENA_TORTURE_SLEAK=1` for the churn phase, `ARENA_TORTURE_FLEAK=1` for the flags phase, `ARENA_TORTURE_MLEAK=1` for the masked `joinN` phase, and `ARENA_TORTURE_WLEAK=1` for the two-word phase, and for Phase N `ARENA_TORTURE_NLEAK=1` (a transient allocation per indexed op), `ARENA_TORTURE_NLEAK=hint` (one per `joinN` hint call) and `ARENA_TORTURE_NDESYNC=1` (a direct row write on an indexed bit, which the column oracle must catch) -- proving the gate bites.)
 
 ### 3. Benchmark — "does it perform as claimed?"
 
@@ -792,7 +835,27 @@ for (let i = 0; i < n; i++) {
 
 The extra `joinN` cost for the Hi masks is O(1) per call (two more `| 0`, one no-row guard, three plan-field stores), not zero; with both Hi masks 0 the loop reads no Hi row. Precedence: empty `required` throws first (M-11); then a non-zero word-0 mask with no flag row (M-10); then a non-zero Hi mask with no Hi row (its own message naming `registerFlagsHi()`). In checked mode the mask type checks (M-20 / M-25) fire before either no-row error. In checked mode the Hi masks are validated like the word-0 ones (32-bit integers, a supplied `undefined` throws, M-20 / M-25). M-13 applies per word: `reqMaskHi & excMaskHi` != 0 matches nothing (throws in checked mode), while a bit shared across the two words (`reqMask` vs `excMaskHi`) is allowed. `reserve()` replaces `arena.flagsHi` too: take a new plan after growing. Nominal: Hi masks with bit 30 != bit 31 may be heap numbers on pointer-compressed engines; hoist them into locals as above (Node cannot measure it).
 
-The driver is still the smallest required **set**; masks never change the plan's sets. `p.flags` is `null` on an arena without `registerFlags()`; a non-zero mask there throws before any state write (M-10), and an empty `required` still throws the required-set error first (M-11). `(reqMask & excMask) !== 0` matches nothing in production and throws in checked mode (M-13). In checked mode a supplied-but-`undefined` mask (a misspelled `F.tpyo`) throws; in production it reads 0 and fails open (M-25). `reserve()` replaces `arena.flags` and refreshes the production plan's `flags` to the new row, but a hoisted `row` (and a checked plan) keeps the pre-reserve row: re-read after growing. There is no flags-only join: a scan with no required set is a caller loop over `arena.flags`, O(capacity) (M-11). Nominal: a mask outside [-2^30, 2^30 - 1] may be a heap number on pointer-compressed engines; hoist it into a local as above (Node cannot measure it).
+The driver is still the smallest required **set**; masks never change the plan's sets. `p.flags` is `null` on an arena without `registerFlags()`; a non-zero mask there throws before any state write (M-10), and an empty `required` still throws the required-set error first (M-11). `(reqMask & excMask) !== 0` matches nothing in production and throws in checked mode (M-13). In checked mode a supplied-but-`undefined` mask (a misspelled `F.tpyo`) throws; in production it reads 0 and fails open (M-25). `reserve()` replaces `arena.flags` and refreshes the production plan's `flags` to the new row, but a hoisted `row` (and a checked plan) keeps the pre-reserve row: re-read after growing. There is no flags-only join: a scan with no required set is a caller loop over `arena.flags`, O(capacity) (M-11); for ONE indexed flag, walk firstFlagged / nextFlagged instead (1.12.0). Nominal: a mask outside [-2^30, 2^30 - 1] may be a heap number on pointer-compressed engines; hoist it into a local as above (Node cannot measure it).
+
+**Indexed driver hint (1.12.0).** If a required flag is indexed and rarer than the driver set, `joinN` reports it: `p.driverFlag` is that flag's mask and `p.driverFlagCount` its `flagCount` (else `0` / `-1`; a non-indexed arena always reads `0` / `-1`). Walk the flag instead of the driver set, and test the driver set and every other condition per entity:
+
+```js
+// F = arena.registerFlags([...], { indexed: [...] }) first; REQ, EXC, mask args as above
+const p = arena.joinN(REQ, EXC, F.rare | F.common, 0);
+if (p.driverFlag !== 0) {
+  const drv = p.driver, oth = p.others, no = p.othersCount, ex = p.excl, nx = p.exclCount;
+  for (let e = arena.firstFlagged(p.driverFlag); e !== -1; e = arena.nextFlagged(p.driverFlag, e)) {
+    if (!drv.has(e)) continue;                    // the walk replaces the dense loop: check the driver set too
+    let ok = true;
+    for (let k = 0; k < no; k++) if (!oth[k].has(e)) { ok = false; break; }
+    if (ok) for (let k = 0; k < nx; k++) if (ex[k].has(e)) { ok = false; break; }
+    if (!ok) continue;
+    // e has every required set and no excluded set, and carries the rare flag (check the other mask bits with hasFlags)
+  }
+} else { /* the plain driver.dense loop above */ }
+```
+
+The hint changes none of the existing plan fields (`driver`, `count` and the rest are as before). It is a hint for rare flags: when no indexed required flag is rarer than the driver set it stays `0` / `-1`. The same walk contract applies (start with `firstFlagged`, pass only a returned handle).
 
 Same discipline as `join`: it plans, you write the loop. The `others`/`excl` arrays are **grow-once reused scratch** — loop to `othersCount`/`exclCount`, never `.length` (a larger prior call can leave a stale tail), and consume before the next `join()`/`joinN()`. `join(a, b)` itself is unchanged.
 
