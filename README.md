@@ -437,10 +437,10 @@ arena.clearFlagAll(F.boss);                 // O(flagged); flagCount(F.boss) is 
 - **Subclass overrides are shadowed (M-42).** On an indexed arena `setFlags`, `clearFlags`, `despawn` (and the `Hi` twins) are own-property installs, so a subclass override of them is NOT called. On a plain arena it is. If you must hook those calls, do not index the arena's flags.
 - **Memory.** One indexed flag allocates 4 x (W + S1 + S2) bytes: the bit column W, and two summary levels S1 and S2. At capacity 1,048,575 that is 135,296 B per indexed flag (W 32,768 + S1 1,024 + S2 32 Int32 words = 131,072 + 4,096 + 128 B). Each word with an indexed bit also holds a 128 B count table; it is absent when no bit is indexed. Unindexed flags: 0 B. `reserve()` grows the columns and keeps the counts; `clear()` zeroes them.
 - **Complexity** (derived from the code, not timed). A walk over a flag with `m` matches reads about `m` + capacity / 1024 summary words, against an O(capacity) row scan, so it pays when the flag is rare; a flag set on most entities is cheaper to test in the row loop above. `flagCount` is a single read; `clearFlagAll` is O(flagged).
-- **Write cost** is bytecode bytes in the function bodies on node v26.8.2 (pins in `test/bytecode-budget.test.js`; no timing is claimed). The indexed bodies are own methods of an indexed arena only: `setFlags` 48 -> 178, `clearFlags` 50 -> 178, `despawn` 215 -> 319 (the `Hi` twins match). A plain arena keeps the byte-identical prototype bodies. For the query side: `nextFlagged` 209 B, `firstFlagged` 215 B, `flagCount` 90 B.
+- **Write cost** is bytecode bytes in the function bodies on node v26.8.2 (pins in `test/bytecode-budget.test.js`; write timings are in the Measured table below). The indexed bodies are own methods of an indexed arena only: `setFlags` 48 -> 178, `clearFlags` 50 -> 178, `despawn` 215 -> 319 (the `Hi` twins match). A plain arena keeps the byte-identical prototype bodies. For the query side: `nextFlagged` 209 B, `firstFlagged` 215 B, `flagCount` 90 B.
 - **`joinN` driver hint.** On an arena with an indexed word-0 flag, `joinN` writes `plan.driverFlag` / `plan.driverFlagCount` (see the method table): when a required flag is rarer than the driver set, walk that flag instead of `driver.dense`. See the [FAQ](#faq) loop. The plan helper is a cold call under `if (this._ixMask)`; `joinN` is 435 B against the 460 B ceiling. In [checked mode](#checked-mode-development-only) the plan exposes both fields as getters that throw when read after the next `joinN()`.
 
-**Structural comparison** (no timings were measured; these are counts derived from the code):
+**Structural comparison** (counts derived from the code, not timed; the measured timings are in the next table):
 
 | | Flags row | One `SparseSet` tag per flag | Indexed flag (1.12.0) |
 |---|---|---|---|
@@ -450,6 +450,21 @@ arena.clearFlagAll(F.boss);                 // O(flagged); flagCount(F.boss) is 
 | `joinN` participation | yes (1.10.0: `reqMask` / `excMask`; 1.11.0: `reqMaskHi` / `excMaskHi`) | yes | yes (same row masks, plus the `driverFlag` hint) |
 | Cleared on despawn | yes (word zeroed) | yes (cascade remove) | yes (`despawn` drops the column bit) |
 | Use when | many boolean states, mostly tested not iterated | the set is small and iterated or joined | one flag is rare and you iterate or count it |
+
+**Measured (one run per lane; [REPORTED, 1 run, 2026-11-06, Node 26.8.2, darwin arm64 12 cores, QUIET host load1 ~2.9, K = 11 interleaved, median of per-round ratios]).**
+
+| What | Plain way | Indexed way | Ratio |
+|---|---|---|---|
+| `setFlags` + `clearFlags` pair, 1 indexed bit (Arena(65,536)) | 1.64 ns/op | 12.57 ns/op | 7.6x (COST) |
+| `setFlags` (4 bits) + `despawn` + `spawn` | 4.57 ns/op | 40.49 ns/op | 9.2x (COST) |
+| count one flag, 1,048,575 live slots, 0.01%-10% | row count 328-774 us | `flagCount` ~0.9 ns | ~1e-6x-3e-6x |
+| clear one flag on all, 0.01% / 0.1% / 1% / 10% | row loop 299 / 303 / 308 / 298 us | `clearFlagAll` 1.09 / 6.66 / 48.1 / 292 us | 0.0035x / 0.022x / 0.15x / 0.98x |
+
+Walk timings are not reported yet (the walk lane's own control failed); the walk cost above is derived from the code.
+
+A call site shared between arena kinds costs the PLAIN arena (Arena(4096), children per config): with one plain and one indexed arena through the same site, `setFlags` + `clearFlags` 4.89x, `setFlags` + `despawn` + `spawn` 1.92x, `joinN` 1.77x; with 6 arena shapes (plain, indexed word 0, Hi-only, both words, checked, checked + indexed) 7.63x / 7.98x / 6.53x. Keep plain and indexed arenas on separate call sites in hot code. A plain arena on 1.12.0 vs 1.11.0 (fe8d7d5): pair 0.999x, churn 1.003x (both within +-5%); `joinN` 1.069x, INCONCLUSIVE (8/11 rounds slower; `joinN` bytecode 420 -> 435 B) [REPORTED, 1 run, 2026-11-06, Node 26.8.2, darwin arm64 12 cores, QUIET host load1 ~2.9, K = 11 interleaved, median].
+
+Inlining A/B (`bench/inline/run.sh`, `bench/f2/inline-indexed/run.sh`, `--runs 3`, TurboFan + Maglev): 1.11.0 vs 1.12.0 plain workload SAME on both tiers (`joinN` still inlines into its caller, 435 B <= 460 B); the 16 indexed bodies A/A SAME; both padded must-fail controls read DIFF [REPORTED, 2026-11-06, Node 26.8.2, darwin arm64 12 cores, QUIET host load1 2.26-3.20].
 
 ### Entity handle layout
 
@@ -571,7 +586,7 @@ Four levels of verification, depending on how deep you want to go.
 npm test
 ```
 
-Runs **409 test cases** (407 pass, 2 skipped without `--expose-gc`, on node v26.8.2, 2026-11-04; other node versions also skip the 5 version-pinned bytecode rows) under `node --test`, covering:
+Runs **548 test cases** (546 pass, 2 skipped without `--expose-gc`, on node v26.8.2, 2026-11-06; other node versions also skip the 5 version-pinned bytecode rows) under `node --test`, covering:
 
 | Group | What's tested |
 |---|---|
@@ -596,7 +611,7 @@ Runs **409 test cases** (407 pass, 2 skipped without `--expose-gc`, on node v26.
 | Tooling gates | the vendored V8 tools' `--self-test` + must-fail script mutants (`test/inlining-budget-diff.test.js`, `test/bytecode-budget.test.js`); hot-method bytecode-length pins on node v26.8.2 and the joinN <= 460 B ceiling |
 | Zero-allocation guarantee | 100k spawn/despawn → < 1 MB heap (requires `--expose-gc`) |
 
-Two zero-allocation cases require `--expose-gc`; without it they skip (`node --test` -> `407 passed, 2 skipped`, or `409 passed` under `node --expose-gc --test`, both on node v26.8.2, 2026-11-04; other node versions also skip the 5 version-pinned bytecode rows). Suitable for CI.
+Two zero-allocation cases require `--expose-gc`; without it they skip (`npm test` (`node --test test/*.test.js`) -> `546 passed, 2 skipped`, or `548 passed` under `node --expose-gc --test test/*.test.js`, both on node v26.8.2, 2026-11-06; other node versions also skip the 5 version-pinned bytecode rows). Suitable for CI.
 
 ### 2. Torture gate — "does zero-GC actually hold under stress?"
 
@@ -632,7 +647,7 @@ A 50,000-particle gravity simulation. Drag to move the gravity well; observe con
 
 | Command | What it does |
 |---|---|
-| `npm test` | Run the unit suite (409 cases: 407 pass, 2 skipped without `--expose-gc`; `npm test` on node v26.8.2, 2026-11-04) under `node --test` |
+| `npm test` | Run the unit suite (548 cases: 546 pass, 2 skipped without `--expose-gc`; `npm test` on node v26.8.2, 2026-11-06) under `node --test` |
 | `npm run test:watch` | Re-run on save |
 | `npm run torture` | Run the zero-GC torture gate (`node --expose-gc test/torture.mjs`) |
 | `npm run bench` | Run the Node benchmark, write `bench/bench-results.json` |

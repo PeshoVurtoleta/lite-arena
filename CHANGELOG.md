@@ -29,11 +29,22 @@ ascending-slot walk over just the entities that carry it.
   (`arena.flags[s] |= F.x`) are UNSUPPORTED (M-39).
 - `joinN` bytecode 420 -> 435 B (fixed ceiling 460 unchanged).
 
+### Measured (REPORTED)
+- Indexed flags, one run per lane [REPORTED, 1 run, 2026-11-06, Node 26.8.2, darwin arm64 12 cores, QUIET host load1 ~2.9, K = 11 interleaved, median]: an indexed set + clear pair 12.6 ns/op vs 1.6 plain
+  (7.6x); 4-bit set + despawn + spawn 40.5 vs 4.6 ns/op (9.2x); `flagCount` ~0.9 ns vs a 0.33-0.77 ms row count at
+  1,048,575 slots; `clearFlagAll` 0.0035x-0.15x a row loop at 0.01-1% density, 0.98x at 10%. Walk timings are not
+  reported.
+- A call site shared by plain and indexed arenas costs the plain arena 1.8-4.9x (2 shapes) and 6.5-8.0x (6 shapes).
+  Plain arenas measured within +-5% of 1.11.0 on set / clear and churn (0.999x / 1.003x); joinN 1.07x INCONCLUSIVE. [REPORTED, 1 run, 2026-11-06, Node 26.8.2, darwin arm64 12 cores, QUIET host load1 ~2.9, K = 11 interleaved, median of per-round ratios]
+- Inlining A/B vs 1.11.0: SAME on TurboFan and Maglev; joinN 435 B (ceiling 460) still inlines into its caller. [REPORTED, 2026-11-06, Node 26.8.2, darwin arm64 12 cores, QUIET host load1 2.26-3.20, --runs 3]
+
 ### Tests
 - `test/flags-indexed*.test.js`, `test/flags-f2-parity.test.js` (+ goldens), `test/joinN-hint.test.js`,
   `test/flags-indexed-alloc.test.js` (new-space allocation gate), `test/f2-bench-a.test.js` /
   `test/f2-bench-b.test.js`, `test/f2-qa-*.test.js`; `test/torture.mjs` Phase N (indexed flags + joinN
   hint, zero-GC).
+- Test counts: 548 tests (546 pass, 2 skipped without `--expose-gc`, node v26.8.2; other node versions also skip
+  the 5 version-pinned bytecode rows).
 
 ## [1.11.0] - 2026-11-04
 

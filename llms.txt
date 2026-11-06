@@ -313,6 +313,9 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
   Direct indexed row writes (`arena.flags[s] |= F.x`) are UNSUPPORTED: the summaries do not see them
   (M-39); use setFlags / clearFlags. On an indexed arena setFlags / clearFlags / despawn are own methods
   installed at registration (M-42; the Hi twins too), so a subclass override of them is bypassed (shadowed).
+- Measured (REPORTED, 1 run, 2026-11-06, Node 26.8.2 darwin arm64 12 cores, QUIET host load1 ~2.9, K = 11 interleaved, median): indexed set+clear ~12.6 ns vs ~1.6 ns plain,
+  flagCount ~0.9 ns (O(1) is derived from the code, not timed); do not share a hot call site between plain and indexed arenas (the plain arena pays
+  1.8-4.9x).
 - The arena NEVER auto-grows. `spawn()` at capacity throws; growth happens only
   through an explicit, between-frames `reserve(newCap)`. `reserve()` reallocates
   every backing buffer (copying live contents; all handles/memberships/dense
