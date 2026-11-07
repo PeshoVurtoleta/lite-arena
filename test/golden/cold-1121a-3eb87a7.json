@@ -1,0 +1,140 @@
+{
+  "registerFlags": {
+    "unknown key": {
+      "threw": "Error: lite-arena: registerFlags options accept only \"indexed\"; got x"
+    },
+    "symbol key": {
+      "threw": "Error: lite-arena: registerFlags options accept only \"indexed\"; got Symbol(s)"
+    },
+    "non-enumerable key": {
+      "threw": "Error: lite-arena: registerFlags options accept only \"indexed\"; got zzz"
+    },
+    "number": {
+      "threw": "Error: lite-arena: registerFlags options accept only \"indexed\"; got number"
+    },
+    "array": {
+      "threw": "Error: lite-arena: registerFlags options accept only \"indexed\"; got object"
+    },
+    "class instance": {
+      "threw": "Error: lite-arena: registerFlags options must be a plain object (prototype Object.prototype or null), got a Opts"
+    }
+  },
+  "registerFlagsHi": {
+    "unknown key": {
+      "threw": "Error: lite-arena: registerFlagsHi options accept only \"indexed\"; got x"
+    },
+    "symbol key": {
+      "threw": "Error: lite-arena: registerFlagsHi options accept only \"indexed\"; got Symbol(s)"
+    },
+    "non-enumerable key": {
+      "threw": "Error: lite-arena: registerFlagsHi options accept only \"indexed\"; got zzz"
+    },
+    "number": {
+      "threw": "Error: lite-arena: registerFlagsHi options accept only \"indexed\"; got number"
+    },
+    "array": {
+      "threw": "Error: lite-arena: registerFlagsHi options accept only \"indexed\"; got object"
+    },
+    "class instance": {
+      "threw": "Error: lite-arena: registerFlagsHi options must be a plain object (prototype Object.prototype or null), got a Opts"
+    }
+  },
+  "validateBuffers": {
+    "missing key": {
+      "threw": "Error: lite-arena: the buffers option is missing a buffer for component field \"y\". Every declared field must get its own buffer -- a partially caller-backed component (some fields shared, some own-allocated) is impossible to debug. Supply a buffer for every field, or omit the buffers option entirely to own-allocate all of them. See decisions/0006-caller-supplied-buffers.md"
+    },
+    "unknown key": {
+      "threw": "Error: lite-arena: the buffers option supplies a buffer for \"z\", which is not a field in the component schema. Every buffer must map to a declared schema field (both directions are checked). Remove it or add the field. See decisions/0006-caller-supplied-buffers.md"
+    },
+    "wrong size": {
+      "threw": "Error: lite-arena: the buffer for component field \"y\" has the wrong byteLength: expected 32 (capacity 8 * 4 bytes/element for Float32Array), got 36. The arena never resizes a caller-supplied buffer, so it must span exactly the arena capacity."
+    },
+    "wrong type": {
+      "threw": "Error: lite-arena: the buffer for component field \"y\" must be an ArrayBuffer or SharedArrayBuffer, got object"
+    },
+    "non-object": {
+      "threw": "Error: lite-arena: the buffers option must be an object mapping each schema field to an ArrayBuffer or SharedArrayBuffer, got number"
+    },
+    "null buffers value": {
+      "threw": "Error: lite-arena: the buffers option must be an object mapping each schema field to an ArrayBuffer or SharedArrayBuffer, got null"
+    },
+    "direct missing key": {
+      "threw": "Error: lite-arena: the buffers option is missing a buffer for component field \"y\". Every declared field must get its own buffer -- a partially caller-backed component (some fields shared, some own-allocated) is impossible to debug. Supply a buffer for every field, or omit the buffers option entirely to own-allocate all of them. See decisions/0006-caller-supplied-buffers.md"
+    },
+    "direct wrong size": {
+      "threw": "Error: lite-arena: the buffer for component field \"y\" has the wrong byteLength: expected 32 (capacity 8 * 4 bytes/element for Float32Array), got 4. The arena never resizes a caller-supplied buffer, so it must span exactly the arena capacity."
+    },
+    "direct non-object": {
+      "threw": "Error: lite-arena: the buffers option must be an object mapping each schema field to an ArrayBuffer or SharedArrayBuffer, got string"
+    }
+  },
+  "rebind": {
+    "empty map": {
+      "threw": "Error: lite-arena: rebind() was given an empty buffers map -- nothing to rebind. Supply the field(s) whose buffers a Worker transferred back, e.g. rebind({ x: returnedBuffer })."
+    },
+    "unknown key": {
+      "threw": "Error: lite-arena: rebind() was given a buffer for \"z\", which is not a field in this component schema. Every buffer must map to a declared field. See decisions/0007-transferable-roundtrip.md"
+    },
+    "wrong size": {
+      "threw": "Error: lite-arena: the buffer for component field \"x\" has the wrong byteLength: expected 32 (capacity 8 * 4 bytes/element for Float32Array), got 28. The arena never resizes a caller-supplied buffer, so it must span exactly the arena capacity."
+    },
+    "wrong type": {
+      "threw": "Error: lite-arena: the buffer for component field \"x\" must be an ArrayBuffer or SharedArrayBuffer, got number"
+    },
+    "non-object": {
+      "threw": "Error: lite-arena: rebind() requires an object mapping one or more component fields to an ArrayBuffer or SharedArrayBuffer, got null"
+    }
+  },
+  "reserveErrors": {
+    "caller-backed": {
+      "threw": "Error: lite-arena: reserve() cannot grow this arena because component #0 (fields: x) is backed by caller-supplied buffers, which the arena never resizes or reassigns. Size caller-backed buffers for the maximum capacity you need up front, or register the component with own-allocation if it must grow. See decisions/0006-caller-supplied-buffers.md"
+    },
+    "detached": {
+      "threw": "Error: lite-arena: reserve() cannot grow this arena because component #0 has a detached field \"x\" -- its backing buffer was transferred to a Worker and not yet rebound. Rebind the returned buffer (comp.rebind({ ... })) before calling reserve(). See decisions/0007-transferable-roundtrip.md"
+    }
+  },
+  "propertyOrder": {
+    "own-allocated": [
+      "arena",
+      "count",
+      "sparse",
+      "dense",
+      "data",
+      "_cols"
+    ],
+    "caller-backed": [
+      "arena",
+      "count",
+      "sparse",
+      "dense",
+      "data",
+      "_cols",
+      "_callerBacked"
+    ],
+    "tag": [
+      "arena",
+      "count",
+      "sparse",
+      "dense",
+      "data",
+      "_cols"
+    ],
+    "checked": [
+      "arena",
+      "count",
+      "sparse",
+      "dense",
+      "data",
+      "_cols",
+      "idx"
+    ]
+  },
+  "reservePlain": {
+    "reserve(16)": true,
+    "capacity after 16": 16,
+    "reserve(8)": false,
+    "reserve(4)": false,
+    "reserve(0)": false,
+    "capacity end": 16
+  }
+}

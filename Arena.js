@@ -169,12 +169,19 @@ function validateBufferTypeAndSize(key, buf, ctor, capacity, hasSAB) {
  * owns the memory"; sharing across a Worker is one reason to want that, and the
  * path is far easier to test with a plain ArrayBuffer.
  *
+ * O-3 / M-61: each field's buffer is read from the map exactly ONCE and returned in
+ * `bufs[]` (aligned with `keys`); the constructor builds its views from that array,
+ * never from `buffers[key]`, so a getter cannot hand back a different value after
+ * validation.
+ *
  * @param {Object<string, Function>} schema - already validated by validateSchema.
+ * @param {string[]} keys - `Object.keys(schema)`, the constructor's own key list.
  * @param {Object<string, ArrayBufferLike>} buffers
  * @param {number} capacity - arena capacity; each buffer must span exactly it.
+ * @returns {ArrayBufferLike[]} the validated buffers, `bufs[i]` for `keys[i]`.
  * @throws {Error} A library error naming the offending key and both byte lengths.
  */
-function validateBuffers(schema, buffers, capacity) {
+function validateBuffers(schema, keys, buffers, capacity) {
     if (buffers === null || typeof buffers !== 'object') {
         throw new Error(
             'lite-arena: the buffers option must be an object mapping each schema field to an ' +
@@ -182,10 +189,11 @@ function validateBuffers(schema, buffers, capacity) {
     }
     const hasSAB = typeof SharedArrayBuffer === 'function';
     // Forward: every declared field needs a valid, exactly-sized buffer.
-    const keys = Object.keys(schema);
+    const bufs = new Array(keys.length);
     for (let i = 0; i < keys.length; i++) {
         const key = keys[i];
-        const buf = buffers[key];
+        // OWN key only: an inherited buffer (a polluted prototype) counts as missing.
+        const buf = Object.hasOwn(buffers, key) ? buffers[key] : undefined;
         if (buf === undefined || buf === null) {
             throw new Error(
                 `lite-arena: the buffers option is missing a buffer for component field "${key}". ` +
@@ -195,6 +203,18 @@ function validateBuffers(schema, buffers, capacity) {
                 'See decisions/0006-caller-supplied-buffers.md');
         }
         validateBufferTypeAndSize(key, buf, schema[key], capacity, hasSAB);
+        // F-4 / M-61: two fields over one buffer would write through each other.
+        // Identity compare against every earlier field (a SharedArrayBuffer is
+        // compared by object, so two wrappers of one memory are not caught).
+        for (let j = 0; j < i; j++) {
+            if (bufs[j] === buf) {
+                throw new Error(
+                    `lite-arena: the buffer for component field "${key}" is already used by field ` +
+                    `"${keys[j]}" -- each field needs its own buffer. ` +
+                    'See decisions/0006-caller-supplied-buffers.md');
+            }
+        }
+        bufs[i] = buf;
     }
     // Reverse: no buffer may target a field the schema does not declare -- a
     // buffer with no home is a typo or a stale key, and dropping it silently is
@@ -210,6 +230,7 @@ function validateBuffers(schema, buffers, capacity) {
                 'See decisions/0006-caller-supplied-buffers.md');
         }
     }
+    return bufs;
 }
 
 /**
@@ -258,38 +279,54 @@ function checkMask(method, which, mask) {
 }
 
 /**
+ * COLD: the options-bag door shared by registerFlags() / registerFlagsHi() (M-9 /
+ * M-17 / M-40) and registerComponent() (M-56). The caller has already ruled out
+ * undefined / null (an omitted bag). Throws unless `options` is an object (not an
+ * array) whose every OWN key -- Symbol and non-enumerable keys too (Reflect.ownKeys)
+ * -- is `allowed`, and whose prototype is Object.prototype or null (a PLAIN object).
+ * Reads no option VALUE: each caller reads its one allowed key itself, once.
+ * `method` names the caller in every message, so the flag methods' wording is
+ * unchanged.
+ * @param {string} method - 'registerFlags', 'registerFlagsHi' or 'registerComponent'.
+ * @param {string} allowed - the one allowed own key ('indexed' or 'buffers').
+ * @param {*} options - the caller's options argument (not undefined / null).
+ * @throws {Error} On a non-object, an array, any other own key, or a non-plain prototype.
+ */
+function checkOptionsBag(method, allowed, options) {
+    let k;
+    if (typeof options !== 'object' || Array.isArray(options)) {
+        k = describeSchemaValue(options);
+    } else {
+        const keys = Reflect.ownKeys(options);
+        for (let i = 0; i < keys.length; i++) {
+            if (keys[i] !== allowed) { k = keys[i]; break; }
+        }
+    }
+    if (k !== undefined) throw new Error(`lite-arena: ${method} options accept only "${allowed}"; got ${String(k)}`);
+    const proto = Object.getPrototypeOf(options);
+    if (proto !== Object.prototype && proto !== null) {
+        const c = Object.getOwnPropertyDescriptor(proto, 'constructor');
+        throw new Error(`lite-arena: ${method} options must be a plain object (prototype ` +
+            `Object.prototype or null), got ${c && typeof c.value === 'function' && c.value.name
+                ? (c.value.name === 'Object' ? 'an Object from another realm' : 'a ' + c.value.name)
+                : 'an object with a custom prototype'}`);
+    }
+}
+
+/**
  * COLD: the validation shared by registerFlags() and registerFlagsHi() (M-7 / M-8 /
  * M-9 / M-17). Throws before the caller allocates anything; returns the NOT yet
  * frozen null-prototype map name i -> `1 << i`. `method` names the caller in every
  * error message, so registerFlags()'s wording is unchanged. M-40: `indexed` is the
  * only allowed options key (any other own key, Symbol / non-enumerable too, throws
- * R1); its VALUE is validated afterwards by ixMaskOf().
+ * R1; checkOptionsBag); its VALUE is validated afterwards by ixMaskOf().
  * @param {string} method - 'registerFlags' or 'registerFlagsHi'.
  * @param {string[]} [names]
  * @param {Object} [options]
  * @returns {Object<string, number>}
  */
 function flagMap(method, names, options) {
-    if (options != null) {
-        let k;
-        if (typeof options !== 'object' || Array.isArray(options)) {
-            k = describeSchemaValue(options);
-        } else {
-            const keys = Reflect.ownKeys(options);
-            for (let i = 0; i < keys.length; i++) {
-                if (keys[i] !== 'indexed') { k = keys[i]; break; }
-            }
-        }
-        if (k !== undefined) throw new Error(`lite-arena: ${method} options accept only "indexed"; got ${String(k)}`);
-        const proto = Object.getPrototypeOf(options);
-        if (proto !== Object.prototype && proto !== null) {
-            const c = Object.getOwnPropertyDescriptor(proto, 'constructor');
-            throw new Error(`lite-arena: ${method} options must be a plain object (prototype ` +
-                `Object.prototype or null), got ${c && typeof c.value === 'function' && c.value.name
-                    ? (c.value.name === 'Object' ? 'an Object from another realm' : 'a ' + c.value.name)
-                    : 'an object with a custom prototype'}`);
-        }
-    }
+    if (options != null) checkOptionsBag(method, 'indexed', options);
     const list = names === undefined ? [] : names;
     if (!Array.isArray(list) || list.length > 32) {
         throw new Error(`lite-arena: ${method} names must be an array of <= 32 strings, got ${
@@ -1132,7 +1169,8 @@ export class Arena {
      * owns -- an `ArrayBuffer` or a `SharedArrayBuffer` -- so a component's
      * payload can live in memory shared with a Worker. When `buffers` is given it
      * must supply one correctly-sized buffer for EVERY schema field and no
-     * others (validated fail-closed in both directions); when omitted, the path
+     * others (validated fail-closed in both directions), each read from the map
+     * once, and no buffer may back two fields; when omitted, the path
      * is byte-identical to own-allocation. The arena never frees, grows, or
      * reassigns a caller-supplied buffer -- see decisions/0006 and note that
      * `reserve()` refuses to grow an arena that has any caller-backed component.
@@ -1144,13 +1182,25 @@ export class Arena {
      * @param {{ buffers?: Object<string, ArrayBufferLike> }} [options] - Optional.
      *   `buffers` maps each schema field to a caller-owned ArrayBuffer /
      *   SharedArrayBuffer of exactly `capacity * BYTES_PER_ELEMENT` bytes.
+     *   M-56: when given (not undefined / null), `options` must be a PLAIN object
+     *   whose only own key is `buffers` (Symbol / non-enumerable keys count);
+     *   `{}` and `{ buffers: undefined }` own-allocate.
      * @returns {SparseSet}
+     * @throws {Error} Non-plain options, an options key other than `buffers`, an
+     *   invalid schema, or an invalid / aliased `buffers` map.
      */
     registerComponent(schema, options) {
-        const buffers = options != null ? options.buffers : undefined;
-        const set = new SparseSet(this.capacity, schema, this, buffers);
-        this.components.push(set);
-        return set;
+        // M-56: a PLAIN options object whose only own key is `buffers` (shared
+        // door with registerFlags; checkOptionsBag). `buffers` is read ONCE here.
+        let buffers;
+        if (options != null) {
+            checkOptionsBag('registerComponent', 'buffers', options);
+            // OWN key only (like ixMaskOf's \`indexed\`): an inherited
+            // Object.prototype.buffers must not make a set caller-backed.
+            if (Object.hasOwn(options, 'buffers')) buffers = options.buffers;
+        }
+        // M-62: the SparseSet constructor registers itself in this.components.
+        return new SparseSet(this.capacity, schema, this, buffers);
     }
 
     /**
@@ -1677,17 +1727,27 @@ export class Arena {
      * smallest honest contract is to forbid the combination; S6 revisits it once
      * a shared epoch exists to signal a re-hoist. See decisions/0006.
      *
+     * M-59: the no-op is decided first. `newCapacity <= capacity` returns false on
+     * EVERY arena -- caller-backed, rebound or detached included -- and only a
+     * real growth request reaches the caller-backed / detached refusals.
+     *
      * @param {number} newCapacity - Target capacity. Must be an integer
      *   <= 1048575 (the 20-bit handle-index ceiling).
      * @returns {boolean} `true` if the arena grew; `false` (a no-op) if
      *   `newCapacity <= capacity`.
-     * @throws {Error} If `newCapacity` is not an integer, exceeds 1048575, or any
-     *   registered component is caller-backed.
+     * @throws {Error} If `newCapacity` is not an integer or exceeds 1048575, or
+     *   (only when `newCapacity > capacity`) any registered component is
+     *   caller-backed or has a detached field.
      */
     reserve(newCapacity) {
         if (!Number.isInteger(newCapacity) || newCapacity > INDEX_MASK) {
             throw new Error(`lite-arena: reserve capacity must be an integer <= ${INDEX_MASK}, got ${newCapacity}`);
         }
+        // Grow-only. Shrinking would strand live entities in dropped slots, so a
+        // request for the same-or-smaller capacity is a defined no-op -- checked
+        // BEFORE the caller-backed / detached scans below (M-59), so a no-op
+        // returns false on every arena instead of throwing.
+        if (newCapacity <= this.capacity) return false;
         // S5 option A: refuse to grow an arena with any caller-backed component --
         // the arena never resizes a buffer it does not own. Cold scan; names the
         // first offending component (registration index + its fields) so the
@@ -1720,9 +1780,6 @@ export class Arena {
                 }
             }
         }
-        // Grow-only. Shrinking would strand live entities in dropped slots, so a
-        // request for the same-or-smaller capacity is a defined no-op.
-        if (newCapacity <= this.capacity) return false;
 
         const oldCapacity = this.capacity;
 
@@ -1856,8 +1913,11 @@ function syncCols(set) {
 export class SparseSet {
     /**
      * Construct a sparse-set-backed component pool. Prefer
-     * `arena.registerComponent(schema)` over calling this directly -- the arena
-     * version also registers the set for automatic cleanup on despawn.
+     * `arena.registerComponent(schema)` over calling this directly; the two are
+     * equivalent except that registerComponent() also validates its options bag.
+     * M-62: either way the set registers itself in `arena.components` (its last
+     * step, after every throw), so reserve() grows it and despawn() / clear()
+     * clean it. A construction that throws registers nothing.
      *
      * @param {number} maxEntities
      * @param {Object<string, Function>} schema
@@ -1865,14 +1925,16 @@ export class SparseSet {
      * @param {Object<string, ArrayBufferLike>} [buffers] - Optional caller-owned
      *   backing buffers, one per schema field (see `Arena.registerComponent`).
      *   When supplied, each `data[key]` views `buffers[key]` instead of a freshly
-     *   allocated array; validated fail-closed in both directions.
+     *   allocated array; validated fail-closed in both directions, each key read
+     *   once, no buffer shared by two fields.
      */
     constructor(maxEntities, schema, arena, buffers) {
         // AR-10: a SparseSet whose capacity does not match its arena's is a trap
-        // -- writes past `sparse.length` are silently discarded and `despawn`
-        // never cleans an unregistered set. Fail closed: require a real arena and
-        // an exactly-matching capacity. `arena.registerComponent()` always passes
-        // `arena.capacity`, so this only ever fires on hand-rolled construction.
+        // -- writes past `sparse.length` are silently discarded. Fail closed:
+        // require a real arena and an exactly-matching capacity.
+        // `arena.registerComponent()` always passes `arena.capacity`, so this
+        // only ever fires on hand-rolled construction. (A direct set is
+        // registered too, M-62: see the last statement of this constructor.)
         if (!(arena instanceof Arena)) {
             throw new Error('lite-arena: SparseSet requires the owning Arena; use arena.registerComponent(schema)');
         }
@@ -1894,7 +1956,9 @@ export class SparseSet {
         // who wrote `{ buffers: someVar }` with `someVar` accidentally null wants
         // a loud error, not a silent private allocation they think is shared.
         const callerBacked = buffers !== undefined;
-        if (callerBacked) validateBuffers(schema, buffers, maxEntities);
+        const keys = Object.keys(schema);
+        // O-3 / M-61: one read per field; the views below are built from bufs[i].
+        const bufs = callerBacked ? validateBuffers(schema, keys, buffers, maxEntities) : null;
 
         this.arena = arena;
         this.count = 0 | 0;
@@ -1930,7 +1994,6 @@ export class SparseSet {
         // dense / data keep their in-object offsets.
         /** @type {ArrayBufferView[]} */
         this._cols = [];
-        const keys = Object.keys(schema);
         for (let i = 0; i < keys.length; i++) {
             const key = keys[i];
             const TypedArrayConstructor = schema[key];
@@ -1938,7 +2001,7 @@ export class SparseSet {
             // builds a length-bounded view [0, maxEntities) over the supplied
             // buffer -- validateBuffers already proved it spans exactly that.
             this.data[key] = callerBacked
-                ? new TypedArrayConstructor(buffers[key], 0, maxEntities)
+                ? new TypedArrayConstructor(bufs[i], 0, maxEntities)
                 : new TypedArrayConstructor(maxEntities);
             this._cols.push(this.data[key]);
         }
@@ -1956,6 +2019,11 @@ export class SparseSet {
         if (arena._checked) {
             this.idx = checkedIdx;
         }
+
+        // M-62: register LAST, after every throw above, so a failed construction
+        // leaves arena.components untouched and a direct `new SparseSet(...)` is
+        // grown by reserve(), cleared by despawn() / clear() like any other set.
+        arena.components.push(this);
     }
 
     /**
@@ -2181,6 +2249,7 @@ export class SparseSet {
         // buffer is read from the map exactly ONCE: a getter cannot hand back a
         // different value after validation.
         const bufs = new Array(keys.length);
+        const dataKeys = Object.keys(this.data);
         for (let i = 0; i < keys.length; i++) {
             const key = keys[i];
             if (!Object.prototype.hasOwnProperty.call(this.data, key)) {
@@ -2194,6 +2263,25 @@ export class SparseSet {
             // The field's TypedArray constructor survives detachment on the view
             // itself, so there is no need to retain the schema separately.
             validateBufferTypeAndSize(key, buf, this.data[key].constructor, capacity, hasSAB);
+            // F-4 / M-61: no buffer may back two fields -- neither another
+            // supplied field nor a field this call leaves in place (its CURRENT
+            // buffer). `keys` is the captured key list; the map is not re-read.
+            let other;
+            for (let j = 0; j < i; j++) {
+                if (bufs[j] === buf) { other = keys[j]; break; }
+            }
+            if (other === undefined) {
+                for (let j = 0; j < dataKeys.length; j++) {
+                    const dk = dataKeys[j];
+                    if (keys.indexOf(dk) < 0 && this.data[dk].buffer === buf) { other = dk; break; }
+                }
+            }
+            if (other !== undefined) {
+                throw new Error(
+                    `lite-arena: rebind() was given a buffer for "${key}" that is already used by field ` +
+                    `"${other}" -- each field needs its own buffer. ` +
+                    'See decisions/0007-transferable-roundtrip.md');
+            }
         }
         // All valid: build a fresh length-bounded view per supplied field. A
         // throw here still leaves data and _cols untouched.
