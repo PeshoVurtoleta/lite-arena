@@ -118,3 +118,82 @@ for (const checked of [false, true]) {
         assert.equal(a.firstFlagged(F.x), h2);
     });
 }
+
+// ---- A7 (M-65 / O-9): bytecode figures in README / llms.txt / CHANGELOG equal the pins ----
+// PINS / IX_PINS come from the TEXT of test/bytecode-budget.test.js (importing it would run its tests).
+// Expected values are the pin tables; the counts below are the figures the 1.12.0 docs state today
+// (the minimum counts below are the checker's own counts, cross-checked once by grep).
+const budgetSrc = readFileSync(new URL('./bytecode-budget.test.js', import.meta.url), 'utf8');
+function parsePinTable(src, name, want) {
+    const m = new RegExp('^const ' + name + ' = \\{([^}]*)\\};', 'm').exec(src);
+    if (m === null) throw new Error('A7: pin table ' + name + ' not found');
+    const o = {};
+    for (const p of m[1].matchAll(/(\w+):\s*(\d+)/g)) o[p[1]] = Number(p[2]);
+    if (Object.keys(o).length !== want) throw new Error('A7: ' + name + ' has ' + Object.keys(o).length + ' entries, want ' + want);
+    return o;
+}
+const A7_PINS = parsePinTable(budgetSrc, 'PINS', 14);
+const A7_IX = parsePinTable(budgetSrc, 'IX_PINS', 14);
+const A7_ALL = { ...A7_PINS, ...A7_IX };
+const A7_CEIL = Number(/^const JOINN_CEILING = (\d+);/m.exec(budgetSrc)?.[1]);
+
+/** Returns { errs, n }: every bytecode figure of `text` checked against the pins; n = figures checked. */
+function checkBytecodeFigures(label, text) {
+    const errs = [];
+    let n = 0;
+    const eq = (what, got, want) => { n++; if (got !== want) errs.push(`${label}: ${what} says ${got}, pin is ${want}`); };
+    // `name` N B  /  joinN N B  (the query bodies and joinN)
+    for (const m of text.matchAll(/(?:`(\w+)`|\b(joinN)\b) (?:is |bytecode )?(\d+) B\b/g)) {
+        const nm = m[1] || m[2];
+        if (!(nm in A7_ALL)) { errs.push(`${label}: "${m[0]}" names no pinned function`); continue; }
+        eq('`' + nm + '`', Number(m[3]), A7_ALL[nm]);
+    }
+    // `name` OLD -> NEW  (plain body -> own indexed body)
+    for (const m of text.matchAll(/`(\w+)` (\d+) -> (\d+)\b(?! B)/g)) {
+        const nm = m[1], ix = 'ix' + nm[0].toUpperCase() + nm.slice(1);
+        if (!(nm in A7_PINS) || !(ix in A7_IX)) { errs.push(`${label}: "${m[0]}" names no pinned pair`); continue; }
+        eq('`' + nm + '` old', Number(m[2]), A7_PINS[nm]);
+        eq('`' + nm + '` new', Number(m[3]), A7_IX[ix]);
+    }
+    // `joinN` bytecode 420 -> 435 B: the new figure is the pin (420 is the 1.11.0 figure, no pin)
+    for (const m of text.matchAll(/joinN`? bytecode (\d+) -> (\d+) B/g)) eq('joinN new', Number(m[2]), A7_PINS.joinN);
+    // 435 B against the 460 B ceiling / 435 B <= 460 B / (ceiling 460)
+    for (const m of text.matchAll(/(\d+) B (?:against the|<=) (\d+) B/g)) {
+        if (Number(m[2]) !== A7_CEIL) continue;          // only the joinN ceiling form
+        eq('joinN vs ceiling', Number(m[1]), A7_PINS.joinN);
+        eq('joinN ceiling', Number(m[2]), A7_CEIL);
+    }
+    for (const m of text.matchAll(/\bjoinN`? <= (\d+) B\b/g)) eq('joinN ceiling', Number(m[1]), A7_CEIL);
+    for (const m of text.matchAll(/\((?:fixed )?ceiling (\d+)\b/g)) eq('joinN ceiling', Number(m[1]), A7_CEIL);
+    return { errs, n };
+}
+const a7Doc = (f) => readFileSync(new URL('../' + f, import.meta.url), 'utf8');
+const a7Changelog = (t) => t.slice(0, t.indexOf('\n## [1.11'));   // 1.12.x sections only; older ones state old figures
+// Minimum figure counts (figures the 1.12.0 docs state today): README 17, llms.txt 2, CHANGELOG 4.
+const A7_DOCS = [['README.md', (t) => t, 17], ['llms.txt', (t) => t, 2], ['CHANGELOG.md', a7Changelog, 4]];
+
+test('A7: pin tables parse (14 + 14 entries, ceiling 460)', () => {
+    assert.equal(Object.keys(A7_ALL).length, 28);
+    assert.match(budgetSrc, new RegExp("despawn: \\d+, joinN: " + A7_PINS.joinN + ","));   // independent re-read of the literal
+    assert.equal(A7_CEIL, 460);
+});
+
+for (const [file, cut, min] of A7_DOCS) {
+    test(`A7: ${file} bytecode figures equal the pins (>= ${min} figures, fail closed)`, () => {
+        const r = checkBytecodeFigures(file, cut(a7Doc(file)));
+        assert.deepEqual(r.errs, []);
+        assert.ok(r.n >= min, `${file}: only ${r.n} bytecode figures found, want >= ${min}`);
+    });
+}
+
+test('A7 control: a README with `nextFlagged` 199 B (pin 209) is detected as a mismatch', () => {
+    const bad = a7Doc('README.md').replace('`nextFlagged` 209 B', '`nextFlagged` 199 B');
+    assert.notEqual(bad, a7Doc('README.md'), 'control did not mutate anything');
+    const r = checkBytecodeFigures('README.md', bad);
+    assert.equal(r.errs.length, 1, r.errs.join('; '));
+    assert.match(r.errs[0], /nextFlagged.*199.*209/);
+});
+
+test('A7 control: text with no bytecode figures yields n = 0 (the minimum-count check would fail it)', () => {
+    assert.equal(checkBytecodeFigures('empty', 'no figures here').n, 0);
+});

@@ -9,11 +9,14 @@
  * lane does not reach the indexed write path).
  *
  * A1 count lanes: per lane 20,000 warm-up ops, a `LANE-START <name>` line, 500,000 ops
- *   (20,000 for walk and clearAll), a `LANE-END <name>` line. The test counts the
+ *   (20,000 for walk), a `LANE-END <name>` line. The test counts the
  *   --trace-gc `Scavenge` and `Mark-Compact` lines between the markers. Lanes: noop,
  *   ixPair1, ixPair4 (f0 f1 f2 f31), hiPair (h0 h31), ixChurn (set + despawn + spawn),
  *   flagCount, firstFlagged, joinNHint (joinN + a driverFlag-driven walk), checkedPair,
- *   walk (first / nextFlagged), clearAll (clearFlagAll + refill), box (must-fail).
+ *   walk (first / nextFlagged), clearAll (clearFlagAll + refill; 500,000 ops), the Hi twins flagCountHi,
+ *   firstFlaggedHi, walkHi (first / nextFlaggedHi), clearAllHi (clearFlagAllHi + refill; walkHi
+ *   and clearAllHi run the full 500,000 ops), box (must-fail). Budget: <= noop + 1 Scavenge = ~2.1 B/op
+ *   at 500,000 ops; only walk (20,000 ops, ~52 B/op) has the coarser resolution.
  *   The pair lanes (ixPair1, ixPair4, checkedPair) prove the indexed write is reached: after
  *   LANE-END, OUTSIDE every window, a reach check runs per bit b of the lane's mask on the
  *   first entity -- setFlags, firstFlagged(b) === it, flagCount(b) === 1, clearFlags,
@@ -57,7 +60,7 @@ if (!ea.includes('--min-semi-space-size=1') || !ea.includes('--max-semi-space-si
 if (typeof v8.GCProfiler !== 'function') fail(2, 'needs v8.GCProfiler (node >= 19.6)');
 
 const COUNT_LANES = ['noop', 'ixPair1', 'ixPair4', 'hiPair', 'ixChurn', 'flagCount', 'firstFlagged', 'joinNHint',
-    'checkedPair', 'walk', 'clearAll', 'box'];
+    'checkedPair', 'walk', 'clearAll', 'flagCountHi', 'firstFlaggedHi', 'walkHi', 'clearAllHi', 'box'];
 const BOX_ENV = process.env.F2NS_BOX;
 const BOX = BOX_ENV === undefined || BOX_ENV === '' ? null : BOX_ENV === '1' ? 'ixPair1' : BOX_ENV;
 if (BOX !== null && (BOX === 'noop' || BOX === 'box' || !COUNT_LANES.includes(BOX))) {
@@ -210,6 +213,53 @@ function mkClearAll() {
     op.check = () => (a.flagCount(1) === r.n ? null : 'clearAll refill count ' + a.flagCount(1));
     return op;
 }
+/** An indexed Hi arena with h0 on every `step`-th slot from `from` (M-65 / O-8: the Hi twins of mkRead). */
+function mkReadHi(cap, step, from) {
+    const a = new Arena(cap);
+    a.registerFlags(NAMES);
+    const H = a.registerFlagsHi(HNAMES, { indexed: ['h0'] });
+    const es = spawnAll(a, cap);
+    let n = 0;
+    for (let i = from; i < cap; i += step) { a.setFlagsHi(es[i], H.h0); n++; }
+    return { a, es, n, h: H.h0 };
+}
+function mkFlagCountHi() {
+    const r = mkReadHi(N, 8, 0), a = r.a, h = r.h;
+    const op = function () { S[0] = (S[0] + a.flagCountHi(h)) | 0; };
+    op.check = () => (a.flagCountHi(h) === r.n ? null : 'flagCountHi drifted');
+    return op;
+}
+function mkFirstHi() {
+    const r = mkReadHi(N, 8, 100), a = r.a, h = r.h;
+    const op = function () { S[0] ^= a.firstFlaggedHi(h); };
+    op.check = () => ((a.firstFlaggedHi(h) & 0xFFFFF) === 100 ? null : 'firstFlaggedHi != slot 100');
+    return op;
+}
+function mkWalkHi() {
+    const r = mkReadHi(4096, 8, 3), a = r.a, h = r.h;
+    const op = function () {
+        let s = 0;
+        for (let e = a.firstFlaggedHi(h); e !== -1; e = a.nextFlaggedHi(h, e)) s = (s + e) | 0;
+        S[0] ^= s;
+    };
+    op.check = () => {
+        let c = 0;
+        for (let e = a.firstFlaggedHi(h); e !== -1; e = a.nextFlaggedHi(h, e)) c++;
+        return c === r.n ? null : 'walkHi count ' + c + ' != ' + r.n;
+    };
+    return op;
+}
+function mkClearAllHi() {
+    const r = mkReadHi(4096, 8, 5), a = r.a, h = r.h;
+    const pick = new Int32Array(r.n);
+    for (let i = 5, k = 0; i < 4096; i += 8) pick[k++] = r.es[i];
+    const op = function () {
+        a.clearFlagAllHi(h);
+        for (let k = 0; k < pick.length; k++) a.setFlagsHi(pick[k], h);
+    };
+    op.check = () => (a.flagCountHi(h) === r.n ? null : 'clearAllHi refill count ' + a.flagCountHi(h));
+    return op;
+}
 const noop = function (i) { S[0] = i; };
 const box = function (i) { HOLD[0] = { a: i }; };
 const boxed = (op) => function (i) { op(i); HOLD[0] = { a: i }; };
@@ -251,7 +301,11 @@ lane('firstFlagged', mkFirst(), OPS);
 lane('joinNHint', mkJoinN(), OPS);
 lane('checkedPair', mkPair({ checked: true }, ['f0'], 1), OPS);
 lane('walk', mkWalk(), WOPS);
-lane('clearAll', mkClearAll(), WOPS);
+lane('clearAll', mkClearAll(), OPS);
+lane('flagCountHi', mkFlagCountHi(), OPS);
+lane('firstFlaggedHi', mkFirstHi(), OPS);
+lane('walkHi', mkWalkHi(), OPS);          // 500,000 ops (not WOPS): 1 Scavenge = 2.1 B/op
+lane('clearAllHi', mkClearAllHi(), OPS);
 lane('box', box, OPS);
 
 // ---------------------------------------------------------------- M-51 byte-delta lanes

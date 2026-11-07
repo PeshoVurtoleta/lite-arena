@@ -5,7 +5,7 @@
  * without them) and reads three things off its stdout:
  *
  * A1 (counts): per lane, the `Scavenge` / `Mark-Compact` lines of --trace-gc between
- *   `LANE-START` / `LANE-END` (500,000 ops; 20,000 for walk and clearAll). Every F2 lane
+ *   `LANE-START` / `LANE-END` (500,000 ops; 20,000 for walk). Every F2 lane
  *   <= noop + 1 Scavenge (~2.1 B/op nominal), 0 Mark-Compact in every window; the box lane
  *   (one {a: i} per op) >= noop + 8 proves the counter sees allocation.
  * M-51 (bytes): new-space used bytes over a GC-free window of 400,000 ops (one ixSetFlags
@@ -42,8 +42,9 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const PROBE = join(ROOT, 'bench/f2/newspace-probe.mjs');
 const FLAGS = ['--expose-gc', '--trace-gc', '--min-semi-space-size=1', '--max-semi-space-size=1'];
 const MARGIN = 16384;
-const F2_LANES = ['ixPair1', 'ixPair4', 'hiPair', 'ixChurn', 'flagCount', 'firstFlagged', 'joinNHint', 'checkedPair', 'walk', 'clearAll'];
-const OPS = { walk: 20000, clearAll: 20000 };
+const F2_LANES = ['ixPair1', 'ixPair4', 'hiPair', 'ixChurn', 'flagCount', 'firstFlagged', 'joinNHint', 'checkedPair', 'walk', 'clearAll',
+    'flagCountHi', 'firstFlaggedHi', 'walkHi', 'clearAllHi'];   // M-65 / O-8: Hi lanes at the word-0 budget
+const OPS = { walk: 20000 };   // every other lane (clearAll, the Hi lanes) runs 500,000 (M-69 / O-8: 20,000 ops cannot see a ~40 B/call mutant)
 const BEFORE_SHA = 'fe8d7d5';
 
 const spawnProbe = (flags, env) => spawnSync(process.execPath, [...flags, PROBE], {
