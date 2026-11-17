@@ -5,7 +5,7 @@ All notable changes to `@zakkster/lite-arena` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.12.1] - 2026-11-17
 
 1.12.1 hardening (cold paths and checked mode; audit 2026-11-06).
 
@@ -51,7 +51,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test/handle-canonical.test.js` (+ `test/golden/handle-canonical-*`). Flipped: `test/flags-checked.test.js`,
   `test/flags-hi-checked.test.js` (a supplied undefined now throws). `test/torture.mjs` Phase A clean variant
   ends with every set empty.
-- Test counts: 586 tests (584 pass, 2 skipped without `--expose-gc`, node v26.8.2, 2026-11-17).
+- New: `test/docs-tier.test.js` (M-64 + M-71, 13 tests): every ms / x figure in README.md and llms.txt carries a tier marker
+  (REPORTED / NOMINAL / illustrative / PRELIMINARY / DETERMINISTIC / derived / arithmetic) in its block, list item or caption,
+  and neither file uses the banned phrasing of M-71, with must-fail controls.
+- Test counts: 599 tests (597 pass, 2 skipped without `--expose-gc`, node v26.8.2, 2026-11-17).
 
 ## [1.12.0] - 2026-11-06
 

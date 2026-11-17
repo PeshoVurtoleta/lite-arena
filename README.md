@@ -596,7 +596,7 @@ Four levels of verification, depending on how deep you want to go.
 npm test
 ```
 
-Runs **586 test cases** (584 pass, 2 skipped without `--expose-gc`, on node v26.8.2, 2026-11-17; other node versions also skip the 5 version-pinned bytecode rows) under `node --test`, covering:
+Runs **599 test cases** (597 pass, 2 skipped without `--expose-gc`, on node v26.8.2, 2026-11-17; other node versions also skip the 5 version-pinned bytecode rows) under `node --test`, covering:
 
 | Group | What's tested |
 |---|---|
@@ -622,7 +622,7 @@ Runs **586 test cases** (584 pass, 2 skipped without `--expose-gc`, on node v26.
 | Tooling gates | the vendored V8 tools' `--self-test` + must-fail script mutants (`test/inlining-budget-diff.test.js`, `test/bytecode-budget.test.js`); hot-method bytecode-length pins on node v26.8.2 and the joinN <= 460 B ceiling |
 | Zero-allocation guarantee | 100k spawn/despawn → < 1 MB heap (requires `--expose-gc`) |
 
-Two zero-allocation cases require `--expose-gc`; without it they skip (`npm test` (`node --test test/*.test.js`) -> `584 passed, 2 skipped`, or `586 passed` under `node --expose-gc --test test/*.test.js`, both on node v26.8.2, 2026-11-17; other node versions also skip the 5 version-pinned bytecode rows). Suitable for CI.
+Two zero-allocation cases require `--expose-gc`; without it they skip (`npm test` (`node --test test/*.test.js`) -> `597 passed, 2 skipped`, or `599 passed` under `node --expose-gc --test test/*.test.js`, both on node v26.8.2, 2026-11-17; other node versions also skip the 5 version-pinned bytecode rows). Suitable for CI.
 
 ### 2. Torture gate — "does zero-GC actually hold under stress?"
 
@@ -658,7 +658,7 @@ A 50,000-particle gravity simulation. Drag to move the gravity well; observe con
 
 | Command | What it does |
 |---|---|
-| `npm test` | Run the unit suite (586 cases: 584 pass, 2 skipped without `--expose-gc`; `npm test` on node v26.8.2, 2026-11-17) under `node --test` |
+| `npm test` | Run the unit suite (599 cases: 597 pass, 2 skipped without `--expose-gc`; `npm test` on node v26.8.2, 2026-11-17) under `node --test` |
 | `npm run test:watch` | Re-run on save |
 | `npm run torture` | Run the zero-GC torture gate (`node --expose-gc test/torture.mjs`) |
 | `npm run bench` | Run the Node benchmark, write `bench/bench-results.json` |
