@@ -252,7 +252,10 @@ function runConfig(ArenaClass, cfg, shapeName, checked, budget, records) {
                     const e = live[pickIdx()], b = BAD[next() % BAD.length], w = next() % 6;
                     res = tryCall(() => (w === 0 ? arena.setFlags(e, b) : w === 1 ? arena.clearFlags(e, b)
                         : w === 2 ? arena.hasFlags(e, b) : w === 3 ? arena.setFlagsHi(e, b)
-                            : w === 4 ? arena.clearFlagsHi(e, b) : arena.hasFlagsHi(e, 0, b)));
+                            : w === 4 ? arena.clearFlagsHi(e, b)
+                                // M-60 / PLAN-1.12.1-B A3: a supplied undefined excluded throws in checked mode
+                                // since 1.12.1, so BAD's undefined calls the 2-arg form (same result on fe8d7d5).
+                                : b === undefined ? arena.hasFlagsHi(e, 0) : arena.hasFlagsHi(e, 0, b)));
                     break;
                 }
                 case 11: case 12: {

@@ -21,11 +21,13 @@
  *     They grow only via an explicit, between-frames `reserve()` call -- never
  *     implicitly, so `spawn()` can never reallocate and invalidate hoisted refs.
  *   - Optional checked mode (`new Arena(n, { checked: true })`): development-only
- *     assertions -- a stale `join()` plan, a misused `idx()` and a flag mask
- *     that is not a 32-bit integer (setFlags / clearFlags / hasFlags) throw
- *     instead of failing silently. OFF and zero-cost in production; the hot paths
- *     (join()'s reused scratch, the prototype `idx()` and the prototype flag
- *     methods) are byte-for-byte identical whether or not it is on.
+ *     assertions -- a stale `join()` plan, a misused `idx()`, a flag mask
+ *     that is not a 32-bit integer (setFlags / clearFlags / hasFlags; a supplied
+ *     undefined excluded mask too) and an entity handle that is not an int32 (a
+ *     `>>> 0` copy) throw instead of failing silently. OFF and zero-cost in
+ *     production; the hot paths (join()'s reused scratch, the prototype `idx()`
+ *     and the prototype flag methods) are byte-for-byte identical whether or not
+ *     it is on.
  *
  * @module @zakkster/lite-arena
  * @author Zahary Shinikchiev
@@ -279,6 +281,36 @@ function checkMask(method, which, mask) {
 }
 
 /**
+ * M-57: CHECKED-mode entity-handle error. A handle is the int32 spawn() returned; a
+ * `>>> 0` / Uint32Array copy of a negative handle (generation >= 2048) passes the
+ * production isAlive (it masks) but never matches a set's Int32Array `dense`, so
+ * has / remove / despawn would fail open on it. Cold: called only from checkedIsAlive
+ * once `(v | 0) !== v` is known; always throws. `v` is described like checkMask's.
+ * @param {*} v - the rejected handle.
+ * @throws {Error} Always.
+ */
+function checkHandle(v) {
+    throw new Error(
+        `lite-arena: an entity handle must be the int32 spawn() returned, got ${
+            typeof v === 'number' ? String(v) : describeSchemaValue(v)} ` +
+        '(a `>>> 0` / Uint32Array copy is unsigned: canonicalize with `h | 0`, or store handles in an ' +
+        'Int32Array). (checked mode; OFF and zero-cost in production.)');
+}
+
+/**
+ * @this {Arena} M-57: the checked isAlive, installed as an OWN property of a checked
+ * arena only. Every entity method reaches isAlive through a property lookup
+ * (`this.isAlive` / `this.arena.isAlive`), so despawn, ixDespawn, the flag methods
+ * and the SparseSet add / has / remove / idx all reject a non-int32 handle (undefined,
+ * NaN, a fraction, a `>>> 0` copy, a string) here, before any state write. An int32
+ * goes to the prototype isAlive (production-exact; a subclass override is honoured).
+ */
+function checkedIsAlive(entity) {
+    if ((entity | 0) !== entity) checkHandle(entity);
+    return Object.getPrototypeOf(this).isAlive.call(this, entity);
+}
+
+/**
  * COLD: the options-bag door shared by registerFlags() / registerFlagsHi() (M-9 /
  * M-17 / M-40) and registerComponent() (M-56). The caller has already ruled out
  * undefined / null (an omitted bag). Throws unless `options` is an object (not an
@@ -386,10 +418,13 @@ function checkedClearFlags(entity, mask) {
     return Object.getPrototypeOf(this).clearFlags.call(this, entity, mask);
 }
 
-/** @this {Arena} `excluded` may be omitted (undefined); any other non-32-bit-integer throws. */
+/**
+ * @this {Arena} `excluded` may be OMITTED; a SUPPLIED one (arguments.length, M-25 -> M-60), a supplied
+ * undefined included, must be a 32-bit integer like every other mask.
+ */
 function checkedHasFlags(entity, required, excluded) {
     checkMask('hasFlags', 'the required', required);
-    if (excluded !== undefined) checkMask('hasFlags', 'the excluded', excluded);
+    if (arguments.length > 2) checkMask('hasFlags', 'the excluded', excluded);
     return Object.getPrototypeOf(this).hasFlags.call(this, entity, required, excluded);
 }
 
@@ -405,10 +440,10 @@ function checkedClearFlagsHi(entity, mask) {
     return Object.getPrototypeOf(this).clearFlagsHi.call(this, entity, mask);
 }
 
-/** @this {Arena} The Hi-word twin of checkedHasFlags (M-26); `excluded` may be omitted. */
+/** @this {Arena} The Hi-word twin of checkedHasFlags (M-26); `excluded` may be omitted, not supplied undefined (M-60). */
 function checkedHasFlagsHi(entity, required, excluded) {
     checkMask('hasFlagsHi', 'the required', required);
-    if (excluded !== undefined) checkMask('hasFlagsHi', 'the excluded', excluded);
+    if (arguments.length > 2) checkMask('hasFlagsHi', 'the excluded', excluded);
     return Object.getPrototypeOf(this).hasFlagsHi.call(this, entity, required, excluded);
 }
 
@@ -856,7 +891,8 @@ export class Arena {
      *   superseded it, `idx()` throws on an entity that is dead or lacks the
      *   component, and `setFlags()` / `clearFlags()` / `hasFlags()` (and their
      *   Hi twins, M-26) throw unless every mask is a 32-bit integer (M-16/M-18; any int32 or uint32,
-     *   so 0x80000000 passes; an omitted `hasFlags` excluded mask is fine).
+     *   so 0x80000000 passes; an omitted `hasFlags` excluded mask is fine, a supplied undefined throws,
+     *   M-60), and every entity method throws on a handle that is not an int32 (M-57: `isAlive` is checked).
      *   Leave it off in shipping builds -- the production hot paths (join()'s
      *   reused scratch, the prototype `idx()` and the prototype flag methods)
      *   are byte-for-byte unaffected by this flag.
@@ -922,8 +958,9 @@ export class Arena {
         // Optional development-mode assertions (AR-09 / AR-11). OFF by default and
         // never consulted on any production hot path. When on: join() hands back a
         // staleness-checked plan, every SparseSet gets a validating idx(), and the
-        // arena gets validating setFlags/clearFlags/hasFlags (M-16) and a joinN that
-        // rejects a supplied non-32-bit-integer mask (M-20), both below.
+        // arena gets validating setFlags/clearFlags/hasFlags (M-16), a joinN that
+        // rejects a supplied non-32-bit-integer mask (M-20) and an isAlive that rejects
+        // a non-int32 handle (M-57), all below.
         this._checked = !!(options && options.checked === true);
 
         // Monotonic version stamp for join() plans, bumped on every checked join()
@@ -963,6 +1000,7 @@ export class Arena {
             this.setFlagsHi = checkedSetFlagsHi;
             this.clearFlagsHi = checkedClearFlagsHi;
             this.hasFlagsHi = checkedHasFlagsHi;
+            this.isAlive = checkedIsAlive;  // M-57: a non-int32 handle throws (checkHandle)
             this.joinN = checkedJoinN;  // M-20 / M-22: validates masks + sets, then delegates
             // F2 queries (S3 / M-41): the M-18 check on `flag` (nextFlagged also E-BIT, and
             // M-18 on `prev`), then the prototype method.
@@ -1077,7 +1115,9 @@ export class Arena {
 
     /**
      * Verifies if a handle points to a living entity.
-     * Safe to call on any 32-bit integer; never throws.
+     * Production: safe to call on any number; never throws (a Symbol / BigInt is the engine's
+     * TypeError in both modes). Checked mode: throws unless `entity` is an int32 (M-57; a
+     * `>>> 0` / Uint32Array copy is rejected).
      * @param {number} entity - The 32-bit handle.
      * @returns {boolean}
      */
@@ -1091,12 +1131,16 @@ export class Arena {
     /**
      * O(registered components) despawn. Removes the entity from all components, invalidates
      * its generation, and returns the slot to the free list.
+     * Canonicalizes a live handle to its int32 form (`entity | 0`) after the isAlive check, so a
+     * `>>> 0` / Uint32Array copy of a negative handle (generation >= 2048) is also removed from every
+     * component, whose `dense` stores the int32 (M-57 / M-68). Checked mode rejects that copy instead.
      * @param {number} entity
      * @returns {boolean} True if successfully despawned, false if already dead
      *   (a free-slot handle is dead: FREE makes isAlive reject it).
      */
     despawn(entity) {
         if (!this.isAlive(entity)) return false;
+        entity |= 0;   // M-68: AFTER the guard (canonicalizing first would let checked despawn accept a >>> 0 copy)
 
         const index = entity & INDEX_MASK;
 
@@ -1195,7 +1239,7 @@ export class Arena {
         let buffers;
         if (options != null) {
             checkOptionsBag('registerComponent', 'buffers', options);
-            // OWN key only (like ixMaskOf's \`indexed\`): an inherited
+            // OWN key only (like ixMaskOf's `indexed`): an inherited
             // Object.prototype.buffers must not make a set caller-backed.
             if (Object.hasOwn(options, 'buffers')) buffers = options.buffers;
         }
@@ -1322,7 +1366,8 @@ export class Arena {
 
     /**
      * O(1): converts `required | 0` and `excluded | 0` first (each once), then: false if dead, else every
-     * `required` bit set and no `excluded` bit (omitted -> 0). Needs registerFlags().
+     * `required` bit set and no `excluded` bit (omitted -> 0). Needs registerFlags(). Checked mode throws
+     * on a non-32-bit-integer mask, a SUPPLIED undefined `excluded` included (M-60).
      */
     hasFlags(entity, required, excluded) {
         const r = required | 0, x = excluded | 0;
@@ -1355,7 +1400,8 @@ export class Arena {
 
     /**
      * O(1): converts `required | 0` and `excluded | 0` first (each once), then: false if dead, else every
-     * `required` Hi bit set and no `excluded` Hi bit (omitted -> 0). Needs registerFlagsHi().
+     * `required` Hi bit set and no `excluded` Hi bit (omitted -> 0). Needs registerFlagsHi(). Checked mode
+     * throws on a non-32-bit-integer mask, a SUPPLIED undefined `excluded` included (M-60).
      */
     hasFlagsHi(entity, required, excluded) {
         const r = required | 0, x = excluded | 0;
@@ -1717,8 +1763,9 @@ export class Arena {
      * is exactly why growth is not implicit: an auto-grow would invalidate those
      * references mid-frame with no call site to blame.
      *
-     * Cold path only: `spawn` / `despawn` / `isAlive` / `idx` bodies are
-     * untouched, and nothing on any hot path ever reaches this method.
+     * Cold path only: reserve() changes no method body (`spawn` / `despawn` /
+     * `isAlive` / `idx` read the replaced buffers through `this`), and nothing on
+     * any hot path ever reaches this method.
      *
      * S5 -- caller-backed components (option A, exclusive): `reserve()` throws if
      * ANY registered component views caller-supplied buffers. Growth reallocates
@@ -2027,7 +2074,9 @@ export class SparseSet {
     }
 
     /**
-     * O(1) membership check. Returns false for dead handles.
+     * O(1) membership check. Returns false for dead handles. Production trusts the
+     * handle (a `>>> 0` copy of a negative handle reads false); checked mode throws
+     * on a non-int32 handle (M-57, the arena's checked isAlive).
      * @param {number} entity
      * @returns {boolean}
      */
@@ -2041,6 +2090,9 @@ export class SparseSet {
     /**
      * O(1) attachment. If the entity is dead, returns -1. If the entity
      * already has this component, returns the existing dense index.
+     * Pass the int32 handle spawn() returned: production trusts it (a `>>> 0`
+     * copy of a negative handle is never found by has(), so a repeat add appends
+     * again); checked mode throws on a non-int32 handle (M-57).
      * @param {number} entity
      * @returns {number} The integer index to read/write into `this.data` arrays,
      *   or -1 if the entity is dead.
@@ -2073,7 +2125,8 @@ export class SparseSet {
      * at indices >= count is undefined; iterate only [0, count).
      *
      * @param {number} entity
-     * @returns {boolean} True if removed, false if not found.
+     * @returns {boolean} True if removed, false if not found (checked mode throws on a
+     *   non-int32 handle, M-57; see has()).
      */
     remove(entity) {
         if (!this.has(entity)) return false;

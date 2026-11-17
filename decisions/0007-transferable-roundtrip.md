@@ -130,3 +130,9 @@ Amendment (2026-10-27, 1.10.0): `rebind()` reads each supplied buffer once,
 validates, and builds every view before re-pointing `data`, then refreshes the
 per-set column cache (`_cols`) that `remove()` walks. Internal invariant: every
 writer of `data[key]` must call `syncCols`.
+
+Amendment (2026-11-17, 1.12.1, M-59 / M-61): `rebind()` rejects a buffer already used by
+another field of the set, whether supplied in the same map or held by a field not being
+rebound, before any view is built (atomicity unchanged). `reserve(n <= capacity)` is a
+`false` no-op even with a detached field; the detached refusal fires only on a real growth
+request.

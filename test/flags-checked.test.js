@@ -29,20 +29,20 @@ test('M-16 checked: non-number mask throws in set/clear/has, row untouched', () 
         assert.throws(() => a.setFlags(e, m), /mask must be/, 'set ' + String(typeof m) + ' ' + String(m));
         assert.throws(() => a.clearFlags(e, m), /mask must be/, 'clear ' + String(typeof m) + ' ' + String(m));
         assert.throws(() => a.hasFlags(e, m), /mask must be/, 'has ' + String(typeof m) + ' ' + String(m));
-        if (m !== undefined) assert.throws(() => a.hasFlags(e, 3, m), /the excluded mask/, 'exc ' + typeof m + ' ' + String(m));
+        assert.throws(() => a.hasFlags(e, 3, m), /the excluded mask/, 'exc ' + typeof m + ' ' + String(m));
     }
     assert.throws(() => a.setFlags(e, 'x'), /mask must be/);
     assert.equal(row(a, e), 3);
 });
 
-test('M-16 checked: omitted or undefined mask (not the optional third arg) throws', () => {
+test('M-16 checked: omitted or undefined mask throws; a SUPPLIED undefined excluded mask throws too (M-60), omitted is fine', () => {
     const a = mk({ checked: true });
     const e = a.spawn();
     a.setFlags(e, 3);
     assert.throws(() => a.hasFlags(e, undefined), /mask must be/);
     assert.throws(() => a.setFlags(e), /mask must be/);
     assert.throws(() => a.clearFlags(e), /mask must be/);
-    assert.equal(a.hasFlags(e, 3, undefined), true);
+    assert.throws(() => a.hasFlags(e, 3, undefined), /the excluded mask must be a 32-bit integer, got undefined/);
     assert.equal(a.hasFlags(e, 3), true);
 });
 

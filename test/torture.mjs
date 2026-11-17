@@ -12,7 +12,11 @@
  *     On dispose the resource is released and the entity despawned. A pass
  *     requires BOTH oracles to return to zero: the arena's own activeCount and
  *     an external lite-leak tracker.size(). Two independent witnesses, so a
- *     bug in one does not hide behind the other.
+ *     bug in one does not hide behind the other. Since 1.12.1 (M-57, audit O-1)
+ *     the three component counts cx / cy / cz.count must also end at 0: the
+ *     handles ride a Uint32Array, so from cycle ~2047 (generation 2048) despawn
+ *     receives a NON-canonical uint handle and must still cascade every remove.
+ *     The 1.12.0 build (180d1268) and 83f754df end with the counts > 0.
  *
  *   Phase B (GC budget) -- pre-spawn to capacity OUTSIDE the loop, then run a
  *     hot tick over dense[0..count) doing typed-array reads/writes only. The
@@ -275,7 +279,10 @@ function phaseA() {
     // slot, or null. Indexed by the raw slot primitive -- never a closure over
     // the entity or its resource.
     const leakHandles = new Array(CAP).fill(null);
-    const live = new Uint32Array(N); // handles spawned this cycle
+    // handles spawned this cycle. Uint32Array ON PURPOSE (1.12.1, M-57 / audit O-1): from
+    // cycle ~2047 its slots hold the non-canonical uint form of a negative handle,
+    // the trigger the component-count oracle below gates. Do not make it Int32Array.
+    const live = new Uint32Array(N);
 
     for (let cycle = 0; cycle < CYCLES; cycle++) {
         for (let i = 0; i < N; i++) {
@@ -309,7 +316,10 @@ function phaseA() {
         }
     }
 
-    return { activeCount: arena.activeCount, trackerSize: tracker.size() };
+    return {
+        activeCount: arena.activeCount, trackerSize: tracker.size(),
+        cxCount: cx.count, cyCount: cy.count, czCount: cz.count,
+    };
 }
 
 // --- Phase B: GC budget ------------------------------------------------------
@@ -2387,7 +2397,8 @@ async function main() {
         ' retention or=' + mR.flagOr + ' orHi=' + mR.flagOrHi +
         ' | phaseN ' + nSummary(nR) + '\n');
 
-    const retentionOk = a.activeCount === 0 && a.trackerSize === 0;
+    const retentionOk = a.activeCount === 0 && a.trackerSize === 0 &&
+        a.cxCount === 0 && a.cyCount === 0 && a.czCount === 0;
     const budgetOk = b.report.ok;
     const joinOk = c.report.ok;
     const reserveOk = d.report.ok;
@@ -2422,7 +2433,9 @@ async function main() {
     if (!retentionOk) {
         process.stderr.write(
             'torture: retention -- activeCount=' + a.activeCount +
-            ' trackerSize=' + a.trackerSize + ' (both must be 0)\n');
+            ' trackerSize=' + a.trackerSize +
+            ' cx.count=' + a.cxCount + ' cy.count=' + a.cyCount + ' cz.count=' + a.czCount +
+            ' (all five must be 0)\n');
     }
     if (!budgetOk) {
         const g = b.summary.gc;

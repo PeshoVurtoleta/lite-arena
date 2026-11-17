@@ -1,0 +1,1103 @@
+{
+  "meta": {
+    "CAP": 16,
+    "OPS": 20000,
+    "SEED": "0x1badb002",
+    "TARGET": [
+      2046,
+      2047,
+      2048,
+      2040,
+      4060,
+      4070,
+      2100,
+      2500,
+      3000,
+      1,
+      2049,
+      2200,
+      3500,
+      2047,
+      2600,
+      2050
+    ]
+  },
+  "G1": {
+    "plain": {
+      "preStream": {
+        "generations": [
+          10239,
+          10240,
+          10241,
+          10233,
+          12253,
+          12263,
+          10293,
+          10693,
+          11193,
+          8195,
+          10242,
+          10393,
+          11693,
+          10240,
+          10793,
+          10243
+        ],
+        "freeWalk": [
+          9,
+          2,
+          11,
+          4,
+          13,
+          6,
+          15,
+          8,
+          1,
+          10,
+          3,
+          12,
+          5,
+          14,
+          7,
+          0
+        ]
+      },
+      "stream": {
+        "ret": "0x404490f8",
+        "kinds": {
+          "spawn": 4006,
+          "add": 2765,
+          "tag": 1763,
+          "setFlags": 1983,
+          "setFlagsHi": 1617,
+          "clear": 988,
+          "remove": 1208,
+          "despawn": 3993,
+          "staleDespawn": 789,
+          "skipped": 888
+        },
+        "negOps": 17648
+      },
+      "state": {
+        "generations": [
+          2316,
+          10502,
+          2312,
+          2346,
+          4096,
+          4096,
+          2409,
+          2773,
+          3291,
+          278,
+          2328,
+          2458,
+          3799,
+          2360,
+          2873,
+          2323
+        ],
+        "freeHead": 1,
+        "freeListRaw": [
+          12,
+          1048575,
+          12,
+          7,
+          9,
+          13,
+          1,
+          13,
+          6,
+          11,
+          1,
+          2,
+          1048575,
+          6,
+          1048575,
+          3
+        ],
+        "freeWalk": [
+          1
+        ],
+        "activeCount": 13,
+        "retiredCount": 2,
+        "remainingCapacity": 1,
+        "flags": [
+          -911457118,
+          0,
+          0,
+          2088782270,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1447324935,
+          0,
+          0,
+          0,
+          0,
+          1056898011,
+          0
+        ],
+        "flagsHi": [
+          1085843124,
+          0,
+          0,
+          1052725183,
+          0,
+          0,
+          0,
+          0,
+          0,
+          -2139723,
+          0,
+          -25169971,
+          0,
+          0,
+          0,
+          78921728
+        ],
+        "C": {
+          "count": 6,
+          "dense": [
+            -1282408434,
+            -1717567477,
+            -1835007997,
+            291504137,
+            -1859125233,
+            -1853882358
+          ],
+          "sparse": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5
+          ]
+        },
+        "Cx": [
+          19994,
+          19961,
+          19953,
+          19971,
+          19991,
+          19995
+        ],
+        "T": {
+          "count": 5,
+          "dense": [
+            -1859125233,
+            -1866465280,
+            -1835007997,
+            -1717567477,
+            -311427060
+          ],
+          "sparse": [
+            0,
+            1,
+            2,
+            3,
+            4
+          ]
+        }
+      }
+    },
+    "indexed": {
+      "preStream": {
+        "generations": [
+          10239,
+          10240,
+          10241,
+          10233,
+          12253,
+          12263,
+          10293,
+          10693,
+          11193,
+          8195,
+          10242,
+          10393,
+          11693,
+          10240,
+          10793,
+          10243
+        ],
+        "freeWalk": [
+          9,
+          2,
+          11,
+          4,
+          13,
+          6,
+          15,
+          8,
+          1,
+          10,
+          3,
+          12,
+          5,
+          14,
+          7,
+          0
+        ]
+      },
+      "stream": {
+        "ret": "0x404490f8",
+        "kinds": {
+          "spawn": 4006,
+          "add": 2765,
+          "tag": 1763,
+          "setFlags": 1983,
+          "setFlagsHi": 1617,
+          "clear": 988,
+          "remove": 1208,
+          "despawn": 3993,
+          "staleDespawn": 789,
+          "skipped": 888
+        },
+        "negOps": 17648
+      },
+      "state": {
+        "generations": [
+          2316,
+          10502,
+          2312,
+          2346,
+          4096,
+          4096,
+          2409,
+          2773,
+          3291,
+          278,
+          2328,
+          2458,
+          3799,
+          2360,
+          2873,
+          2323
+        ],
+        "freeHead": 1,
+        "freeListRaw": [
+          12,
+          1048575,
+          12,
+          7,
+          9,
+          13,
+          1,
+          13,
+          6,
+          11,
+          1,
+          2,
+          1048575,
+          6,
+          1048575,
+          3
+        ],
+        "freeWalk": [
+          1
+        ],
+        "activeCount": 13,
+        "retiredCount": 2,
+        "remainingCapacity": 1,
+        "flags": [
+          -911457118,
+          0,
+          0,
+          2088782270,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1447324935,
+          0,
+          0,
+          0,
+          0,
+          1056898011,
+          0
+        ],
+        "flagsHi": [
+          1085843124,
+          0,
+          0,
+          1052725183,
+          0,
+          0,
+          0,
+          0,
+          0,
+          -2139723,
+          0,
+          -25169971,
+          0,
+          0,
+          0,
+          78921728
+        ],
+        "C": {
+          "count": 6,
+          "dense": [
+            -1282408434,
+            -1717567477,
+            -1835007997,
+            291504137,
+            -1859125233,
+            -1853882358
+          ],
+          "sparse": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5
+          ]
+        },
+        "Cx": [
+          19994,
+          19961,
+          19953,
+          19971,
+          19991,
+          19995
+        ],
+        "T": {
+          "count": 5,
+          "dense": [
+            -1859125233,
+            -1866465280,
+            -1835007997,
+            -1717567477,
+            -311427060
+          ],
+          "sparse": [
+            0,
+            1,
+            2,
+            3,
+            4
+          ]
+        },
+        "ix": {
+          "f0": {
+            "count": 2,
+            "walk": [
+              291504137,
+              -1282408434
+            ]
+          },
+          "f5": {
+            "count": 2,
+            "walk": [
+              -1866465280,
+              -1835007997
+            ]
+          },
+          "f31": {
+            "count": 1,
+            "walk": [
+              -1866465280
+            ]
+          }
+        },
+        "ixHi": {
+          "h1": {
+            "count": 1,
+            "walk": [
+              -1835007997
+            ]
+          },
+          "h17": {
+            "count": 3,
+            "walk": [
+              -1835007997,
+              291504137,
+              -1717567477
+            ]
+          },
+          "h31": {
+            "count": 2,
+            "walk": [
+              291504137,
+              -1717567477
+            ]
+          }
+        }
+      }
+    }
+  },
+  "G2": {
+    "plain": {
+      "preStream": {
+        "generations": [
+          10239,
+          10240,
+          10241,
+          10233,
+          12253,
+          12263,
+          10293,
+          10693,
+          11193,
+          8195,
+          10242,
+          10393,
+          11693,
+          10240,
+          10793,
+          10243
+        ],
+        "freeWalk": [
+          9,
+          2,
+          11,
+          4,
+          13,
+          6,
+          15,
+          8,
+          1,
+          10,
+          3,
+          12,
+          5,
+          14,
+          7,
+          0
+        ]
+      },
+      "stream": {
+        "ret": "0x404490f8",
+        "kinds": {
+          "spawn": 4006,
+          "add": 2765,
+          "tag": 1763,
+          "setFlags": 1983,
+          "setFlagsHi": 1617,
+          "clear": 988,
+          "remove": 1208,
+          "despawn": 3993,
+          "staleDespawn": 789,
+          "skipped": 888
+        },
+        "negOps": 17648,
+        "hasCalls": {
+          "hash": "0x21a041c6",
+          "trueCount": 18516,
+          "falseCount": 57692,
+          "first32": [
+            0,
+            8,
+            2,
+            0,
+            8,
+            0,
+            8,
+            0,
+            0,
+            10,
+            0,
+            8,
+            8,
+            0,
+            10,
+            10,
+            0,
+            9,
+            0,
+            8,
+            0,
+            0,
+            8,
+            8,
+            8,
+            10,
+            0,
+            0,
+            8,
+            8,
+            0,
+            8
+          ]
+        }
+      },
+      "state": {
+        "generations": [
+          2316,
+          10502,
+          2312,
+          2346,
+          4096,
+          4096,
+          2409,
+          2773,
+          3291,
+          278,
+          2328,
+          2458,
+          3799,
+          2360,
+          2873,
+          2323
+        ],
+        "freeHead": 1,
+        "freeListRaw": [
+          12,
+          1048575,
+          12,
+          7,
+          9,
+          13,
+          1,
+          13,
+          6,
+          11,
+          1,
+          2,
+          1048575,
+          6,
+          1048575,
+          3
+        ],
+        "freeWalk": [
+          1
+        ],
+        "activeCount": 13,
+        "retiredCount": 2,
+        "remainingCapacity": 1,
+        "flags": [
+          -911457118,
+          0,
+          0,
+          2088782270,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1447324935,
+          0,
+          0,
+          0,
+          0,
+          1056898011,
+          0
+        ],
+        "flagsHi": [
+          1085843124,
+          0,
+          0,
+          1052725183,
+          0,
+          0,
+          0,
+          0,
+          0,
+          -2139723,
+          0,
+          -25169971,
+          0,
+          0,
+          0,
+          78921728
+        ],
+        "C": {
+          "count": 6,
+          "dense": [
+            -1282408434,
+            -1717567477,
+            -1835007997,
+            291504137,
+            -1859125233,
+            -1853882358
+          ],
+          "sparse": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5
+          ]
+        },
+        "Cx": [
+          19994,
+          19961,
+          19953,
+          19971,
+          19991,
+          19995
+        ],
+        "T": {
+          "count": 5,
+          "dense": [
+            -1859125233,
+            -1866465280,
+            -1835007997,
+            -1717567477,
+            -311427060
+          ],
+          "sparse": [
+            0,
+            1,
+            2,
+            3,
+            4
+          ]
+        }
+      }
+    },
+    "indexed": {
+      "preStream": {
+        "generations": [
+          10239,
+          10240,
+          10241,
+          10233,
+          12253,
+          12263,
+          10293,
+          10693,
+          11193,
+          8195,
+          10242,
+          10393,
+          11693,
+          10240,
+          10793,
+          10243
+        ],
+        "freeWalk": [
+          9,
+          2,
+          11,
+          4,
+          13,
+          6,
+          15,
+          8,
+          1,
+          10,
+          3,
+          12,
+          5,
+          14,
+          7,
+          0
+        ]
+      },
+      "stream": {
+        "ret": "0x404490f8",
+        "kinds": {
+          "spawn": 4006,
+          "add": 2765,
+          "tag": 1763,
+          "setFlags": 1983,
+          "setFlagsHi": 1617,
+          "clear": 988,
+          "remove": 1208,
+          "despawn": 3993,
+          "staleDespawn": 789,
+          "skipped": 888
+        },
+        "negOps": 17648,
+        "hasCalls": {
+          "hash": "0x21a041c6",
+          "trueCount": 18516,
+          "falseCount": 57692,
+          "first32": [
+            0,
+            8,
+            2,
+            0,
+            8,
+            0,
+            8,
+            0,
+            0,
+            10,
+            0,
+            8,
+            8,
+            0,
+            10,
+            10,
+            0,
+            9,
+            0,
+            8,
+            0,
+            0,
+            8,
+            8,
+            8,
+            10,
+            0,
+            0,
+            8,
+            8,
+            0,
+            8
+          ]
+        }
+      },
+      "state": {
+        "generations": [
+          2316,
+          10502,
+          2312,
+          2346,
+          4096,
+          4096,
+          2409,
+          2773,
+          3291,
+          278,
+          2328,
+          2458,
+          3799,
+          2360,
+          2873,
+          2323
+        ],
+        "freeHead": 1,
+        "freeListRaw": [
+          12,
+          1048575,
+          12,
+          7,
+          9,
+          13,
+          1,
+          13,
+          6,
+          11,
+          1,
+          2,
+          1048575,
+          6,
+          1048575,
+          3
+        ],
+        "freeWalk": [
+          1
+        ],
+        "activeCount": 13,
+        "retiredCount": 2,
+        "remainingCapacity": 1,
+        "flags": [
+          -911457118,
+          0,
+          0,
+          2088782270,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1447324935,
+          0,
+          0,
+          0,
+          0,
+          1056898011,
+          0
+        ],
+        "flagsHi": [
+          1085843124,
+          0,
+          0,
+          1052725183,
+          0,
+          0,
+          0,
+          0,
+          0,
+          -2139723,
+          0,
+          -25169971,
+          0,
+          0,
+          0,
+          78921728
+        ],
+        "C": {
+          "count": 6,
+          "dense": [
+            -1282408434,
+            -1717567477,
+            -1835007997,
+            291504137,
+            -1859125233,
+            -1853882358
+          ],
+          "sparse": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5
+          ]
+        },
+        "Cx": [
+          19994,
+          19961,
+          19953,
+          19971,
+          19991,
+          19995
+        ],
+        "T": {
+          "count": 5,
+          "dense": [
+            -1859125233,
+            -1866465280,
+            -1835007997,
+            -1717567477,
+            -311427060
+          ],
+          "sparse": [
+            0,
+            1,
+            2,
+            3,
+            4
+          ]
+        },
+        "ix": {
+          "f0": {
+            "count": 2,
+            "walk": [
+              291504137,
+              -1282408434
+            ]
+          },
+          "f5": {
+            "count": 2,
+            "walk": [
+              -1866465280,
+              -1835007997
+            ]
+          },
+          "f31": {
+            "count": 1,
+            "walk": [
+              -1866465280
+            ]
+          }
+        },
+        "ixHi": {
+          "h1": {
+            "count": 1,
+            "walk": [
+              -1835007997
+            ]
+          },
+          "h17": {
+            "count": 3,
+            "walk": [
+              -1835007997,
+              291504137,
+              -1717567477
+            ]
+          },
+          "h31": {
+            "count": 2,
+            "walk": [
+              291504137,
+              -1717567477
+            ]
+          }
+        }
+      }
+    },
+    "invalid": {
+      "setFlags(neg, undefined)": {
+        "threw": "Error: lite-arena: setFlags() the mask must be a 32-bit integer, got undefined (a misspelled flag name reads undefined). (checked mode; OFF and zero-cost in production.)"
+      },
+      "setFlags(neg, 1.5)": {
+        "threw": "Error: lite-arena: setFlags() the mask must be a 32-bit integer, got 1.5 (a misspelled flag name reads undefined). (checked mode; OFF and zero-cost in production.)"
+      },
+      "setFlags(p, NaN)": {
+        "threw": "Error: lite-arena: setFlags() the mask must be a 32-bit integer, got NaN (a misspelled flag name reads undefined). (checked mode; OFF and zero-cost in production.)"
+      },
+      "setFlags(p, \"1\")": {
+        "threw": "Error: lite-arena: setFlags() the mask must be a 32-bit integer, got string (a misspelled flag name reads undefined). (checked mode; OFF and zero-cost in production.)"
+      },
+      "setFlags(p, 2**32)": {
+        "threw": "Error: lite-arena: setFlags() the mask must be a 32-bit integer, got 4294967296 (a misspelled flag name reads undefined). (checked mode; OFF and zero-cost in production.)"
+      },
+      "clearFlags(neg, {})": {
+        "threw": "Error: lite-arena: clearFlags() the mask must be a 32-bit integer, got object (a misspelled flag name reads undefined). (checked mode; OFF and zero-cost in production.)"
+      },
+      "clearFlags(p, -Infinity)": {
+        "threw": "Error: lite-arena: clearFlags() the mask must be a 32-bit integer, got -Infinity (a misspelled flag name reads undefined). (checked mode; OFF and zero-cost in production.)"
+      },
+      "hasFlags(neg, undefined)": {
+        "threw": "Error: lite-arena: hasFlags() the required mask must be a 32-bit integer, got undefined (a misspelled flag name reads undefined). (checked mode; OFF and zero-cost in production.)"
+      },
+      "hasFlags(p)": {
+        "threw": "Error: lite-arena: hasFlags() the required mask must be a 32-bit integer, got undefined (a misspelled flag name reads undefined). (checked mode; OFF and zero-cost in production.)"
+      },
+      "hasFlags(neg, 1, 1.5)": {
+        "threw": "Error: lite-arena: hasFlags() the excluded mask must be a 32-bit integer, got 1.5 (a misspelled flag name reads undefined). (checked mode; OFF and zero-cost in production.)"
+      },
+      "hasFlags(p, 1, null)": {
+        "threw": "Error: lite-arena: hasFlags() the excluded mask must be a 32-bit integer, got null (a misspelled flag name reads undefined). (checked mode; OFF and zero-cost in production.)"
+      },
+      "hasFlags(p, 1, \"x\")": {
+        "threw": "Error: lite-arena: hasFlags() the excluded mask must be a 32-bit integer, got string (a misspelled flag name reads undefined). (checked mode; OFF and zero-cost in production.)"
+      },
+      "setFlagsHi(neg, -0.5)": {
+        "threw": "Error: lite-arena: setFlagsHi() the mask must be a 32-bit integer, got -0.5 (a misspelled flag name reads undefined). (checked mode; OFF and zero-cost in production.)"
+      },
+      "clearFlagsHi(p, Infinity)": {
+        "threw": "Error: lite-arena: clearFlagsHi() the mask must be a 32-bit integer, got Infinity (a misspelled flag name reads undefined). (checked mode; OFF and zero-cost in production.)"
+      },
+      "hasFlagsHi(neg, NaN)": {
+        "threw": "Error: lite-arena: hasFlagsHi() the required mask must be a 32-bit integer, got NaN (a misspelled flag name reads undefined). (checked mode; OFF and zero-cost in production.)"
+      },
+      "hasFlagsHi(p, 1, \"x\")": {
+        "threw": "Error: lite-arena: hasFlagsHi() the excluded mask must be a 32-bit integer, got string (a misspelled flag name reads undefined). (checked mode; OFF and zero-cost in production.)"
+      },
+      "hasFlagsHi(neg, 1, 2**33)": {
+        "threw": "Error: lite-arena: hasFlagsHi() the excluded mask must be a 32-bit integer, got 8589934592 (a misspelled flag name reads undefined). (checked mode; OFF and zero-cost in production.)"
+      },
+      "flagCount(3)": {
+        "threw": "Error: lite-arena: flagCount() needs exactly one indexed flag bit (indexed mask 0x80000021), got 3"
+      },
+      "flagCount(F.f1) non-indexed": {
+        "threw": "Error: lite-arena: flagCount() needs exactly one indexed flag bit (indexed mask 0x80000021), got 2"
+      },
+      "flagCount(undefined)": {
+        "threw": "Error: lite-arena: flagCount() the flag mask must be a 32-bit integer, got undefined (a misspelled flag name reads undefined). (checked mode; OFF and zero-cost in production.)"
+      },
+      "firstFlagged(0)": {
+        "threw": "Error: lite-arena: firstFlagged() needs exactly one indexed flag bit (indexed mask 0x80000021), got 0"
+      },
+      "nextFlagged(F.f0, 1.5)": {
+        "threw": "Error: lite-arena: nextFlagged() the prev mask must be a 32-bit integer, got 1.5 (a misspelled flag name reads undefined). (checked mode; OFF and zero-cost in production.)"
+      },
+      "nextFlagged(F.f1, neg)": {
+        "threw": "Error: lite-arena: nextFlagged() needs exactly one indexed flag bit (indexed mask 0x80000021), got 2"
+      },
+      "flagCountHi(H.h0) non-indexed": {
+        "threw": "Error: lite-arena: flagCountHi() needs exactly one indexed flag bit (indexed mask 0x80020002), got 1"
+      },
+      "nextFlaggedHi(H.h1, \"p\")": {
+        "threw": "Error: lite-arena: nextFlaggedHi() the prev mask must be a 32-bit integer, got string (a misspelled flag name reads undefined). (checked mode; OFF and zero-cost in production.)"
+      },
+      "C.idx(neg) non-member": {
+        "threw": "Error: lite-arena: idx() in checked mode was called on an entity that is dead or does not hold this component. idx() is an UNCHECKED fast path -- guard it with has(), or iterate dense[0..count). (checked mode; OFF and zero-cost in production.)"
+      },
+      "P.idx(p) non-member": {
+        "threw": "Error: lite-arena: idx() in checked mode was called on an entity that is dead or does not hold this component. idx() is an UNCHECKED fast path -- guard it with has(), or iterate dense[0..count). (checked mode; OFF and zero-cost in production.)"
+      },
+      "P.idx(0) dead": {
+        "threw": "Error: lite-arena: idx() in checked mode was called on an entity that is dead or does not hold this component. idx() is an UNCHECKED fast path -- guard it with has(), or iterate dense[0..count). (checked mode; OFF and zero-cost in production.)"
+      },
+      "joinN([C], null, 1.5)": {
+        "threw": "Error: lite-arena: joinN() the required mask must be a 32-bit integer, got 1.5 (a misspelled flag name reads undefined). (checked mode; OFF and zero-cost in production.)"
+      },
+      "joinN([C], [C])": {
+        "threw": "Error: lite-arena: joinN() set appears in both required and excluded -- the match is always empty. Remove it from one list. (checked mode.)"
+      },
+      "joinN([C], null, 1, 1)": {
+        "threw": "Error: lite-arena: joinN() reqMask and excMask share bit(s) 1 -- the match is always empty. Remove them from one mask. (checked mode.)"
+      },
+      "joinN([P]) foreign set": {
+        "threw": "Error: lite-arena: joinN() required set #0 is not registered with this arena (foreign SparseSet). (checked mode.)"
+      },
+      "joinN([Q], null, 0, 0, 2, 2)": {
+        "threw": "Error: lite-arena: joinN() reqMaskHi and excMaskHi share bit(s) 2 -- the match is always empty. Remove them from one mask. (checked mode.)"
+      },
+      "spawn() exhausted": {
+        "threw": "Error: lite-arena: out of memory -- no free slot. capacity=2, activeCount=2, retiredCount=0. The arena is full; despawn entities or raise capacity with reserve()."
+      },
+      "valid": {
+        "isAlive(neg)": {
+          "ok": true,
+          "v": true
+        },
+        "isAlive(0) never-spawned gen 0": {
+          "ok": true,
+          "v": false
+        },
+        "isAlive(-1)": {
+          "ok": true,
+          "v": false
+        },
+        "hasFlags(neg, 0)": {
+          "ok": true,
+          "v": true
+        },
+        "setFlags(neg, F.f0|F.f31)": {
+          "ok": true,
+          "v": true
+        },
+        "hasFlags(neg, F.f0, F.f5)": {
+          "ok": true,
+          "v": true
+        },
+        "hasFlags(neg, F.f31, F.f0)": {
+          "ok": true,
+          "v": false
+        },
+        "setFlagsHi(neg, 0x80000000)": {
+          "ok": true,
+          "v": true
+        },
+        "hasFlagsHi(neg, H.h31)": {
+          "ok": true,
+          "v": true
+        },
+        "hasFlagsHi(neg, H.h31, H.h1)": {
+          "ok": true,
+          "v": true
+        },
+        "flagCount(F.f31)": {
+          "ok": true,
+          "v": 1
+        },
+        "C.add(neg)": {
+          "ok": true,
+          "v": 0
+        },
+        "C.has(neg)": {
+          "ok": true,
+          "v": true
+        },
+        "C.idx(neg)": {
+          "ok": true,
+          "v": 0
+        },
+        "despawn(neg)": {
+          "ok": true,
+          "v": true
+        },
+        "despawn(neg) again": {
+          "ok": true,
+          "v": false
+        },
+        "C.count after": {
+          "ok": true,
+          "v": 0
+        },
+        "flagCount(F.f31) after": {
+          "ok": true,
+          "v": 0
+        },
+        "flagCountHi(H.h31) after": {
+          "ok": true,
+          "v": 0
+        }
+      }
+    }
+  }
+}

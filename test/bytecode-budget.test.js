@@ -210,8 +210,9 @@ describe('bytecode-budget real runs (tiny driver)', { concurrency: true }, () =>
 // methods of an indexed arena only, so the plain arena keeps compiling the prototype twins pinned in PINS.
 // F2 (M-38 / M-44): joinN 420 -> 435 (one cold pickFlagDriver(this, r) call under `if (this._ixMask)`, the
 // joinN driver hint; ceiling 460 unchanged).
+// 1.12.1 (M-57 / M-68): despawn 215 -> 222 (entity |= 0 after the isAlive guard, +7 B); ixDespawn unchanged.
 const PINS = {
-    despawn: 215, joinN: 435, isAlive: 40, spawn: 93, setFlags: 48, hasFlags: 68, clearFlags: 50,
+    despawn: 222, joinN: 435, isAlive: 40, spawn: 93, setFlags: 48, hasFlags: 68, clearFlags: 50,
     setFlagsHi: 48, hasFlagsHi: 68, clearFlagsHi: 50,
     add: 113, has: 66, remove: 140, idx: 16,
 };

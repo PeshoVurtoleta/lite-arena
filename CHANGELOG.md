@@ -5,6 +5,42 @@ All notable changes to `@zakkster/lite-arena` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+1.12.1 hardening (cold paths and checked mode; audit 2026-11-06).
+
+### Fixed
+- `registerComponent(schema, options)` options (F-1, M-56): `options` must be a plain object whose only own key
+  is `buffers`; `5`, `'x'`, `true`, `[]`, a class instance and any other key (a `{ buffer }` typo) now throw instead
+  of silently own-allocating a payload meant to be shared.
+- Caller-supplied buffers are read once per field, as OWN keys only (O-3, M-70): a getter can no longer swap in
+  a wrong-length buffer after validation, and an inherited field now throws "missing a buffer".
+- One buffer may not back two fields of a component (F-4, M-61): registration and `rebind()` throw, so a write to
+  `x[3]` no longer reads back at `y[3]`.
+- A directly constructed `SparseSet` registers with its arena (O-4, M-62): it is reserved, despawned and cleared
+  like any other set (before, `reserve()` left it short and `add()` of a high slot re-appended on every call).
+  The arena keeps it for its lifetime (no unregister).
+- `reserve(n)` with `n <= capacity` returns `false` on caller-backed, rebound and detached arenas (O-10 / F-3,
+  M-59); it used to throw.
+- A `>>> 0` / Uint32Array copy of a handle with generation >= 2048 (O-1, M-57 / M-68): production `despawn`
+  canonicalizes it (`entity |= 0` after the alive check), so the entity is removed from every component instead of
+  leaving a dead handle in `dense`. Checked mode throws on a non-int32 handle in `isAlive` / `despawn` / `add` /
+  `has` / `remove` / `idx`. Production `isAlive` is safe on any number and never throws on one; production `add` / `has` / `remove` still TRUST
+  the handle (`add(h >>> 0)` appends a duplicate and can push `count` past capacity): store handles in an
+  `Int32Array` or use `h | 0`.
+- Checked `hasFlags` / `hasFlagsHi` throw on a SUPPLIED `undefined` `excluded` mask (O-6, M-60), as `joinN` does;
+  omitting it is still fine.
+
+### Changed
+- `despawn` bytecode 222 B (was 215; +7 B, `entity |= 0`), node v26.8.2. `ixDespawn` is 319 B (unchanged).
+
+### Tests
+- New: `test/cold-paths-1121a.test.js` (+ `test/cold-1121a-probe.mjs`, golden `test/golden/cold-1121a-3eb87a7.json`),
+  `test/handle-canonical.test.js` (+ `test/golden/handle-canonical-*`). Flipped: `test/flags-checked.test.js`,
+  `test/flags-hi-checked.test.js` (a supplied undefined now throws). `test/torture.mjs` Phase A clean variant
+  ends with every set empty.
+- Test counts: 586 tests (584 pass, 2 skipped without `--expose-gc`, node v26.8.2, 2026-11-17).
+
 ## [1.12.0] - 2026-11-06
 
 F2: indexed flags. A flag can be registered as indexed, which gives O(1) counts and an

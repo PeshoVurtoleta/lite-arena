@@ -45,8 +45,8 @@ test('A3 checked Hi setters throw "must be a 32-bit integer" on bad masks; row u
             /lite-arena: clearFlagsHi\(\) the mask must be a 32-bit integer, got /, 'clear ' + tag);
         assert.throws(() => arena.hasFlagsHi(e, m),
             /lite-arena: hasFlagsHi\(\) the required mask must be a 32-bit integer, got /, 'has req ' + tag);
-        // a supplied undefined excluded is treated as omitted (word-0 rule, flags-checked.test.js:45)
-        if (m !== undefined) assert.throws(() => arena.hasFlagsHi(e, 0, m),
+        // a SUPPLIED undefined excluded mask throws too (M-60, arguments.length)
+        assert.throws(() => arena.hasFlagsHi(e, 0, m),
             /lite-arena: hasFlagsHi\(\) the excluded mask must be a 32-bit integer, got /, 'has exc ' + tag);
     }
     assert.equal(arena.flagsHi[e & arena.indexMask], 3);
@@ -71,8 +71,8 @@ test('A3 checked Hi methods accept 0x80000000 and every int32 / uint32 mask', ()
     assert.equal(arena.setFlagsHi(e, 0x80000000), true);
     assert.equal(arena.flagsHi[e & arena.indexMask], -2147483648);
     assert.equal(arena.hasFlagsHi(e, 0x80000000), true);
-    // an omitted excluded mask is fine
-    assert.equal(arena.hasFlagsHi(e, 0x80000000, undefined), true);
+    // an omitted excluded mask is fine; a SUPPLIED undefined one throws (M-60)
+    assert.throws(() => arena.hasFlagsHi(e, 0x80000000, undefined), /the excluded mask must be a 32-bit integer, got undefined/);
 });
 
 test('A3 checked Hi methods validate first, then behave like production (dead handle, no Hi row)', () => {

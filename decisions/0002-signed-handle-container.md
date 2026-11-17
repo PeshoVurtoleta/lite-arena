@@ -86,3 +86,12 @@ e.g. Chrome) for generations 1024..3071, where the value leaves the 31-bit
 range. The `Int32Array` decision is unaffected (it stores any int32 exactly and
 rejecting `>>> 0` still avoids a larger, uint32-wide range of non-Smi values).
 NOMINAL: Node cannot measure the pointer-compression case.
+
+Amendment (2026-11-17, 1.12.1, M-57 / M-68): the signed-handle rule is now enforced where
+it is cheap. Checked mode throws on a handle that is not an int32 (a `>>> 0` / Uint32Array
+copy) in `isAlive` / `despawn` / `add` / `has` / `remove` / `idx`. Production
+`isAlive` is safe on any number and never throws on one (a Symbol / BigInt is the engine's TypeError in both modes); production `despawn` canonicalizes a live
+handle (`entity |= 0`, AFTER its alive check) so a copy of a generation >= 2048 handle is
+still removed from every `dense`; production `add` / `has` / `remove` TRUST the handle (a
+`>>> 0` copy reads `has` false and `add` appends a duplicate, so `count` can pass
+capacity). Store handles in an `Int32Array` or canonicalize with `h | 0`.

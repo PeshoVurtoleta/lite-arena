@@ -195,10 +195,12 @@ export class Arena {
      * @param maxEntities Integer in `[1, 1048575]`.
      * @param options Optional. `checked: true` enables development-mode
      *   assertions -- a stale {@link Arena.join} plan and a misused
-     *   {@link SparseSet.idx} throw, and setFlags / clearFlags / hasFlags (and the Hi twins) throw
+     *   {@link SparseSet.idx} throw, setFlags / clearFlags / hasFlags (and the Hi twins) throw
      *   unless every mask is a 32-bit integer (non-number, NaN, fraction, +-Infinity
-     *   or a value outside both int32 and uint32 throws; 0x80000000 is accepted) -- that are OFF and
-     *   zero-cost in production.
+     *   or a value outside both int32 and uint32 throws; 0x80000000 is accepted), a SUPPLIED
+     *   `undefined` `excluded` mask throws (omitting it is fine), and every entity method
+     *   (isAlive / despawn / add / has / remove / idx) throws on a handle that is not an
+     *   int32 (a `>>> 0` / Uint32Array copy) -- that are OFF and zero-cost in production.
      *   The production hot paths are byte-for-byte unaffected by this flag.
      * @throws Error when `maxEntities` is not an integer in that range.
      */
@@ -212,7 +214,9 @@ export class Arena {
     spawn(): Entity;
 
     /**
-     * O(1) liveness check. Safe to call on any 32-bit integer.
+     * O(1) liveness check. Production: safe on any number and never throws on one (a Symbol or
+     * BigInt is the engine's TypeError in both modes). Checked mode: throws unless `entity`
+     * is an int32 (a `>>> 0` / Uint32Array copy is rejected, M-57).
      * Returns true only when the handle matches the slot's current generation.
      * A free slot (never spawned, despawned, cleared or reserved) is never alive,
      * including its next handle (FREE flag, decisions/0009).
@@ -225,6 +229,10 @@ export class Arena {
      * to the free list.
      * @returns true if the entity was alive, false if the handle was already stale
      *   or names a free slot (nothing changes in that case).
+     *
+     * Production canonicalizes a live handle to its int32 form (`entity | 0`) after the
+     * alive check, so a `>>> 0` / Uint32Array copy of a negative handle (generation >= 2048)
+     * is still removed from every component (M-57 / M-68). Checked mode throws on that copy.
      *
      * On an arena with an indexed flag (1.12.0) this is an OWN method that drops the
      * entity's indexed bits from the columns and counts, then runs `Arena.prototype.despawn`;
@@ -258,10 +266,15 @@ export class Arena {
      * allocates, so a component's payload can live in memory shared with a
      * Worker. When supplied, `buffers` must give one buffer of exactly
      * `capacity * BYTES_PER_ELEMENT` bytes for EVERY schema field and no others,
-     * validated fail-closed in both directions; omitting it own-allocates as
-     * before. The arena never frees, grows, or reassigns a caller-supplied
+     * validated fail-closed in both directions (each field is read once, as an OWN key of the map
+     * only -- inherited fields do not count, M-70); omitting it own-allocates as
+     * before. Two fields of one component may not share a buffer (aliased buffers throw, M-61).
+     * The arena never frees, grows, or reassigns a caller-supplied
      * buffer, and `reserve()` refuses to grow an arena that has any caller-backed
      * component (see decisions/0006). The tick loop is identical either way.
+     *
+     * `options` is optional; when given it must be a plain object whose only own key is
+     * `buffers` -- `5`, `'x'`, `true`, `[]`, a class instance or any other key throw (M-56).
      *
      * @example
      *   const Transform = arena.registerComponent({
@@ -273,8 +286,9 @@ export class Arena {
      *   const Vel = arena.registerComponent({ vx: Float32Array }, { buffers: { vx: sab } });
      * @throws {Error} If any field type is not a numeric TypedArray constructor,
      *   the schema carries a `__proto__` / symbol key, or (when `buffers` is
-     *   given) any field lacks a correctly-typed, correctly-sized buffer or a
-     *   buffer targets no declared field.
+     *   given) any field lacks a correctly-typed, correctly-sized buffer, a
+     *   buffer targets no declared field, or two fields share one buffer; also when
+     *   `options` is not a plain object or carries a key other than `buffers` (M-56).
      */
     registerComponent<T extends Record<string, TypedArrayConstructor>>(
         schema: T,
@@ -382,15 +396,18 @@ export class Arena {
      * decisions/0006. It ALSO throws if any component has a DETACHED field (a
      * buffer transferred to a Worker and not yet rebound) -- growing it would
      * silently copy zero bytes; rebind the returned buffer first. See
-     * decisions/0007.
+     * decisions/0007. The no-op is decided first (M-59): `newCapacity <= capacity`
+     * returns `false` on EVERY arena, caller-backed, rebound and detached included;
+     * only a real growth request reaches those refusals.
      *
      * New slots start free (their next handle is not alive) and add
      * `(newCap - cap) x 4095` to the despawn budget.
      *
      * @param newCapacity Target capacity; an integer `<= 1048575`.
-     * @returns `true` if the arena grew, `false` if it was already large enough.
-     * @throws Error when `newCapacity` is not an integer, exceeds 1048575, any
-     *   registered component is caller-backed, or any component has a detached field.
+     * @returns `true` if the arena grew, `false` if it was already large enough
+     *   (also on a caller-backed, rebound or detached arena).
+     * @throws Error when `newCapacity` is not an integer, exceeds 1048575, or (only when
+     *   `newCapacity > capacity`) any registered component is caller-backed or has a detached field.
      */
     reserve(newCapacity: number): boolean;
 
@@ -477,7 +494,8 @@ export class Arena {
     /**
      * O(1): alive AND `(row & required) === required` AND `(row & excluded) === 0`.
      * Both masks are converted (`| 0`, each once) BEFORE the alive check, so it cannot
-     * return `true` for an entity its own mask despawned. `excluded` defaults to 0.
+     * return `true` for an entity its own mask despawned. `excluded` omitted is 0; in checked mode
+     * a SUPPLIED `undefined` throws (M-60: a misspelled flag name reads undefined).
      * `hasFlags(e, 0)` on a live entity is `true`. A dead
      * handle is `false` (a BigInt or Symbol mask throws TypeError first, as in
      * {@link Arena.setFlags}). Same precondition as {@link Arena.setFlags}; a typo'd mask
@@ -543,7 +561,7 @@ export class Arena {
 
     /**
      * O(1): alive AND `(hiRow & required) === required` AND `(hiRow & excluded) === 0`.
-     * `excluded` defaults to 0. Twin of {@link Arena.hasFlags} for `flagsHi`; same
+     * `excluded` omitted is 0; checked mode throws on a SUPPLIED `undefined` (M-60). Twin of {@link Arena.hasFlags} for `flagsHi`; same
      * precondition as {@link Arena.setFlagsHi}.
      */
     hasFlagsHi(entity: Entity, required: number, excluded?: number): boolean;
@@ -627,7 +645,11 @@ export class SparseSet<T extends Record<string, TypedArrayConstructor>> {
      * Int32Array, not Uint32Array: an entity handle is a SIGNED 32-bit int
      * (negative once a slot reaches generation 2048), and `dense` stores whole
      * handles. Read a handle out of `dense[i]` and pass it straight back to the
-     * API; do not `>>> 0` it or store it in an unsigned view.
+     * API; do not `>>> 0` it or store it in an unsigned view. Production add / has / remove
+     * TRUST the handle (they do not canonicalize): a `>>> 0` copy of a generation >= 2048 handle
+     * makes has() read false and add() append a DUPLICATE, which can push `count` past capacity.
+     * Store handles in an Int32Array, or canonicalize with `h | 0`. Only despawn canonicalizes.
+     * Checked mode throws on such a copy (M-57).
      */
     readonly dense: Int32Array;
 
@@ -640,17 +662,21 @@ export class SparseSet<T extends Record<string, TypedArrayConstructor>> {
     readonly data: ComponentData<T>;
 
     /**
-     * Prefer `arena.registerComponent(schema)` — the arena version registers
-     * this set for automatic cleanup on entity despawn.
+     * Prefer `arena.registerComponent(schema)`: it validates its options bag too and is
+     * otherwise equivalent. A directly constructed set ALSO registers itself with the arena
+     * (M-62, the constructor's last statement), so it is reserved, despawned and cleared like
+     * any other. The arena keeps every such set for its lifetime (there is no unregister), and
+     * each one adds a pass to despawn's component loop.
      *
      * Direct construction is validated: `arena` must be an `Arena` and
-     * `maxEntities` must equal `arena.capacity`, or the constructor throws. A
-     * mismatched-capacity set would silently discard out-of-range writes and,
-     * being unregistered, would never be cleaned on despawn.
+     * `maxEntities` must equal `arena.capacity`, or the constructor throws (a throwing
+     * construction registers nothing). A mismatched-capacity set would silently discard
+     * out-of-range writes.
      *
      * The optional `buffers` map makes each `data[key]` view a caller-owned
      * `ArrayBuffer` / `SharedArrayBuffer` instead of an allocated array; it is
-     * validated fail-closed in both directions. See {@link Arena.registerComponent}.
+     * validated fail-closed in both directions (own keys only; `Object.keys` of the map, M-70)
+     * and may not alias one buffer to two fields (M-61). See {@link Arena.registerComponent}.
      *
      * @throws {Error} If `arena` is not an `Arena`, `maxEntities !== arena.capacity`,
      *   the schema is invalid, or (when `buffers` is given) any field lacks a
@@ -664,19 +690,29 @@ export class SparseSet<T extends Record<string, TypedArrayConstructor>> {
         buffers?: { [K in keyof T]?: ArrayBufferLike }
     );
 
-    /** O(1). True if the entity is alive AND possesses this component. */
+    /**
+     * O(1). True if the entity is alive AND possesses this component. Production trusts the
+     * handle (a `>>> 0` copy of a generation >= 2048 handle reads false); checked mode throws
+     * on a non-int32 handle (M-57).
+     */
     has(entity: Entity): boolean;
 
     /**
      * Attaches the component to the entity.
      * @returns The dense array index to access `this.data`, or `-1` if the entity is dead.
      *   If the entity already has this component, returns the existing index.
+     *
+     * Production trusts the handle: add(h >>> 0) of a generation >= 2048 handle is never found by
+     * has(), so each repeat APPENDS a duplicate and `count` can pass capacity. Pass the int32 handle
+     * spawn() returned (or `h | 0`); checked mode throws on a non-int32 handle (M-57).
      */
     add(entity: Entity): number;
 
     /**
      * O(1) Swap-and-Pop removal.
      * @returns true if removed, false if the entity didn't have this component.
+     *   Production trusts the handle (a `>>> 0` copy of a negative handle finds nothing);
+     *   checked mode throws on a non-int32 handle (M-57).
      */
     remove(entity: Entity): boolean;
 
@@ -687,7 +723,7 @@ export class SparseSet<T extends Record<string, TypedArrayConstructor>> {
      * (e.g. iterating `dense[0..count)`).
      *
      * In checked mode (`new Arena(n, { checked: true })`) this throws when the
-     * entity is dead or does not hold the component; production is unchecked and
+     * entity is dead, does not hold the component, or is a non-int32 handle (M-57); production is unchecked and
      * uses the prototype fast path unchanged.
      */
     idx(entity: Entity): number;
@@ -727,7 +763,10 @@ export class SparseSet<T extends Record<string, TypedArrayConstructor>> {
      * supplied buffer passes (no half-applied state). After a successful rebind
      * the set is caller-backed, so {@link Arena.reserve} refuses to grow it.
      *
-     * @throws On a non-object/empty map, unknown key, wrong type, or wrong size.
+     * A buffer already used by another field of the set (supplied in the same map, or held by a field
+     * not being rebound) is rejected too (M-61).
+     *
+     * @throws On a non-object/empty map, unknown key, wrong type, wrong size, or an aliased buffer.
      */
     rebind(buffers: { [K in keyof T]?: ArrayBufferLike }): void;
 }

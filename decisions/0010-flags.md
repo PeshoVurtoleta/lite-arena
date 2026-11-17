@@ -221,7 +221,15 @@ statements above it overrides in 1.12.0, by the lines they appear on in the 1.11
   build (one cold `pickFlagDriver(this, r)` call under `if (this._ixMask)`, M-44); the
   M-28 ceiling 460 never moves. The other pinned lengths (despawn 215, setFlags 48,
   clearFlags 50, hasFlags 68, the Hi twins) are unchanged: indexed arenas use own methods
-  with their own pins, listed in 0011.
+  with their own pins, listed in 0011. (1.12.1: despawn 222, M-68.)
 - Precondition M-6 and the typo fail-open note are unchanged. The new flag methods
   (`flagCount`, `firstFlagged`, `clearFlagAll` + Hi) throw E-ROW when nothing is indexed;
   production `nextFlagged` trusts both arguments (M-39, M-52).
+
+## Amendment: checked hasFlags / hasFlagsHi and a supplied undefined (M-60, 2026-11-17, 1.12.1)
+
+The statement above that an omitted `excluded` is fine stands, but checked `hasFlags` /
+`hasFlagsHi` now tell omitted from SUPPLIED-undefined by `arguments.length > 2` (as joinN does,
+M-25): `hasFlags(e, req, undefined)` throws "the excluded mask must be a 32-bit integer, got
+undefined" (a misspelled flag name reads undefined). Production is unchanged (`| 0`, fail-open).
+Zero production bytes: only the checked wrappers changed.

@@ -119,3 +119,11 @@ getter (and `SharedArrayBuffer`'s where it exists), captured once at module load
 A prototype fake or a Proxy is rejected; a cross-realm buffer (a vm context's
 ArrayBuffer) is accepted; the size check uses the length the getter returned, so
 an own `byteLength` property cannot pass a wrong-sized buffer. Cold path only.
+
+Amendment (2026-11-17, 1.12.1, M-56 / M-59 / M-61 / M-70): `registerComponent` options must
+be a plain object whose only own key is `buffers` (5, 'x', true, [] and other keys throw).
+The buffers map is read once per field, as OWN keys only (an inherited field is "missing a
+buffer"). One buffer may not back two fields of a component (registration and `rebind`
+both throw; SharedArrayBuffers compare by identity). `reserve(n)` with `n <= capacity`
+returns `false` on every arena, caller-backed included: the no-op is decided before the
+caller-backed refusal, which now fires only on a real growth request.

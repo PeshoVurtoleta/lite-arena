@@ -14,7 +14,7 @@ recomputed. This file is not shipped (not in `package.json` `files[]`).
 
 Numbering note: #1-#5 are the inlining / bytecode-budget family (section A), #6-#11 the
 fail-closed semantics family (B), #12-#15 the allocation-gate family (C), #16-#22 the
-measurement and harness family (D), #23 the docs-drift family (E), #24-#33 the 2026-11-06
+measurement and harness family (D), #23 the docs-drift family (E), #24-#34 the 2026-11-06
 audit family (F). The audit's 15 distinct findings (O-1..O-10, F-1..F-8, with O-5 = F-2,
 O-10 = F-3, O-7 ~ F-5) are all CONFIRMED by both auditors; triage rulings are M-56..M-67.
 Tracking notes for decided-but-unshipped fixes use the 1.12.1 label from DECISIONS.md.
@@ -41,7 +41,7 @@ proof.
    build, or that measures retention when it is titled allocation, or that cannot see a
    once-per-N allocation, is not a gate. Every gate gets a must-fail control and a
    revert-check; a parity gate's revert-check is a live-build mutant. *(#13, #14, #15,
-   #20, #31)*
+   #20, #31, #34)*
 6. **A control that fails voids the harness, not just the row.** An A/A control that reads
    1.76x in 11/11 rounds means no row of that harness is trusted. Identical `new Function`
    sources share V8 feedback; give each config unique source. *(#16, #17)*
@@ -84,7 +84,7 @@ guard moved to a cold helper) measured 502 B -- over the 460 B ceiling.
 `CheckedJoinNPlan` from the scratch), not the guards.
 **Outcome.** Maintainer: "Adopt Dt". A cold module function `stampCheckedJoinNPlan(arena,
 required, excluded)` builds it, and the M-10 guards become truthy tests for both words:
-`joinN` 420 B, despawn 215 B, Hi twins = word-0 bytecode (DETERMINISTIC, node v26.8.2). The
+`joinN` 420 B, despawn 215 B (1.12.1: 222, M-68), Hi twins = word-0 bytecode (DETERMINISTIC, node v26.8.2). The
 inline A/B vs before-F1 read SAME 37/37 on turbofan and SAME 40/40 on maglev, control OK
 (REPORTED, QUIET host, `--strict`; M-29).
 **Source:** M-32; HISTORY.md "2026-11-04 F1 built" and "F1 close-out"; evidence
@@ -401,9 +401,11 @@ every `dense`; `add(u)` appended a duplicate each call (count 7 on capacity 4; t
 repro). The trigger is documented misuse (a handle stored in a `Uint32Array` field).
 **Mechanism.** Two layers disagree about what a handle IS. Every test and torture phase
 passed canonical handles only, so no gate saw it.
-**Outcome.** M-57 (planned, 1.12.1-B): `despawn()` canonicalizes (`entity |= 0` on entry) and CHECKED mode
-rejects a non-canonical handle in `isAlive` / `add` / `has` / `remove` / `despawn`;
-production pinned hot bodies untouched. Rejected: an engine-wide `isAlive` check (40 B pin).
+**Outcome.** M-57 / M-68 (landed, 1.12.1 unit B): production `despawn()` canonicalizes (`entity |= 0` AFTER its
+alive check, so checked despawn still rejects a copy; despawn pin 215 -> 222 B) and CHECKED mode
+rejects a non-int32 handle in `isAlive` / `add` / `has` / `remove` / `despawn` / `idx`. Production `isAlive`
+is safe on any number and never throws on one, and production `add` / `has` / `remove` TRUST the handle: add(u) with a `>>> 0` copy still
+appends a duplicate and can push `count` past capacity. Rejected: an engine-wide `isAlive` check (40 B pin).
 **Source:** audit O-1 (`audit/2026-11-06/opus-5.5_FINDINGS.md`); M-57.
 
 ### #25 -- A registration path must be hardened like the rebind path (O-3 / F-1 / F-4)
@@ -415,7 +417,7 @@ accepted one ArrayBuffer for two fields on registration and on `rebind` (F-4: a 
 `x[3]` read back at `y[3]`).
 **Mechanism.** `rebind()` had been hardened (single read, atomic) and registration had not;
 the same trust boundary had two doors.
-**Outcome.** M-56 and M-61 (planned, 1.12.1-A): plain-object options, any own key other than `buffers` rejected
+**Outcome.** M-56 and M-61 (landed, 1.12.1 unit A, 296d193): plain-object options, any own key other than `buffers` rejected
 (M-40 wording); `validateBuffers` reads each key once into a local array the constructor
 builds from; registration and rebind reject a buffer already used by another field (rebind
 also checks fields it is not rebinding). Its gate must fail on 1.12.0.
@@ -428,7 +430,7 @@ caller-backed, rebound or detached arena it threw "cannot grow this arena" becau
 caller-backed and detached scans ran first.
 **Mechanism.** Every early-return precedes every scan: the cheapest, most common outcome
 must be decided before the expensive checks that can only fail for other outcomes.
-**Outcome.** M-59 (planned, 1.12.1-A): the no-op check moves above both scans, after the integer / ceiling
+**Outcome.** M-59 (landed, 1.12.1 unit A, 296d193): the no-op check moves above both scans, after the integer / ceiling
 check; gate `reserve(capacity)` and `reserve(capacity - 1)` return `false` on all three
 kinds.
 **Source:** audit O-10, F-3; M-59.
@@ -441,7 +443,7 @@ dropped the sparse write and re-appended every call (3 adds gave count 3, `has()
 AR-10 claimed to close this trap.
 **Mechanism.** Two ways to make a set (the constructor and `registerComponent`); only one
 registered it.
-**Outcome.** M-62 (planned, 1.12.1-A): the constructor pushes itself and `registerComponent` stops pushing twice;
+**Outcome.** M-62 (landed, 1.12.1 unit A, 296d193): the constructor pushes itself and `registerComponent` stops pushing twice;
 gate: direct set + `reserve()` + high-slot `add` keeps count 1.
 **Source:** audit O-4; M-62.
 
@@ -452,8 +454,8 @@ excluded mask as omitted; the d.ts said it throws, `joinN` threw in the same cas
 `flags-checked.test.js:45` pinned the fail-open as intended.
 **Mechanism.** M-25 was applied to `joinN` and not carried to the other mask-taking
 methods; a test had pinned the bug.
-**Outcome.** M-60 (planned, 1.12.1-B): M-25 applies to checked `hasFlags` / `hasFlagsHi` (`arguments.length > 2`
--> validated), checked wrappers only, zero production bytes; the pinned tests are to be flipped.
+**Outcome.** M-60 (landed, 1.12.1 unit B): M-25 applies to checked `hasFlags` / `hasFlagsHi` (`arguments.length > 2`
+-> validated), checked wrappers only, zero production bytes; the pinned tests are flipped.
 **Source:** audit O-6; M-60; see also #9.
 
 ### #29 -- Settled behavior still needs true docs (O-5 / F-2)
@@ -524,3 +526,19 @@ F-6 is a real fail-open on a development-only switch.
 **Outcome.** M-67: F-6 to backlog (a NEXT.md filler for a future minor, since it makes a
 silent typo throw); F-7 by design, one README / d.ts line.
 **Source:** audit F-6, F-7; M-67; ADR `decisions/0004-retirement-observability-and-clear.md`.
+
+### #34 -- A parity golden can pin a bug (M-60 census trap)
+
+**Tried / broke.** The B0 census for M-60 found `test/golden/f2-plain-workload.mjs` case 10 (`w === 5`) calling
+checked `hasFlagsHi(e, 0, b)` with `b = undefined`: 13 records of the fe8d7d5 parity golden had been cut from the
+M-60 fail-open (a supplied `undefined` was treated as omitted). Making the call throw turned
+`flags-f2-parity` A7 red at record #495.
+**Mechanism.** A golden records what the old build did, not what the contract says; a fail-open it exercised
+became a "pinned" behavior (the same shape as #28's test pin, one level up).
+**Outcome.** Addendum A3 (1.12.1 unit B): the workload calls the 2-arg form `hasFlagsHi(e, 0)` when
+`b === undefined` (identical on fe8d7d5 in both modes), RNG consumption unchanged, so
+`test/golden/f2-plain.json` stays byte-identical and still cut from fe8d7d5. Rejected: recutting or hand-patching
+the golden (it would stop being the fe8d7d5 cut). The supplied-undefined throw is gated by `flags-hi-checked`
+and `handle-canonical`. Rule: before a fix turns a fail-open into a throw, census the goldens and workloads for
+calls that exercise it.
+**Source:** M-60; PLAN-1.12.1-B addendum A3.

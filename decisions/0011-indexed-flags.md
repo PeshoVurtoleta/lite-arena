@@ -166,7 +166,7 @@ research folder, not in this package):
 - Memory (A): 135,300 B per flag at capacity 1,048,575 (adds a 4 B third level) against
   135,296 B inline.
 - Write path bytecode at 0 indexed flags (node v26.8.2): the live prototype bodies are
-  setFlags 48 / clearFlags 50 / despawn 215. The own-method install keeps exactly those. A
+  setFlags 48 / clearFlags 50 / despawn 215 (1.12.1: despawn 222, M-68). The own-method install keeps exactly those. A
   branch with a cold helper costs setFlags 77 / clearFlags 79 / despawn 254; a transition test in
   the body costs 103 / 101 / 258. The branch form moves setFlags past the Maglev
   single-inline tier (under 100 B); the branch-min form stays under it but crosses the
@@ -235,7 +235,7 @@ per function:
 | ixClearFlags | 178 | own method |
 | ixSetFlagsHi | 178 | own method |
 | ixClearFlagsHi | 178 | own method |
-| ixDespawn | 319 | own method (M-42); the prototype despawn stays 215 |
+| ixDespawn | 319 | own method (M-42); the prototype despawn stays 215 (1.12.1: 222, M-68) |
 | ixSet | 97 | column set, HOT |
 | ixUnset | 116 | column clear, HOT |
 | ixWordFrom | 209 | summary walk, HOT |
@@ -246,5 +246,5 @@ per function:
 | firstFlagged | 215 | |
 | firstFlaggedHi | 215 | |
 
-The prototype twins keep their pins (setFlags 48, clearFlags 50, despawn 215, the Hi twins
+The prototype twins keep their pins (setFlags 48, clearFlags 50, despawn 215 (1.12.1: 222, M-68), the Hi twins
 alike): a plain arena compiles the same bodies as 1.11.0.

@@ -21,7 +21,8 @@ import { Arena, SparseSet, Entity } from '@zakkster/lite-arena';
 const arena = new Arena(maxEntities: number);   // [1, 1_048_575]
 // Optional dev-only assertions (OFF and zero-cost in production):
 //   new Arena(maxEntities, { checked: true });  // stale join()/misused idx() throw,
-//   // and a flag mask that is not a 32-bit integer throws (typo guard)
+//   // a flag mask that is not a 32-bit integer throws (typo guard), and an entity handle
+//   // that is not an int32 (a `>>> 0` copy) throws
 
 // Components: SoA schemas mapped to parallel TypedArrays.
 const Pos = arena.registerComponent({
@@ -50,14 +51,14 @@ Vel.rebind({ vx: vxBuf });                   // return leg: Vel.data.vx is live 
 
 // Entity lifecycle:
 const e: Entity = arena.spawn();        // O(1), throws when full (throw names full vs retired)
-arena.isAlive(e): boolean;              // O(1), safe on arbitrary input
-arena.despawn(e): boolean;              // O(registered components), cascades; false on a dead or free-slot handle
+arena.isAlive(e): boolean;              // O(1); production is safe on any number and never throws on one (a Symbol / BigInt is the engine's TypeError in both modes); checked mode throws on a non-int32
+arena.despawn(e): boolean;              // O(registered components), cascades; false on a dead or free-slot handle; production canonicalizes (e | 0) after the alive check
 arena.remainingCapacity(): number;      // O(1), = capacity - activeCount - retiredCount
 arena.clear();                          // reset in place (no realloc); ALL prior handles die
 
 // Component ops on SparseSet<T>:
-Pos.add(e): number;        // returns dense index, or -1 if dead
-Pos.has(e): boolean;       // O(1), validates liveness + membership
+Pos.add(e): number;        // returns dense index, or -1 if dead; production TRUSTS the handle (add(h >>> 0), gen >= 2048, appends a duplicate)
+Pos.has(e): boolean;       // O(1), validates liveness + membership; production trusts the handle (a >>> 0 copy reads false)
 Pos.remove(e): boolean;    // O(1) swap-and-pop; allocates nothing after warm-up (<= 4 TypedArray kinds app-wide)
 Pos.idx(e): number;        // UNSAFE fast-path -- no checks; use only after has()
 
@@ -216,6 +217,10 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
   set that is both required and excluded throws, and `idx()` on a dead/non-member
   entity throws, and setFlags/clearFlags/hasFlags throw unless every mask is a
   32-bit integer (0x80000000 ok; NaN, fractions, +-Infinity, non-numbers throw);
+  a SUPPLIED undefined hasFlags / hasFlagsHi `excluded` throws (omitted is fine, M-60);
+  isAlive / despawn / add / has / remove / idx throw on a handle that is not an int32 (a
+  `>>> 0` / Uint32Array copy; canonicalize with `h | 0`, M-57) -- PRODUCTION isAlive is safe on any number and never throws on one, despawn canonicalizes, add / has / remove trust the handle (a `>>> 0` copy of a
+  generation >= 2048 handle: has reads false, add appends a duplicate and count can pass capacity);
   the Hi methods and joinN's reqMaskHi / excMaskHi (args 5-6) are validated the same way.
   joinN() masks: a SUPPLIED reqMask / excMask must be a 32-bit integer (M-20), and a
   supplied-but-undefined one (a misspelled F.tpyo) throws too (M-25); an OMITTED mask
@@ -247,7 +252,9 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
   remove (Node HeapNumber; 12 B pointer-compressed, NOMINAL), Uint32 values >= 2^31
   box too, and `despawn()` inherits the limit through `remove()`.
   Below 2^31 vs at >= 2^31: 0 vs 7-8 scavenges per 500,000 swapping removes (REPORTED, 2026-10-27, darwin 12 cores, Node 26.8.2, 6 kinds warmed, 1 MiB semi-space; 11 runs: 7 in 9 runs at load1 4.5-6.8, 8 in 2 runs at load1 1.56; scavenge counts, not timings).
-- `registerComponent(schema)` validates the schema at registration (a cold path):
+- `registerComponent(schema, options?)`: `options` must be a plain object whose only own key is
+  `buffers` (`5`, `'x'`, `true`, `[]`, other keys throw, M-56).
+  It validates the schema at registration (a cold path):
   every field type must be one of the nine numeric TypedArray constructors
   (Int8/Uint8/Uint8Clamped/Int16/Uint16/Int32/Uint32/Float32/Float64Array), or
   it throws a library error naming the key. `Array`, `Object`, `SharedArrayBuffer`,
@@ -259,8 +266,10 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
 - `registerTag()` is `registerComponent({})`: membership only; `data` is an empty
   null-prototype object (`Object.keys(data).length === 0`).
 - `SparseSet` is exported, but constructing one directly requires the owning
-  `Arena` and a capacity equal to `arena.capacity`; a mismatch throws. Prefer
-  `arena.registerComponent(schema)`, which always constructs it correctly.
+  `Arena` and a capacity equal to `arena.capacity`; a mismatch throws. A directly constructed
+  set registers itself with the arena (M-62): reserved, despawned and cleared like any other; the
+  arena keeps it for its lifetime (no unregister) and each adds a pass to despawn's component loop.
+  Prefer `arena.registerComponent(schema)`, which always constructs it correctly.
 - `join(a, b)` returns a REUSED scratch `{driver, other, count}` (driver = the
   smaller-count set); it allocates nothing and is called once per system, cold.
   It is a planner, not an iterator -- there is deliberately no `query()` or
@@ -320,19 +329,21 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
   through an explicit, between-frames `reserve(newCap)`. `reserve()` reallocates
   every backing buffer (copying live contents; all handles/memberships/dense
   indices preserved), so hoisted refs like `const x = comp.data.x` are stale
-  after it returns -- re-read them. Grow-only: `newCap <= capacity` is a no-op.
+  after it returns -- re-read them. Grow-only: `newCap <= capacity` is a no-op returning false on EVERY arena (caller-backed,
+  rebound and detached too, M-59).
 - Caller-supplied buffers (`registerComponent(schema, { buffers })`): each
   `data[key]` can VIEW a buffer the caller owns -- an `ArrayBuffer` or
   `SharedArrayBuffer` of exactly `capacity * BYTES_PER_ELEMENT` bytes -- so a
   component's payload can live in memory shared with a Worker. Validated
   fail-closed both ways: every declared field needs a correctly-typed,
-  correctly-sized buffer, and no buffer may target an undeclared field; a
+  correctly-sized buffer (own keys of the map only, read once; inherited ones count as missing, M-70),
+  no buffer may target an undeclared field, and no buffer may back two fields (M-61); a
   missing/null buffer for a declared field throws rather than silently
   own-allocating. Only `data.*` is shareable -- `count` and `dense` are NOT
   shared, so a Worker can read/write `data.*` over a range the main thread hands
   it by message (postMessage is the fence) but CANNOT iterate the set itself yet.
   No atomics, no locking, no multi-writer. The arena never frees, grows, or
-  reassigns a caller-supplied buffer, and `reserve()` throws if any component is
+  reassigns a caller-supplied buffer, and a growing `reserve()` throws if any component is
   caller-backed. See decisions/0006-caller-supplied-buffers.md.
 - Transferable round-trip (`detach` / `rebind` / `isDetached`): OFFLOAD a
   component's payload to a Worker with zero copy, using a plain `ArrayBuffer` and
@@ -341,11 +352,11 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
   collects the backing buffer(s) for the transfer list; transferring one detaches
   the sender's view (`byteLength` 0). `rebind(buffers)` re-adopts the buffer(s) a
   Worker transfers back -- a PARTIAL, fail-closed map (unknown key, wrong type, or
-  wrong size throws; nothing is re-pointed until every buffer passes), after which
+  wrong size, or a buffer already used by another field throws; nothing is re-pointed until every buffer passes), after which
   the set is caller-backed. `isDetached(key)` is truthful (`byteLength === 0`) and
   is the sanctioned ONCE-PER-FRAME system guard -- raw `data[key][i]` reads are
   not policed (they cannot be, without taxing the hot path), so a hot loop over a
-  detached field is a caller bug. `reserve()` also refuses a component with a
+  detached field is a caller bug. A growing `reserve()` also refuses a component with a
   detached field. The transfer is the fence: the buffer is owned by exactly one
   thread at a time. See decisions/0007-transferable-roundtrip.md.
 

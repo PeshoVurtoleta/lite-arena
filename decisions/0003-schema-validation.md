@@ -73,6 +73,13 @@ Validation lives in the `SparseSet` constructor (a shared `validateSchema()`),
 so BOTH `arena.registerComponent()` and any direct `new SparseSet()` are
 covered by one code path.
 
+Amendment (2026-11-17, 1.12.1, M-62 / M-70): a directly constructed `SparseSet` also
+registers itself in `arena.components` (the constructor's last statement, after every
+throw), so it is reserved, despawned and cleared like any other set; the arena keeps it
+for its lifetime (no unregister) and each adds a pass to despawn's component loop.
+The constructor reads each buffers-map field once, as an OWN key only: an inherited field
+throws "missing a buffer".
+
 ### AR-10 -- keep SparseSet exported, validate capacity + owner
 
 Chosen: the `SparseSet` constructor requires its `arena` argument to be an
