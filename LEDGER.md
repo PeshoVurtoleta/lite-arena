@@ -465,7 +465,7 @@ methods; a test had pinned the bug.
 (a retired slot to 2, 4095 to 1), so an old handle can be live again after the next spawn.
 **Mechanism.** The behavior is SETTLED (M-2, ADR 0004 section 3: "re-open the ABA window
 ... acceptable and documented"); only the wording overclaimed.
-**Outcome.** M-58 (planned, 1.12.1-C): docs fix only -- README, d.ts and llms.txt say that no pre-clear or
+**Outcome.** M-58 (docs landed, 1.12.1-C2): docs fix only -- README, d.ts and llms.txt say that no pre-clear or
 persisted handle may be retained across `clear()` or into a fresh arena. Engine fix
 rejected (it would reopen M-2).
 **Source:** audit O-5, F-2; M-58; ADR `decisions/0004-retirement-observability-and-clear.md`.
@@ -480,7 +480,7 @@ vs 2.49x (REPORTED, audit O-7 table). llms.txt had an 8.5 ms table with no prove
 contradicted the README's 1.70 ms (F-5).
 **Mechanism.** Verification tiers: a claim belongs to one tier or it is unproven; a
 REPORTED number is worded as a measurement.
-**Outcome.** M-64 (planned, 1.12.1-C / D): every surviving number labelled REPORTED with provenance or NOMINAL;
+**Outcome.** M-64 (docs landed, 1.12.1-C2; drift row: 1.12.1-D): every surviving number labelled REPORTED with provenance or NOMINAL;
 law phrasing reworded; the llms.txt table replaced or deleted; the headline said to be from
 v1.6.1; a docs-drift row requires a tier marker next to every ms / x figure. No new timing
 (the re-stamp waits for the next quiet L5 run, see #17).
@@ -510,7 +510,7 @@ mutated-README control. M-66 (backlog): a summary-sensitive walk in Phase N afte
 `flagCount` reads 0 for a flagged entity and a later `clearFlags` drives it to -1.
 **Mechanism.** The same conversion-runs-user-code hazard as #7 and #8, but here fixing it
 would cost bytes in a pinned body.
-**Outcome.** M-63 (planned, 1.12.1-C): "by design, document" -- unsupported re-entrancy, to be documented next to
+**Outcome.** M-63 (docs landed, 1.12.1-C2): "by design, document" -- unsupported re-entrancy, to be documented next to
 M-39's direct-row-write rule (README / d.ts). Rejected: an engine fix in the pinned
 prototype bodies.
 **Source:** audit O-2; M-63; M-39.
@@ -523,7 +523,7 @@ arena unchecked (F-6). Checked `join(a, b)` has no foreign-set / same-set guard,
 **Mechanism.** F-7 is the intended scope: AR-09 / ADR 0004 section 5 give checked `join()`
 the staleness guard only, and M-13 / M-22 scope foreign / contradiction checks to `joinN`.
 F-6 is a real fail-open on a development-only switch.
-**Outcome.** M-67: F-6 to backlog (a NEXT.md filler for a future minor, since it makes a
+**Outcome.** M-67 (docs landed, 1.12.1-C2): F-6 to backlog (a NEXT.md filler for a future minor, since it makes a
 silent typo throw); F-7 by design, one README / d.ts line.
 **Source:** audit F-6, F-7; M-67; ADR `decisions/0004-retirement-observability-and-clear.md`.
 

@@ -1,11 +1,11 @@
 # @zakkster/lite-arena
 
 > Zero-GC Entity-Component-System (ECS) memory allocator in a single file.
-> Generational handles defeat ABA; SoA sparse sets give cache-friendly
+> Generational handles close ABA through despawn and rollover (not across clear()); SoA sparse sets give cache-friendly
 > iteration; swap-and-pop keeps removal O(1) without array shifts.
 
 Use this library when you need to manage 1,000-100,000 game entities with
-multiple components per entity, at 60 fps, without GC pauses. It's a primitive,
+multiple components per entity, at 60 fps with GC-free hot paths (gated by `npm run torture`, DETERMINISTIC). It's a primitive,
 not a framework: no query language, no scene graph, no rendering. Drop it
 into a custom game loop, particle system, simulation, or canvas overlay.
 
@@ -179,8 +179,9 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
 - `Generation = 0` is reserved as "never alive"; synthesizing handle `0` is
   guaranteed to be rejected on a fresh arena.
 - Generational rollover is fail-closed: a slot that exhausts its 4095 live
-  generations is permanently retired on despawn (never recycled), so a stale
-  handle can never alias as valid. `arena.retiredCount` counts retired slots.
+  generations is retired on despawn (never recycled until clear() revives it), so
+  rollover never re-issues a generation. clear() is the exception: it re-opens the
+  ABA window (see its bullet below). `arena.retiredCount` counts retired slots.
   This is a despawn BUDGET, not a rarity: at the default 20/12 split the arena
   has capacity x 4095 despawns from construction (LIFO free list: a hot slot is
   reused at once); the first retirement lands at about 4095 x entity lifetime and
@@ -194,7 +195,8 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
   (erratum).
 - Free slots carry a FREE flag in `generations`: a free slot's next handle is not
   alive, so isAlive/add/despawn reject it (also handles persisted from another run
-  or arena; handles are not unique across arenas). See
+  or arena; handles are not unique across arenas, so a persisted handle can be alive
+  in a fresh arena once its slot is spawned at that generation). See
   decisions/0009-free-slot-flag.md.
 - The handle is an int32: a Smi on 64-bit Node, possibly a heap number on
   31-bit-Smi platforms (pointer compression, e.g. Chrome) for generations
@@ -207,13 +209,19 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
   (so an empty-but-exhausted arena does not read as a phantom leak).
 - `clear()` resets the arena to empty WITHOUT reallocating (rebuilds the free
   list, bumps every generation, revives retired slots, zeroes each component's
-  count); it is O(capacity) and allocates nothing. Every handle minted before
-  `clear()` is invalid afterward -- the honest contract of a reset. Retirement is
+  count); it is O(capacity) and allocates nothing. Retain no handle minted before
+  `clear()` (nor a persisted one into a fresh arena, which issues generation 1
+  again): isAlive() rejects each slot's most recent pre-clear handle, not every older
+  one, because clear() re-issues an already-used generation (a retired slot -> 2,
+  gen 4095 -> 1, every other g -> g + 1), so an old handle whose generation equals the
+  slot's new one is live again after that slot's next spawn (ADR 0004 section 3). Retirement is
   observed via the counter, never a callback: there is deliberately no `onRetire`
   (see decisions/0004-retirement-observability-and-clear.md).
 - Checked mode (`new Arena(n, { checked: true })`) is OFF by default and zero-cost
   in production. When on: reading a `join()`/`joinN()` plan after a later
-  `join()`/`joinN()` throws (they share one epoch), a `joinN()` foreign set or a
+  `join()`/`joinN()` throws (they share one epoch); checked `join(a, b)` has that
+  staleness guard ONLY (no foreign-set / same-set guard; those are joinN's, M-13 / M-22,
+  AR-09, ADR 0004 section 5), a `joinN()` foreign set or a
   set that is both required and excluded throws, and `idx()` on a dead/non-member
   entity throws, and setFlags/clearFlags/hasFlags throw unless every mask is a
   32-bit integer (0x80000000 ok; NaN, fractions, +-Infinity, non-numbers throw);
@@ -252,7 +260,8 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
   remove (Node HeapNumber; 12 B pointer-compressed, NOMINAL), Uint32 values >= 2^31
   box too, and `despawn()` inherits the limit through `remove()`.
   Below 2^31 vs at >= 2^31: 0 vs 7-8 scavenges per 500,000 swapping removes (REPORTED, 2026-10-27, darwin 12 cores, Node 26.8.2, 6 kinds warmed, 1 MiB semi-space; 11 runs: 7 in 9 runs at load1 4.5-6.8, 8 in 2 runs at load1 1.56; scavenge counts, not timings).
-- `registerComponent(schema, options?)`: `options` must be a plain object whose only own key is
+- `registerComponent(schema, options?)`: `undefined`, `null`, `{}` and `{ buffers: undefined }`
+  own-allocate; any other `options` must be a plain object whose only own key is
   `buffers` (`5`, `'x'`, `true`, `[]`, other keys throw, M-56).
   It validates the schema at registration (a cold path):
   every field type must be one of the nine numeric TypedArray constructors
@@ -320,7 +329,12 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
   W = ceil(capacity / 32), S1 = ceil(W / 32), S2 = ceil(S1 / 32) Int32 words =
   135,296 B per indexed flag at capacity 1,048,575, plus a 128 B count table per word; 0 B unindexed.
   Direct indexed row writes (`arena.flags[s] |= F.x`) are UNSUPPORTED: the summaries do not see them
-  (M-39); use setFlags / clearFlags. On an indexed arena setFlags / clearFlags / despawn are own methods
+  (M-39); use setFlags / clearFlags. A mask whose valueOf() registers INDEXED flags while a
+  prototype setFlags / setFlagsHi is converting it is UNSUPPORTED re-entrancy (M-63): the
+  in-flight call writes the row bit, not the column, like a direct row write (flagCount
+  reads 0 for a flagged entity, a later clearFlags drives it to -1); register every flag
+  before setting any. (Distinct from M-33: registerFlags re-entered from a names getter / options trap, inner call wins, outer throws.)
+  On an indexed arena setFlags / clearFlags / despawn are own methods
   installed at registration (M-42; the Hi twins too), so a subclass override of them is bypassed (shadowed).
 - Measured (REPORTED, 1 run, 2026-11-06, Node 26.8.2 darwin arm64 12 cores, QUIET host load1 ~2.9, K = 11 interleaved, median): indexed set+clear ~12.6 ns vs ~1.6 ns plain,
   flagCount ~0.9 ns (O(1) is derived from the code, not timed); do not share a hot call site between plain and indexed arenas (the plain arena pays
@@ -399,17 +413,17 @@ arena.reserve(newCap): boolean;   // grows the universe; false if newCap <= cap
 
 ## Headline performance
 
-On a 2022 laptop, iteration of 10,000 entities × 200 frames (illustrative --
-ratios are the portable result; see README for v1.6.1 numbers on current hardware):
+Iteration of 10,000 entities x 200 frames (README Workload 2; REPORTED: Apple M4 Pro,
+Node v26.3.1, lite-arena v1.6.1, median of 7 trials; not re-measured for 1.12.x):
 
 | Strategy | ms | vs lite-arena |
 |---|---:|---:|
-| **lite-arena**     | **8.5 ms** | **1.00×** |
-| Manual SoA (no ECS) | 9.2 ms | 1.09× |
-| Array<Object>       | 28.6 ms | 3.38× |
-| Map<id, object>     | 39.2 ms | 4.63× |
+| **lite-arena**     | **1.70 ms** | **1.00x** |
+| Manual SoA (no ECS) | 1.91 ms | 1.12x |
+| Array<Object>       | 3.28 ms | 1.93x |
+| Map<id, object>     | 4.55 ms | 2.68x |
 
-Heap delta across all backends: < 100 bytes. The headline win is **iteration
+Heap delta across all backends: < 100 bytes (REPORTED, same run). The headline win is **iteration
 speed**, not spawn throughput; if your bottleneck is per-frame spawn churn,
 benchmark first — a bare TypedArray pool may suffice.
 

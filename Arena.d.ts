@@ -20,9 +20,12 @@
  *
  * The 12-bit generation field issues 4095 live values per slot. A slot that
  * exhausts them is retired on despawn (see {@link Arena.retiredCount}) rather
- * than wrapping, so a stale handle can never alias as valid. Handles are not
- * unique across arenas: a handle from one arena (or a previous run) is only
- * meaningful to the arena that minted it.
+ * than wrapping, so rollover never re-issues a generation. {@link Arena.clear}
+ * is the exception: it re-opens the ABA window (it re-issues an already-used
+ * generation), and a fresh arena issues generation 1 again, so retain no
+ * pre-clear or persisted handle across `clear()` or into a fresh arena. Handles
+ * are not unique across arenas: a handle from one arena (or a previous run) is
+ * only meaningful to the arena that minted it.
  */
 export type Entity = number;
 
@@ -145,11 +148,11 @@ export class Arena {
     readonly activeCount: number;
 
     /**
-     * Number of slots permanently retired by generation exhaustion.
+     * Number of slots retired by generation exhaustion (until {@link Arena.clear} revives them).
      *
      * A slot is retired when it has issued all 4095 of its live generations;
-     * it is never recycled, so a stale handle can never alias as valid
-     * (fail-closed rollover; see the docs on {@link Entity}). Retirement is a
+     * it is never recycled by rollover, so rollover never re-issues a
+     * generation (clear() is the exception, see {@link Arena.clear}; fail-closed rollover; see the docs on {@link Entity}). Retirement is a
      * cold-path event, but it is a budget, not a rarity: at the default 20/12
      * split the arena has `capacity x 4095` despawns from construction (the
      * free list is LIFO, so a hot slot is reused at once). The first retirement
@@ -166,7 +169,12 @@ export class Arena {
      * Like `data.x`, `reserve()` REPLACES this array: re-read it after growing.
      * Read-only from user code; write through setFlags / clearFlags. A direct write to a bit
      * registered with `{ indexed }` (e.g. `flags[s] |= F.x`) is UNSUPPORTED: it leaves the
-     * column and `flagCount` out of step, and no mode detects it (M-39).
+     * column and `flagCount` out of step, and no mode detects it (M-39). A mask whose
+     * `valueOf()` registers INDEXED flags (registerFlags with `{ indexed }`) while the
+     * prototype `setFlags` is converting it is UNSUPPORTED re-entrancy (M-63): the in-flight
+     * call writes the row bit, not the column, with the same effect (`flagCount` reads 0 for
+     * a flagged entity, a later `clearFlags` drives it to -1); register every flag before
+     * setting any. The Hi twin `setFlagsHi` / `registerFlagsHi` is the same.
      * Bits 30-31 are plain int32 inside the array; held in a JS variable they may be
      * heap numbers on pointer-compressed engines (nominal; Node cannot observe it).
      */
@@ -201,6 +209,8 @@ export class Arena {
      *   `undefined` `excluded` mask throws (omitting it is fine), and every entity method
      *   (isAlive / despawn / add / has / remove / idx) throws on a handle that is not an
      *   int32 (a `>>> 0` / Uint32Array copy) -- that are OFF and zero-cost in production.
+     *   Checked `join(a, b)` validates plan staleness ONLY: it has no foreign-set / same-set
+     *   guard (those are `joinN`'s checked M-13 / M-22 checks; AR-09, ADR 0004 section 5).
      *   The production hot paths are byte-for-byte unaffected by this flag.
      * @throws Error when `maxEntities` is not an integer in that range.
      */
@@ -273,8 +283,9 @@ export class Arena {
      * buffer, and `reserve()` refuses to grow an arena that has any caller-backed
      * component (see decisions/0006). The tick loop is identical either way.
      *
-     * `options` is optional; when given it must be a plain object whose only own key is
+     * `options` is optional; when given (not `undefined` / `null`) it must be a plain object whose only own key is
      * `buffers` -- `5`, `'x'`, `true`, `[]`, a class instance or any other key throw (M-56).
+     * `undefined`, `null`, `{}` and `{ buffers: undefined }` own-allocate.
      *
      * @example
      *   const Transform = arena.registerComponent({
@@ -418,11 +429,14 @@ export class Arena {
      * operation that allocates nothing. Every slot is left free, with 4094
      * generations per revived slot still to issue.
      *
-     * Every {@link Entity} handle minted before `clear()` is INVALID afterward --
-     * `isAlive()` rejects it (the honest contract of a reset). Reviving retired
-     * slots restores full capacity and returns `retiredCount` to 0. Do not retain
-     * or test any pre-clear handle across a `clear()`; handles persisted from
-     * another run fail closed on a fresh or cleared arena.
+     * The contract of a reset: retain NO handle minted before `clear()`. `isAlive()`
+     * rejects each slot's MOST RECENT pre-clear handle, not every older one:
+     * `clear()` re-opens the ABA window by re-issuing an already-used generation (a
+     * retired slot -> 2, gen 4095 -> 1, every other slot g -> g + 1), so an old
+     * handle whose generation equals the slot's new one is live again after that
+     * slot's next spawn (ADR 0004 section 3). A fresh arena issues generation 1
+     * again, so a handle persisted from another run or arena is no safer. Reviving
+     * retired slots restores full capacity and returns `retiredCount` to 0.
      */
     clear(): void;
 
@@ -441,7 +455,10 @@ export class Arena {
      * `despawn` are installed as OWN methods, so a subclass override of them is SHADOWED
      * (M-42; `despawn` still runs the prototype `despawn` last). Write indexed bits only
      * through the API: a direct `flags[i] |= F.x` on an indexed bit desyncs the column and
-     * the count, which is UNSUPPORTED and undetected, even in checked mode (M-39). Memory:
+     * the count, which is UNSUPPORTED and undetected, even in checked mode (M-39); so is a
+     * mask whose `valueOf()` calls this method with `{ indexed }` while a prototype
+     * `setFlags` / `setFlagsHi` is converting it (M-63: that call writes the row bit, not
+     * the column). Register every flag before setting any. Memory:
      * 135,296 B per indexed flag at capacity 1,048,575 (column 131,072 + two summaries
      * 4,096 + 128), plus a 128 B count table per word; 0 B when nothing is indexed.
      *

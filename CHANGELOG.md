@@ -33,6 +33,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - `despawn` bytecode 222 B (was 215; +7 B, `entity |= 0`), node v26.8.2. `ixDespawn` is 319 B (unchanged).
+- Docs (M-58): README, llms.txt, Arena.d.ts and ADRs 0001 / 0004 no longer say a stale handle "can never alias", and say that
+  `clear()` revives retired slots. Retirement never re-issues a generation, but `clear()` re-opens the ABA window and a
+  fresh arena issues generation 1 again: retain no pre-clear or persisted handle across `clear()` or into a fresh arena.
+- Docs (M-63): a mask whose `valueOf()` registers INDEXED flags while a prototype `setFlags` / `setFlagsHi` is
+  converting it is documented as unsupported re-entrancy (it desyncs the column like a direct row write; register every
+  flag before setting any).
+- Docs (M-64): every benchmark / estimate figure in README and llms.txt carries a tier (REPORTED, NOMINAL or
+  illustrative). The headline figures are labelled as the v1.6.1 run, not re-measured for 1.12.x; the llms.txt
+  headline table is replaced by the README Workload 2 rows; the "hold across machines" and "you should see" wording
+  is gone; the no-GC claim is attributed to `npm run torture`.
+- Docs (M-67 / F-7): checked `join(a, b)` validates plan staleness only; the foreign-set / same-set guards belong to
+  `joinN`.
 
 ### Tests
 - New: `test/cold-paths-1121a.test.js` (+ `test/cold-1121a-probe.mjs`, golden `test/golden/cold-1121a-3eb87a7.json`),

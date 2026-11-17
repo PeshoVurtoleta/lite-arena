@@ -8,7 +8,8 @@ Ships in: v1.6.0
 ## Context
 
 Decision 0001 made generational rollover fail-closed: a slot that exhausts its
-4095 live generations is permanently RETIRED on despawn rather than wrapping its
+4095 live generations is permanently RETIRED on despawn (section 3: `clear()`
+revives it) rather than wrapping its
 counter and re-issuing a stale generation. That is the right call and it is well
 argued. What 0001 left open is that the caller cannot see retirement coming.
 
@@ -106,6 +107,12 @@ AR-11, which 0003 deferred, WITHOUT the fast-path tax that forced the deferral:
   every unchecked set stays monomorphic on the prototype method. This is the
   "separate checked variant" 0003 anticipated: the cost lands only in checked
   mode, never on the flag being merely present.
+- (2026-11-17, 1.12.1, M-57 / M-68) entity handles: checked isAlive / add / has /
+  remove / despawn / idx throw on a non-int32 handle (`checkHandle`: a `>>> 0` /
+  Uint32Array copy, undefined, NaN, a fraction, a string); production despawn
+  canonicalizes (`entity |= 0`, despawn pin 215 -> 222 B).
+- (2026-11-17, 1.12.1, M-67 / F-7) scope: checked `join()` has the staleness guard
+  only. Foreign-set / same-set checks belong to `joinN` (M-13 / M-22).
 
 ## Consequences
 

@@ -12,7 +12,7 @@
 
 **Pre-allocated, zero-GC Entity-Component-System for 60 fps simulations, particle systems, and bullet-hell hot loops.**
 
-One allocation per component, for the lifetime of the universe. No `new Map`, no `splice`, no `delete obj.field` deopts. Generational handles defeat the ABA problem. Swap-and-pop keeps your iteration loop dense and cache-friendly.
+One allocation per component, for the lifetime of the universe. No `new Map`, no `splice`, no `delete obj.field` deopts. Generational handles close the ABA problem through despawn and rollover (not across `clear()`; see [Edge cases](#edge-cases--guarantees)). Swap-and-pop keeps your iteration loop dense and cache-friendly.
 
 ```js
 import { Arena } from '@zakkster/lite-arena';
@@ -92,9 +92,9 @@ function tick(dt) {
 
 Three failure modes are baked in:
 
-1. **Object property reads are polymorphic.** As soon as `particles` mixes shapes (subclasses, dynamically added fields), the JIT can't inline `p.x` and falls back to a megamorphic cache lookup. Roughly 4-10× slowdown vs. typed-array reads.
-2. **Every `splice` is O(n).** Removing 30 % of a 10k particle array per frame = 1.5M shifts per second.
-3. **Every dead particle becomes garbage.** Major-GC pauses show up as periodic 30 ms hitches in a 16.67 ms frame budget.
+1. **Object property reads are polymorphic.** As soon as `particles` mixes shapes (subclasses, dynamically added fields), the JIT can't inline `p.x` and falls back to a megamorphic cache lookup. Roughly 4-10× slowdown vs. typed-array reads (illustrative, NOMINAL; not measured in this repo).
+2. **Every `splice` is O(n).** Removing 30 % of a 10k particle array per frame = 1.5M shifts per second (illustrative, NOMINAL).
+3. **Every dead particle becomes garbage.** Major-GC pauses show up as periodic 30 ms hitches (illustrative, NOMINAL) in a 16.67 ms frame budget (arithmetic: 1000 / 60).
 
 ```mermaid
 flowchart LR
@@ -122,7 +122,7 @@ flowchart LR
 
 - **Not a game engine.** No renderer, no physics, no scene graph.
 - **Not a query language.** No `arena.query(Position, Velocity).each(...)`. Iterate `dense[0..count)` directly — JIT inlines it perfectly.
-- **Not magic.** A hand-rolled struct-of-arrays with no bookkeeping is ~1.1× faster on iteration (see [benchmarks](#benchmarks)). This library trades that for **multi-component composition, generational handles, automatic cascade-delete, and dense iteration** in a single file.
+- **Not magic.** A hand-rolled struct-of-arrays with no bookkeeping matched it on iteration and was 10.8x faster on spawn/despawn churn (REPORTED, v1.6.1 run; see [benchmarks](#benchmarks)). This library trades that for **multi-component composition, generational handles, automatic cascade-delete, and dense iteration** in a single file.
 
 ---
 
@@ -251,29 +251,31 @@ sequenceDiagram
 
 ### Why hoist `comp.data.x` to a local?
 
-Same reason you'd hoist any `this.field` in a hot loop — the JIT optimises typed-array indexed access far better than property chains:
+Same reason you'd hoist any `this.field` in a hot loop — the JIT optimises typed-array indexed access far better than property chains. The figures in this table are illustrative (NOMINAL) estimates, not a reported or gated measurement:
 
 | Pattern | 10k entities × 200 frames | Notes |
 |---|---|---|
 | `Position.data.x[i]` in body | ~12 ms | one-property chain per access; usually fine |
 | `const x = Position.data.x` hoisted | ~8 ms | **recommended for inner loops** |
 
-The numbers are stable across V8 / JSC / SpiderMonkey. Hoist whenever the loop is the bottleneck.
+They are illustrative and were not measured across engines. Hoist whenever the loop is the bottleneck.
 
 ---
 
 ## Case study: a 50,000-particle simulation
 
-We rendered a 50,000-particle gravity-well simulation three ways, identical math, identical canvas output:
+We rendered a 50,000-particle gravity-well simulation three ways, identical math, identical canvas output. The chart and table below are illustrative (NOMINAL) figures, not a gated or re-measured result:
 
 ```mermaid
 %%{init: {"theme":"dark"}}%%
 xychart-beta
-    title "ms/frame at 50k particles, identical sim — lower is better"
+    title "ms/frame at 50k particles, identical sim (illustrative) — lower is better"
     x-axis ["lite-arena", "Manual SoA", "Map<id,Obj>", "Array<Object>"]
     y-axis "ms" 0 --> 50
     bar [2.1, 2.3, 9.8, 7.1]
 ```
+
+The same illustrative (NOMINAL) figures as a table:
 
 | Strategy | ms/frame | Heap delta / 60 frames | Comment |
 |---|---:|---:|---|
@@ -282,21 +284,23 @@ xychart-beta
 | `Map<id, Particle>` | 9.8 ms | hundreds of KB | hash lookup + polymorphic property reads |
 | `Array<Particle>` + splice | 7.1 ms | tens of MB | splice O(n), GC stutter |
 
-A 60 fps frame is **16.67 ms**. lite-arena uses ~13 %; the array-of-objects approach burns ~42 % *before* any game logic runs.
+A 60 fps frame is **16.67 ms** (arithmetic: 1000 / 60). lite-arena uses ~13 %; the array-of-objects approach burns ~42 % *before* any game logic runs (arithmetic on the illustrative figures above: 2.1 / 16.67 and 7.1 / 16.67).
 
-*Illustrative figures from a laptop-class run of the bundled 50k-particle demo (a full canvas simulation, not `npm run bench`); the reproducible micro-benchmarks in [Benchmarks](#benchmarks) below are stamped with their machine and version.*
+*Illustrative (NOMINAL) figures from a laptop-class run of the bundled 50k-particle demo (a full canvas simulation, not `npm run bench`); the reproducible micro-benchmarks in [Benchmarks](#benchmarks) below are stamped with their machine and version.*
 
 ### When it matters
+
+All figures in this table are NOMINAL, illustrative estimates, not measurements.
 
 | Scenario | Entities | Without lite-arena | With lite-arena |
 |---|---:|---|---|
 | Menu UI | ~50 | irrelevant | irrelevant |
 | Platformer | ~500 | fine | fine |
-| **Twitch overlay particles** | **~5,000** | **GC stutter every few seconds** | **~0.5 ms/frame, no GC** |
+| **Twitch overlay particles** | **~5,000** | **GC stutter every few seconds** | **~0.5 ms/frame, no GC (torture-gated)** |
 | Bullet hell | ~20,000 | drops to 30 fps | ~1 ms/frame |
 | Boid flock / cellular automaton | ~100,000 | off the budget | ~5 ms/frame |
 
-Rule of thumb: once your per-frame entity count passes ~2,000 with multiple components per entity, the allocation profile of your bookkeeping matters more than the math.
+Rule of thumb (an illustrative heuristic, not a measurement): once your per-frame entity count passes ~2,000 with multiple components per entity, the allocation profile of your bookkeeping matters more than the math.
 
 ---
 
@@ -317,7 +321,7 @@ Throws if `maxEntities` is out of range or non-integer.
 |---|---|---|
 | `capacity` | `number` | As passed. |
 | `activeCount` | `number` | Current number of living entities. Read-only. |
-| `retiredCount` | `number` | Slots permanently retired by generation exhaustion (fail-closed rollover). A budget, not a rarity: `capacity x 4095` despawns at the default split, first retirement at about `4095 x entity lifetime`; see [Generational rollover](#edge-cases--guarantees). Read-only. |
+| `retiredCount` | `number` | Slots retired by generation exhaustion until `clear()` revives them (fail-closed rollover). A budget, not a rarity: `capacity x 4095` despawns at the default split, first retirement at about `4095 x entity lifetime`; see [Generational rollover](#edge-cases--guarantees). Read-only. |
 | `flags` | `Int32Array \| null` | Per-slot flag words (length = capacity), `null` until `registerFlags()`. `reserve()` replaces it: re-read after growing. See [Entity flags](#entity-flags). Read-only. |
 | `flagsHi` | `Int32Array \| null` | The second flag word (bits 32..63, M-26): per-slot, `null` until `registerFlagsHi()`. `reserve()` replaces it: re-read after growing. Read-only. |
 | `indexMask` | `number` | Mask from a handle to its slot index (0xFFFFF today). Hoist it; do not hard-code 0xFFFFF. Read-only. |
@@ -330,7 +334,7 @@ Throws if `maxEntities` is out of range or non-integer.
 | `isAlive(e)` | `boolean` | O(1). Production: safe on any number and never throws on one (a Symbol / BigInt is the engine's `TypeError`). [Checked mode](#checked-mode-development-only) throws unless `e` is an int32 (a `>>> 0` / Uint32Array copy is rejected, M-57). |
 | `despawn(e)` | `boolean` | O(registered components). Removes from every component; returns false if already dead or if `e` names a free slot (nothing changes). Production canonicalizes a live handle (`e \| 0`, after the alive check), so a `>>> 0` / Uint32Array copy of a generation >= 2048 handle is still removed from every component; checked mode throws on that copy (M-57 / M-68). On an arena with [indexed flags](#indexed-flags-1120) it also drops the entity from the indexed columns (an own method there, M-42: a subclass `despawn` override is not called). |
 | `remainingCapacity()` | `number` | O(1). Slots still spawnable right now: `capacity - activeCount - retiredCount`. Equals the free-list length, so `activeCount + retiredCount + remainingCapacity() === capacity` always holds. Falls below `capacity - activeCount` once slots retire. |
-| `registerComponent(schema, options?)` | `SparseSet` | Mounts a new SoA component. Schema: `{ key: TypedArrayConstructor }`. `options` is optional and must be a plain object whose only own key is `buffers` (`5`, `'x'`, `true`, `[]` and other keys throw, M-56). **Validated at registration** (a cold path): every field type must be one of the nine numeric TypedArray constructors, or it throws a library error naming the offending key (see [Schema validation](#schema-validation)). |
+| `registerComponent(schema, options?)` | `SparseSet` | Mounts a new SoA component. Schema: `{ key: TypedArrayConstructor }`. `options` is optional: `undefined`, `null`, `{}` and `{ buffers: undefined }` own-allocate; anything else given must be a plain object whose only own key is `buffers` (`5`, `'x'`, `true`, `[]` and other keys throw, M-56). **Validated at registration** (a cold path): every field type must be one of the nine numeric TypedArray constructors, or it throws a library error naming the offending key (see [Schema validation](#schema-validation)). |
 | `registerTag()` | `SparseSet` | Zero-size tag component (membership only). `registerComponent({})` with intent. `data` is an empty null-prototype object. |
 | `join(a, b)` | `{ driver, other, count }` | Cold-path join planner. Returns a **reused** scratch with the smaller-count set as `driver`; allocates nothing. Not an iterator — you write the loop. In [checked mode](#checked-mode-development-only) it returns a plan that throws if read after the next `join()`. |
 | `joinN(required, excluded?, reqMask?, excMask?, reqMaskHi?, excMaskHi?)` | `{ driver, count, driverFlag, driverFlagCount, others, othersCount, excl, exclCount, reqMask, excMask, flags, reqMaskHi, excMaskHi, flagsHi }` | Cold-path **k-way + exclusion** planner: "in every `required` set AND in none of `excluded`". The k-input sibling of `join` (which is untouched). Picks the rarest `required` set as `driver` (ties favour the first); `others`/`excl` are **grow-once reused** scratch arrays -- loop to `othersCount`/`exclCount`, never `.length`. Zero-alloc steady-state. Fail-closed: empty/null `required` throws; a set in both lists is empty (throws in checked mode). Optional **flag masks** (1.10.0): `reqMask` bits must all be set and `excMask` bits all clear in the entity's flag word; the plan carries both (normalised `\| 0`) plus `flags` (`arena.flags`, `null` without `registerFlags()`; `reserve()` refreshes the production plan's `flags`, a hoisted row keeps the old one). Optional **Hi masks** (1.11.0, args 5-6): the same test against the second word `arena.flagsHi`; the plan also carries `reqMaskHi` / `excMaskHi` / `flagsHi`. The extra cost is O(1) per call (not zero); with both Hi masks 0 the loop reads no Hi row. **Driver hint (1.12.0):** on an arena with an indexed word-0 flag the plan also carries `driverFlag` (the mask of the rarest indexed required flag that is rarer than the driver set, else `0`) and `driverFlagCount` (that flag's `flagCount`, else `-1`); a non-indexed arena keeps `0` / `-1`. See [Indexed flags](#indexed-flags-1120) and [Entity flags](#entity-flags). |
@@ -345,7 +349,7 @@ Throws if `maxEntities` is out of range or non-integer.
 | `nextFlagged(flag, prev)` / `nextFlaggedHi(flag, prev)` | `Entity` | (1.12.0) The next flagged handle above `prev`'s slot, or `-1`. Hot: production trusts `flag` and `prev` (pass only a handle `firstFlagged` / `nextFlagged` returned). Checked mode validates both. |
 | `clearFlagAll(flag)` / `clearFlagAllHi(flag)` | `void` | (1.12.0) O(flagged). Clears the indexed flag on every entity carrying it; `flagCount(flag)` is `0` afterwards. Same `flag` validation as `flagCount`. |
 | `reserve(newCap)` | `boolean` | **Explicit, between-frames capacity growth** -- the only way the arena grows. Reallocates every backing buffer (all handles/data preserved); `false` no-op if `newCap <= capacity` (on EVERY arena, caller-backed, rebound and detached included, M-59; only a real growth request reaches those refusals). Invalidates hoisted refs -- re-read `data.x`, `arena.flags` and `arena.flagsHi` after. Indexed columns are grown and their counts kept. |
-| `clear()` | `void` | Resets the arena to empty **without reallocating** -- rebuilds the free list, bumps every generation, revives every retired slot, zeroes each component's `count` (and every indexed column and `flagCount`). O(capacity), allocates nothing. **Every handle minted before `clear()` is invalid afterward.** |
+| `clear()` | `void` | Resets the arena to empty **without reallocating** -- rebuilds the free list, bumps every generation, revives every retired slot, zeroes each component's `count` (and every indexed column and `flagCount`). O(capacity), allocates nothing. **Retain no handle minted before `clear()`** (nor one persisted from another run, into a fresh arena): `isAlive()` rejects each slot's most recent pre-clear handle, but `clear()` re-issues generations (a retired slot -> 2, 4095 -> 1, every other `g` -> `g + 1`), so an older handle can be live again after its slot's next spawn (ADR 0004 section 3). |
 
 ### `SparseSet<T>` instance members
 
@@ -436,6 +440,7 @@ arena.clearFlagAll(F.boss);                 // O(flagged); flagCount(F.boss) is 
 - **Bad `flag` argument.** `flagCount`, `firstFlagged` and `clearFlagAll` throw, in production too, unless `flag` is exactly one indexed bit of that word: `needs registerFlags() with { indexed: [...] } first` when the word has no indexed flag at all (`registerFlagsHi()` for the `Hi` twins), else `needs exactly one indexed flag bit`. `nextFlagged` is the hot call and trusts its `flag` in production; checked mode validates it (and `prev`) before running.
 - **The walk contract (M-39 / M-52).** `nextFlagged` continues from `prev`'s SLOT and ignores its generation, so despawning or un-flagging `prev` inside the loop is supported. A flag set mid-loop on a higher slot is visited; on a lower slot it is not. Always start with `firstFlagged(F)` and pass only a handle `firstFlagged` / `nextFlagged` returned. A non-integer `prev` (`undefined`, `NaN`, `null`) is UNSUPPORTED in production: it resumes after slot 0 and silently skips a flagged slot 0. Checked mode throws instead (the M-18 non-32-bit-integer error).
 - **Direct writes are unsupported (M-39).** Write an indexed bit only through `setFlags` / `clearFlags` / `despawn` / `clearFlagAll` (and the `Hi` twins). `arena.flags[s] |= F.boss` or `arena.flagsHi[s] |= ...` on an indexed bit changes the row but not the column, so `flagCount` and the walk disagree with the row; checked mode does not detect it. Unindexed bits in the same word may still be written directly.
+- **Re-entrant indexed registration is unsupported (M-63).** A mask whose `valueOf()` calls `registerFlags` / `registerFlagsHi` with `{ indexed }` while the prototype `setFlags` / `setFlagsHi` is converting it desyncs the column: the in-flight call writes the row bit, not the column, exactly like a direct row write. `flagCount` then reads 0 for a flagged entity, and a later `clearFlags` or `despawn` drives it to -1; checked mode is immune (it rejects object masks). Register every flag before setting any. (Distinct from M-33's re-entrant `registerFlags` / `registerFlagsHi` call from a names getter or options Proxy trap: the inner call wins and the outer throws, `test/flags-m33.test.js`.)
 - **Subclass overrides are shadowed (M-42).** On an indexed arena `setFlags`, `clearFlags`, `despawn` (and the `Hi` twins) are own-property installs, so a subclass override of them is NOT called. On a plain arena it is. If you must hook those calls, do not index the arena's flags.
 - **Memory.** One indexed flag allocates 4 x (W + S1 + S2) bytes: the bit column W, and two summary levels S1 and S2. At capacity 1,048,575 that is 135,296 B per indexed flag (W 32,768 + S1 1,024 + S2 32 Int32 words = 131,072 + 4,096 + 128 B). Each word with an indexed bit also holds a 128 B count table; it is absent when no bit is indexed. Unindexed flags: 0 B. `reserve()` grows the columns and keeps the counts; `clear()` zeroes them.
 - **Complexity** (derived from the code, not timed). A walk over a flag with `m` matches reads about `m` + capacity / 1024 summary words, against an O(capacity) row scan, so it pays when the flag is rare; a flag set on most entities is cheaper to test in the row loop above. `flagCount` is a single read; `clearFlagAll` is O(flagged).
@@ -489,6 +494,8 @@ A lying schema used to silently produce a polymorphic `Array` or a boxed `Number
 
 `new Arena(n, { checked: true })` turns on assertions that catch silent API misuse: a stale `join()` plan, a misused `idx()`, a flag mask (or `joinN` mask) that is not a 32-bit integer (a supplied-but-`undefined` `joinN` mask or `hasFlags` / `hasFlagsHi` `excluded` mask included), an entity handle that is not an int32 (a `>>> 0` / Uint32Array copy: `isAlive` / `despawn` / `add` / `has` / `remove` throw, M-57), and a bad `flag` / `prev` passed to `nextFlagged` / the other indexed-flag methods. All are **off by default and byte-for-byte zero-cost in production** -- the production `join()` scratch, the prototype `idx()` and the prototype flag methods are unaffected by the flag (the checked versions are own properties that shadow them; on an indexed arena they delegate to the installed indexed bodies). Turn it on in tests, off in shipping builds.
 
+Scope note (M-67): checked `join(a, b)` validates plan staleness only. It has no foreign-set or same-set guard; those belong to `joinN`'s checked M-13 / M-22 checks (AR-09, ADR 0004 section 5).
+
 ```js
 const arena = new Arena(1000, { checked: true });
 
@@ -539,7 +546,7 @@ In production those same calls take the fast path: `join()` returns the reused s
 
 ### Headline result
 
-Measured on an **Apple M4 Pro (arm64), Node v26.3.1, lite-arena v1.6.1** — median of 7 trials via `npm run bench`. Absolute milliseconds scale with your hardware and JS engine; **the ratios are what to compare**, and they hold across machines. Re-run `npm run bench` to get your own.
+REPORTED figures, measured on an **Apple M4 Pro (arm64), Node v26.3.1, lite-arena v1.6.1** — median of 7 trials via `npm run bench`. They were **not re-measured for 1.12.x** (the re-stamp waits for the next quiet run). Absolute milliseconds scale with your hardware and JS engine; compare ratios within one run, and re-run `npm run bench` to get your own.
 
 ```
 Workload 1: Spawn/Despawn churn (10k cycles)
@@ -566,7 +573,7 @@ Workload 4: Reset & refill (empty the container, refill to N)
   Map<id, object> (clear)           0.34 ms      80 B     9.4×
 ```
 
-**Takeaway:** on the operation that runs *every frame* — **iteration** — lite-arena is the fastest option: it matches a hand-rolled struct-of-arrays and beats `Array<Object>` ~1.9× and `Map` ~2.7×. Spawn/despawn churn is slower than a feature-less manual pool because lite-arena does more per op (multi-component cascade-delete, generational-handle protection, sparse-set membership) — the price of composition and safety; it still edges `Map`. One-shot removal is close: on this engine `Map`'s native `delete` is very fast, and lite-arena's workload also spawns and despawns all N. `clear()` resets in place, allocation-free, several× faster than rebuilding a fresh arena. The portable story across machines: **iteration wins, heap deltas stay in the tens of bytes, and you never take a GC pause.**
+**Takeaway (in this v1.6.1 run, REPORTED):** on the operation that runs *every frame* — **iteration** — lite-arena was the fastest option: it matched a hand-rolled struct-of-arrays and beat `Array<Object>` ~1.9× and `Map` ~2.7×. Spawn/despawn churn is slower than a feature-less manual pool because lite-arena does more per op (multi-component cascade-delete, generational-handle protection, sparse-set membership) — the price of composition and safety; it still edged `Map`. One-shot removal was close: on this engine `Map`'s native `delete` is very fast, and lite-arena's workload also spawns and despawns all N. `clear()` reset in place, allocation-free, several× faster than rebuilding a fresh arena (Workload 4 above). What this run measured: **iteration won and heap deltas stayed in the tens of bytes.** The no-GC claim is not a bench result: it is gated by `npm run torture` (DETERMINISTIC counts).
 
 ### Running the bench
 
@@ -602,8 +609,9 @@ Runs **586 test cases** (584 pass, 2 skipped without `--expose-gc`, on node v26.
 | Swap-and-pop correctness | middle/last/single-element removal, SoA data integrity |
 | Retirement budget | deterministic generation-retirement counts (`test/budget.test.js`): `capacity x 4095`, `clear()` 4094 refill, `reserve()` growth, Arena(1000) workloads |
 | Free-slot flag | a free slot's next handle is not alive; census `aliveCount === activeCount`; generation-stream parity (`test/free-slot.test.js`) |
-| Retirement observability | `remainingCapacity()` exactness, exhaustion message names full vs. retired, `clear()` resets + revives + invalidates prior handles |
-| Checked mode | stale `join()` plan throws; `idx()` on dead/non-member throws; non-32-bit-integer flag or `joinN` masks throw (a supplied `undefined` `hasFlags(Hi)` `excluded` too, `test/flags-checked.test.js` 13 tests, `test/flags-hi-checked.test.js` 14 tests); a non-int32 entity handle throws and production `despawn` canonicalizes (`test/handle-canonical.test.js`, 14 tests); registration / rebind / reserve cold paths (`test/cold-paths-1121a.test.js`); `joinN` `(reqMask & excMask) !== 0` throws; a throwing checked `joinN` leaves earlier plans valid; a non-SparseSet `required` entry gets the foreign-set error; prototype `idx()` untouched |
+| Retirement observability | `remainingCapacity()` exactness, exhaustion message names full vs. retired, `clear()` resets + revives; the most recent pre-clear handle of each slot is rejected |
+| Checked mode | stale `join()` plan throws; `idx()` on dead/non-member throws; non-32-bit-integer flag or `joinN` masks throw (a supplied `undefined` `hasFlags(Hi)` `excluded` too, `test/flags-checked.test.js` 13 tests, `test/flags-hi-checked.test.js` 14 tests); a non-int32 entity handle throws and production `despawn` canonicalizes (`test/handle-canonical.test.js`, 14 tests); `joinN` `(reqMask & excMask) !== 0` throws; a throwing checked `joinN` leaves earlier plans valid; a non-SparseSet `required` entry gets the foreign-set error; prototype `idx()` untouched |
+| Cold-path hardening (1.12.1) | registration options / buffers, rebind aliasing (M-61), `reserve()` no-op (`test/cold-paths-1121a.test.js`) |
 | Indexed flags (1.12.0) | oracle suites against a harness row scan (`test/flags-indexed.test.js`, `test/flags-indexed-hi.test.js`, `test/flags-indexed-checked.test.js`); the walk, error texts and M-52 `prev` contract; the new-space allocation gate (`test/flags-indexed-alloc.test.js`: scavenge COUNTS at a pinned 1 MiB semi-space, every lane <= noop + 1 Scavenge, a byte-delta lane and a reserve-retention check); the `joinN` hint (`test/joinN-hint.test.js`); qa boundary matrices (`test/f2-qa-boundary.test.js`, `test/f2-qa-scan-fullcap.test.js`) |
 | Entity flags | register / set / clear / has semantics, 32nd-bit mask, dead handles (`test/flags.test.js`); checked-mode mask validation (`test/flags-checked.test.js`); mask converted before the alive check, re-entrant register (`test/flags-m33.test.js`, 17 tests); qa boundary suite (`test/flags-hi-qa.test.js`, 16 tests) |
 | `remove()` allocation | scavenge-count gate per 500,000 swapping removes: 1-col, 4-col and tag sets <= noop + 1, must-fail control (`test/remove-alloc.test.js`) |
@@ -630,12 +638,12 @@ The unit tests prove behaviour; the torture gate proves the *guarantees*. It pri
 npm run bench
 ```
 
-Reproduces the [headline numbers](#headline-result). On any 2020+ machine you should see:
+Re-runs the [headline workloads](#headline-result). The v1.6.1 run (REPORTED, Apple M4 Pro, Node v26.3.1) measured:
 
-- lite-arena **iteration matches or beats a hand-rolled SoA** (within JIT noise)
-- lite-arena **iteration ~1.9× faster than `Array<Object>`, ~2.7× faster than `Map<id, Object>`**
-- Heap deltas **< 100 bytes** across the churn, iteration, and removal workloads (the steady-state hot paths)
-- `clear()` reuse **allocation-free and several× faster** than allocating a fresh arena on the reset workload
+- lite-arena **iteration matched or beat a hand-rolled SoA** (within JIT noise)
+- lite-arena **iteration ~1.9× faster than `Array<Object>`, ~2.7× faster than `Map<id, Object>`** (REPORTED, v1.6.1 run)
+- Heap deltas **< 100 bytes** (REPORTED, same run) across the churn, iteration, and removal workloads (the steady-state hot paths)
+- `clear()` reuse **allocation-free and several× faster** than allocating a fresh arena on the reset workload (REPORTED, same run)
 
 ### 4. Visual smoke test — "does it actually work?"
 
@@ -644,7 +652,7 @@ Reproduces the [headline numbers](#headline-result). On any 2020+ machine you sh
 open demo/demo.html
 ```
 
-A 50,000-particle gravity simulation. Drag to move the gravity well; observe constant-time frame stats in the corner. If you toggle the mode buttons to "Array<Object>" or "Map" you'll see the framerate halve and GC stutter appear in the stats graph. The **lite-arena + Worker** backend runs the physics off the main thread via the 1.8.0 transferable round-trip (`detach` -> transfer -> integrate -> transfer back -> `rebind`) — plain `ArrayBuffer` transfers, no cross-origin isolation, the same path that runs inside a Twitch Extension iframe.
+A 50,000-particle gravity simulation. Drag to move the gravity well; observe constant-time frame stats in the corner. If you toggle the mode buttons to "Array<Object>" or "Map" the stats graph shows slower frames and GC stutter (illustrative, NOMINAL; the demo is not a gated measurement). The **lite-arena + Worker** backend runs the physics off the main thread via the 1.8.0 transferable round-trip (`detach` -> transfer -> integrate -> transfer back -> `rebind`) — plain `ArrayBuffer` transfers, no cross-origin isolation, the same path that runs inside a Twitch Extension iframe.
 
 ### Quick `npm run` reference
 
@@ -748,10 +756,10 @@ worker.onmessage = ({ data: vxBuf }) => Vel.rebind({ vx: vxBuf });   // data.vx 
 
 ## Edge cases & guarantees
 
-- **Stale handles are detected, not just suspected.** A handle stores its slot's generation at the moment it was issued; despawn bumps the generation. `isAlive(staleHandle)` returns false, full stop — even after the slot has been reused by a different entity.
-- **Generational rollover is fail-closed: the slot retires, it never aliases.** The 12-bit generation counter issues 4095 live generations per slot. On the despawn that would exhaust them, the slot is **permanently retired** — withdrawn from the free list so it is never recycled — instead of wrapping and re-issuing an old generation. A stale handle therefore *never* aliases as valid, on any code path. The cost is a despawn BUDGET: at the default 20/12 split the arena has `capacity x 4095` despawns from construction (the free list is LIFO, so a hot slot is reused at once). The first retirement lands at about `4095 x entity lifetime`, and `spawn()` fails at or before `capacity x 4095 / despawns-per-second`, sooner when many entities are alive (bound: `(cap - active) x 4095 <= D <= cap x 4095 - active`). For `Arena(1000)`: 1 spawn/frame with a 1-frame life retires its first slot at despawn #4095 and fails at 4,095,000 despawns (100%); 10/frame with a 30-frame life fails at 3,685,310 (90%); 5/frame with a 1..120-frame life fails at 3,115,308 (76.08%). At 60 fps (arithmetic from those counts, not a separate measurement) that is a first retirement after 68.3 s and failure after 18.96 h for the first, 2047.5 s and 1.71 h for the second, 4297.0 s and 2.88 h for the third. `clear()` refills 4094 generations per revived slot; `reserve()` adds `(newCap - cap) x 4095`. The counts are deterministic and gated by `test/budget.test.js`. `arena.retiredCount` reports how many slots have retired: watch it, and `clear()` or `reserve()` before the wall. See [decisions/0001-generational-rollover.md](decisions/0001-generational-rollover.md) for the full tradeoff. (Retirement lives entirely on the `despawn` cold path — `isAlive()` and the hot loop are untouched.)
+- **Stale handles are detected, not just suspected.** A handle stores its slot's generation at the moment it was issued; despawn bumps the generation. `isAlive(staleHandle)` returns false through despawn and slot reuse — even after the slot has been reused by a different entity. The one exception is `clear()` (see below), which re-issues generations.
+- **Generational rollover is fail-closed: the slot retires, rollover never aliases.** The 12-bit generation counter issues 4095 live generations per slot. On the despawn that would exhaust them, the slot is **retired** (until `clear()` revives it) — withdrawn from the free list so rollover never recycles it — instead of wrapping and re-issuing an old generation. A stale handle therefore never aliases through rollover; `clear()` is the exception (see below), and a fresh arena issues generation 1 again. The cost is a despawn BUDGET: at the default 20/12 split the arena has `capacity x 4095` despawns from construction (the free list is LIFO, so a hot slot is reused at once). The first retirement lands at about `4095 x entity lifetime`, and `spawn()` fails at or before `capacity x 4095 / despawns-per-second`, sooner when many entities are alive (bound: `(cap - active) x 4095 <= D <= cap x 4095 - active`). For `Arena(1000)`: 1 spawn/frame with a 1-frame life retires its first slot at despawn #4095 and fails at 4,095,000 despawns (100%); 10/frame with a 30-frame life fails at 3,685,310 (90%); 5/frame with a 1..120-frame life fails at 3,115,308 (76.08%). At 60 fps (arithmetic from those counts, not a separate measurement) that is a first retirement after 68.3 s and failure after 18.96 h for the first, 2047.5 s and 1.71 h for the second, 4297.0 s and 2.88 h for the third. `clear()` refills 4094 generations per revived slot; `reserve()` adds `(newCap - cap) x 4095`. The counts are deterministic and gated by `test/budget.test.js`. `arena.retiredCount` reports how many slots have retired: watch it, and `clear()` or `reserve()` before the wall. See [decisions/0001-generational-rollover.md](decisions/0001-generational-rollover.md) for the full tradeoff. (Retirement lives entirely on the `despawn` cold path — `isAlive()` and the hot loop are untouched.)
 - **Synthesizing handle `0` is safe.** Generation 0 is never issued (generations start at 1), so the all-zero bit pattern is reliably rejected. A common pattern: store `0` as your "no entity" sentinel in custom data structures; `arena.isAlive(0)` is guaranteed false on a fresh arena.
-- **A free slot's next handle is not alive.** Free slots carry a FREE flag in `generations` (spawn strips it, despawn sets it), so `isAlive`, `add` and `despawn` reject a handle for a slot that is not currently spawned, including one persisted from another run or arena (handles are not unique across arenas). See [decisions/0009-free-slot-flag.md](decisions/0009-free-slot-flag.md).
+- **A free slot's next handle is not alive.** Free slots carry a FREE flag in `generations` (spawn strips it, despawn sets it), so `isAlive`, `add` and `despawn` reject a handle for a slot that is not currently spawned, including one persisted from another run or arena (handles are not unique across arenas: a persisted handle can be alive in a fresh arena once its slot is spawned at that generation). See [decisions/0009-free-slot-flag.md](decisions/0009-free-slot-flag.md).
 - **Flag typos fail open in production; a dead handle is `false`.** `setFlags(e, F.tpyo)` (undefined mask) is a silent no-op returning `true`, and `hasFlags(e, F.tpyo)` is `true`; checked mode throws. `setFlags` / `clearFlags` / `hasFlags` on a dead handle return `false` and write nothing (a BigInt or Symbol mask throws `TypeError` even then, since the mask is converted first). See [Entity flags](#entity-flags).
 - **`despawn()` cascades to every registered component.** You never need to manually `pos.remove(e); vel.remove(e); sprite.remove(e); arena.despawn(e)` — just `arena.despawn(e)`.
 - **`remove()` allocates nothing, within a limit.** It walks a per-set cached column array (no `for...in`); measured 0 scavenges per 500,000 swapping removes for 1-col and tag sets, 0-1 for 4-col (7 runs, Node 26.8.2, darwin, 2026-10-27; gated <= noop + 1 in test/remove-alloc.test.js). That holds while the whole app's components use <= 4 distinct TypedArray kinds at the shared swap site (V8 polymorphic limit); above that each Float32/Float64 column boxes 16 B per swapping remove (6 kinds: 16 scavenges per 500,000 in all 7 runs, REPORTED). 16 B is Node's HeapNumber (12 B pointer-compressed, NOMINAL); a Uint32 value >= 2^31 boxes too once past 4 kinds (0 vs 7-8 scavenges per 500,000 swapping removes (REPORTED, 2026-10-27, darwin 12 cores, Node 26.8.2, 6 kinds warmed, 1 MiB semi-space; 11 runs: 7 in 9 runs at load1 4.5-6.8, 8 in 2 runs at load1 1.56; scavenge counts, not timings), below 2^31 vs at >= 2^31); `despawn()` inherits the limit through `remove()`; "allocates nothing" means after warm-up. Replace a column only via `rebind()`; assigning `comp.data[key] = ...` directly is unsupported and `remove()` will not honour it.
@@ -760,7 +768,7 @@ worker.onmessage = ({ data: vxBuf }) => Vel.rebind({ vx: vxBuf });   // data.vx 
 - **`add()` is idempotent.** Calling `add(e)` twice returns the same dense index both times; the second call is a no-op.
 - **In production the arena throws at construction or at exhaustion, never per-operation.** `spawn()` only throws when no slot is free; everything else returns booleans / -1 / false. The hot loop does no validation. [Checked mode](#checked-mode-development-only) is the development-time exception: it throws on misuse (a stale plan, a bad mask, a non-int32 handle). The exhaustion message still contains `"out of memory"`, but now also **names the cause** — genuinely full vs. retirement-exhausted — and reports `capacity`, `activeCount`, and `retiredCount`, so an empty-but-exhausted arena (all slots retired) does not read as a phantom leak.
 - **A shrinking arena says so.** `remainingCapacity()` (`capacity - activeCount - retiredCount`) is the number of entities you can still spawn; the conservation law `activeCount + retiredCount + remainingCapacity() === capacity` holds after every operation. Watch it, between frames, to see exhaustion coming before `spawn()` throws.
-- **`clear()` fully resets without reallocating.** It rebuilds the free list, bumps every generation, revives every retired slot, and zeroes each component's `count` — O(capacity), zero allocation, buffers reused. **Every handle issued before `clear()` is invalid afterward** (the honest contract of a reset): `isAlive()` rejects them. Do not retain a pre-clear handle across a `clear()`.
+- **`clear()` fully resets without reallocating.** It rebuilds the free list, bumps every generation, revives every retired slot, and zeroes each component's `count` — O(capacity), zero allocation, buffers reused. **No pre-clear handle may be retained across a `clear()`, nor a persisted handle into a fresh arena** (the honest contract of a reset). `isAlive()` rejects each slot's most recent pre-clear handle, not every older one: `clear()` re-opens the ABA window by re-issuing an already-used generation (a retired slot -> 2, gen 4095 -> 1, every other slot `g` -> `g + 1`), so an old handle whose generation equals the slot's new one is live again after that slot's next spawn (ADR 0004 section 3).
 - **Checked mode is opt-in and never in the hot path.** `new Arena(n, { checked: true })` makes a stale `join()` plan, a misused `idx()`, a non-32-bit-integer flag mask and a non-int32 entity handle throw. It is off by default and byte-for-byte zero-cost in production — the checked `idx()` is installed as an own property that shadows the untouched prototype method. See [Checked mode](#checked-mode-development-only).
 
 ---
@@ -768,7 +776,7 @@ worker.onmessage = ({ data: vxBuf }) => Vel.rebind({ vx: vxBuf });   // data.vx 
 ## FAQ
 
 **Why a hard `maxEntities` cap? Why not auto-grow?**
-Because *implicit* growth would reallocate every component's parallel TypedArrays mid-frame and silently invalidate every system that hoisted a reference to `data.x` — with no call site to blame. The whole point of pre-allocation is that none of that ever happens on the hot path. Pick a number 2-4× the worst-case spawn burst; you pay ~`maxEntities × sum-of-component-sizes` bytes of RAM, once.
+Because *implicit* growth would reallocate every component's parallel TypedArrays mid-frame and silently invalidate every system that hoisted a reference to `data.x` — with no call site to blame. The whole point of pre-allocation is that none of that ever happens on the hot path. Pick a number e.g. 2-4 times the worst-case spawn burst (an illustrative sizing heuristic, NOMINAL); you pay ~`maxEntities × sum-of-component-sizes` bytes of RAM, once.
 
 If you genuinely outgrow the cap, grow **explicitly** with `arena.reserve(newCap)` — the sanctioned escape hatch. It reallocates all backing buffers on the cold path, copying live contents so every handle, membership, and dense index survives, and returns `true` (or `false` if `newCap <= capacity`). It is **between-frames only**: because the buffers move, any reference you hoisted (`const x = comp.data.x`) is stale afterward and must be re-read. `spawn()` still throws at capacity and *never* calls `reserve()` for you — growth is opt-in, by design.
 
@@ -890,7 +898,7 @@ Iterators allocate. The hot-loop pattern is `for (let i = 0; i < comp.count; i++
 Use `arena.registerTag()` — a named shortcut for `arena.registerComponent({})`. `data` is an empty object; only `dense` and `count` track membership. `add()` to tag, `has()` to test, `remove()` to untag, and iterate `dense[0..count)` to walk the set. Like any component, tags clear automatically on `despawn()`. Pair it with `join()` to iterate "all entities tagged X that also have component Y" without a query API.
 
 **How do I reset the arena between levels / rounds?**
-Call `arena.clear()`. It empties the arena and every registered component in place — O(capacity), no reallocation, no garbage — and is several times faster than building a fresh `new Arena(...)` (see [benchmarks](#benchmarks)). The one rule: **every handle from before the `clear()` is dead afterward**, exactly as if you'd built a new arena. Don't stash a handle across a reset and expect it to still be valid — `isAlive()` will (correctly) say it isn't.
+Call `arena.clear()`. It empties the arena and every registered component in place — O(capacity), no reallocation, no garbage — and was faster than building a fresh `new Arena(...)` in the v1.6.1 bench (REPORTED, see [benchmarks](#benchmarks)). The one rule — **retain no handle from before the `clear()`**: `isAlive()` rejects each slot's most recent pre-clear handle, but `clear()` re-issues generations, so an older handle can be live again after its slot's next spawn; a fresh `new Arena(...)` has the same hazard (it issues generation 1 again). Don't stash a handle across a reset.
 
 **How do I tell whether the arena is running low — or silently shrinking?**
 `arena.remainingCapacity()` returns how many more entities you can spawn right now. It normally equals `capacity - activeCount`, but it dips lower as slots retire (fail-closed rollover; every slot retires after 4095 despawns of it) — `arena.retiredCount` counts those. If `spawn()` throws while `activeCount` is well under `capacity`, retirement is why, and the throw message says so. Check `remainingCapacity()` between frames to grow (via `reserve()`) before you hit the wall. Until slots retire, `retiredCount` is `0` and `remainingCapacity()` is just the free-slot count; see the despawn budget under Generational rollover.

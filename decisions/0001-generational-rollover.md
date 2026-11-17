@@ -24,6 +24,11 @@ handle only while `generations[index]` still equals the handle's generation. A
 stale handle to a recycled slot is rejected because the slot's generation has
 moved on.
 
+Amendment (2026-11-17, M-58): "the entire ABA defence" holds through despawn and
+rollover only. `clear()` re-opens the ABA window (it re-issues an already-used
+generation) and a fresh arena issues generation 1 again, so no pre-clear or
+persisted handle may be retained; see decisions/0004 section 3.
+
 That defence has a horizon. A single slot cycled spawn/despawn 4095 times walks
 its generation `1 -> 2 -> ... -> 4095`. The next despawn is the problem: bumping
 `4095` rolls the 12-bit field back toward the low generations, and a stale handle
