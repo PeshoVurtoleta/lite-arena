@@ -10,10 +10,12 @@
 #                  inliner's bytecode limits (60 dead stores behind an impossible branch). The A/B must
 #                  say DIFF; then this prints CONTROL OK and exits 0, anything else exits 2.
 # --runs N         runs per side per tier (default 3; run 1 vs runs 2..N is the null control).
-# --out DIR        artifact dir (default: a new mktemp -d $TMPDIR/arena-inline-XXXXXX).
+# --out DIR        artifact dir (default: a new mktemp -d $TMPDIR/arena-inline-XXXXXX). DIR/diff must be new or
+#                  empty: lite-utils 1.0.0 refuses a reused one (exit 2), so a rerun needs a fresh --out.
 #
-# Both sides run bench/inline/workload.mjs (the 1.10.0 API only) through bench/inlining-budget-diff.sh
-# (vendored from LiteUtils 7f0ba7b; see its header) on the target methods below. Before tracing, both
+# Both sides run bench/inline/workload.mjs (the 1.10.0 API only) through inlining-budget-diff.sh of the exact-pinned
+# devDependency @zakkster/lite-utils 1.0.0 (M-73), located by `node test/tools/lite-utils-run.mjs --path
+# inlining-budget-diff.sh` (a missing, misnamed or non-1.0.0 copy exits 2), on the target methods below. Before tracing, both
 # builds must return the same workload sink, else exit 2 (not an inlining comparison).
 # Exit: 0 SAME, 1 DIFF, 2 NO-VERDICT (or a refused input). M-28: a SAME verdict keeps the decision line
 # "Inlining joinN into query", so joinN stays TurboFan-inlinable (<= 460 B on node v26.8.2).
@@ -21,11 +23,12 @@
 # Tier: STATISTICAL / REPORTED. Inlining follows tier-up timing: never part of npm test / verify. Run once
 # per release under the host quiet lock:
 #   node ~/.claude/hooks/quiet-lock.mjs run "lite-arena inline" -- bench/inline/run.sh BEFORE.js
+#
+# MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
-TOOL="$ROOT/bench/inlining-budget-diff.sh"
 FNS="despawn,joinN,isAlive,spawn,setFlags,hasFlags,clearFlags"
 
 die() { printf 'inline/run.sh: %s\nVERDICT NO-VERDICT\n' "$1" >&2; exit 2; }
@@ -48,7 +51,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [[ ${#POS[@]} -ge 1 && ${#POS[@]} -le 2 ]] || die "need BEFORE_ARENA_JS [AFTER_ARENA_JS] (see --help)"
-[[ -x "$TOOL" ]] || die "missing $TOOL"
+# The tool: inlining-budget-diff.sh of the exact-pinned devDependency @zakkster/lite-utils (M-73), located by the
+# wrapper's fail-closed lookup (node_modules/@zakkster/lite-utils only; name and exact version checked; its why is on stderr).
+TOOL="$(node "$ROOT/test/tools/lite-utils-run.mjs" --path inlining-budget-diff.sh)" || die "cannot locate lite-utils inlining-budget-diff.sh (see above)"
+[[ -f "$TOOL" ]] || die "lite-utils inlining-budget-diff.sh is not a file: $TOOL"
+TOOL_VER="$(node -p 'require(process.argv[1]).version' "$(dirname "$TOOL")/package.json")" || die "cannot read the lite-utils version"
 
 BEFORE="${POS[0]}"; AFTER="${POS[1]:-$ROOT/Arena.js}"
 [[ -f "$BEFORE" ]] || die "no such file: $BEFORE"
@@ -101,9 +108,10 @@ printf 'inline/run.sh  before %s (sha256/8 %s)\n' "$BEFORE" "$(shasum -a 256 "$B
 printf '               after  %s (sha256/8 %s)%s\n' "$AFTER" "$(shasum -a 256 "$AFTER" | cut -c1-8)" \
   "$([[ $CONTROL -eq 1 ]] && printf '  [CONTROL: padded isAlive]')"
 printf '               load   %s\n' "$(uptime | sed 's/.*load averages*: *//')"
+printf '               lite-utils %s inlining-budget-diff.sh sha256/8 %s  %s\n' "$TOOL_VER" "$(shasum -a 256 "$TOOL" | cut -c1-8)" "$TOOL"
 
 set +e
-"$TOOL" --fn "$FNS" --runs "$RUNS" --out "$OUT/diff" "$WORK/driver-before.mjs" "$WORK/driver-after.mjs"
+bash "$TOOL" --fn "$FNS" --runs "$RUNS" --out "$OUT/diff" "$WORK/driver-before.mjs" "$WORK/driver-after.mjs"
 RC=$?
 set -e
 FINAL=1

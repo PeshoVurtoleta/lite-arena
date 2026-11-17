@@ -5,6 +5,23 @@ All notable changes to `@zakkster/lite-arena` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Tests / tooling
+- The vendored `bench/inlining-budget-diff.sh` and `bench/bytecode-budget.sh` are deleted; the V8 tools now come from
+  the exact-pinned devDependency `@zakkster/lite-utils` 1.0.0 (`dependencies` stays empty), reached through
+  `test/tools/lite-utils.mjs` (resolver, fails closed on name / version) and `test/tools/lite-utils-run.mjs`
+  (wrapper with a script allowlist; lookup failure, unknown script, signal or odd exit -> exit 2 NO-VERDICT). The
+  deopt-diff pin / `--self-test` rows in `test/lite-utils.test.js` read the installed path directly.
+- npm scripts `inline-budget-diff` and `bytecode-budget` go through the wrapper; new `deopt-diff` (M-74: deopt-records
+  diff of named functions; its `--self-test` is gated, no Arena runner yet). `bench/inline/run.sh` and
+  `bench/f2/inline-indexed/run.sh` resolve the tool through the wrapper and need a fresh `--out` (DIR/diff must be new or empty).
+- New `test/lite-utils.test.js` (package pin, resolver and wrapper fail-closed rows, process-group hygiene, run.sh
+  refusals, deopt-diff pin + `--self-test`); the script sha256 pins + `--self-test` smoke stay in the two tool tests.
+- M-73: the 12 + 8 script-mutant rows and the gate mutants are dropped; lite-utils' own suite owns the tool internals.
+  The Arena bytecode PINS / IX_PINS gate and its must-fail rows are unchanged (1.0.0 output is byte-identical on every gated line).
+- Test counts: 626 tests (624 pass, 2 skipped without `--expose-gc`, node v26.8.2).
+
 ## [1.12.1] - 2026-11-17
 
 1.12.1 hardening (cold paths and checked mode; audit 2026-11-06).

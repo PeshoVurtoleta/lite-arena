@@ -28,13 +28,15 @@
     "torture": "node --expose-gc test/torture.mjs",
     "bench": "node --expose-gc bench/bench.js",
     "inline": "bash bench/inline/run.sh",
-    "inline-budget-diff": "bash bench/inlining-budget-diff.sh",
-    "bytecode-budget": "bash bench/bytecode-budget.sh",
+    "inline-budget-diff": "node test/tools/lite-utils-run.mjs inlining-budget-diff.sh",
+    "bytecode-budget": "node test/tools/lite-utils-run.mjs bytecode-budget.sh",
+    "deopt-diff": "node test/tools/lite-utils-run.mjs deopt-diff.sh",
     "verify": "npm test && npm run torture && npm run bench"
   },
   "devDependencies": {
     "@zakkster/lite-gc-profiler": "^1.11.0",
-    "@zakkster/lite-leak": "^1.8.0"
+    "@zakkster/lite-leak": "^1.8.0",
+    "@zakkster/lite-utils": "1.0.0"
   },
   "keywords": [
     "ecs",

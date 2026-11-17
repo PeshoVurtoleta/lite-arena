@@ -13,7 +13,7 @@ STATISTICAL / REPORTED / PRELIMINARY / NOMINAL); numbers are copied from the sou
 recomputed. This file is not shipped (not in `package.json` `files[]`).
 
 Numbering note: #1-#5 are the inlining / bytecode-budget family (section A), #6-#11 the
-fail-closed semantics family (B), #12-#15 the allocation-gate family (C), #16-#22 the
+fail-closed semantics family (B), #12-#15 the allocation-gate family (C), #16-#22 and #35 the
 measurement and harness family (D), #23 the docs-drift family (E), #24-#34 the 2026-11-06
 audit family (F). The audit's 15 distinct findings (O-1..O-10, F-1..F-8, with O-5 = F-2,
 O-10 = F-3, O-7 ~ F-5) are all CONFIRMED by both auditors; triage rulings are M-56..M-67.
@@ -41,7 +41,7 @@ proof.
    build, or that measures retention when it is titled allocation, or that cannot see a
    once-per-N allocation, is not a gate. Every gate gets a must-fail control and a
    revert-check; a parity gate's revert-check is a live-build mutant. *(#13, #14, #15,
-   #20, #31, #34)*
+   #20, #31, #34, #35)*
 6. **A control that fails voids the harness, not just the row.** An A/A control that reads
    1.76x in 11/11 rounds means no row of that harness is trusted. Identical `new Function`
    sources share V8 feedback; give each config unique source. *(#16, #17)*
@@ -75,6 +75,8 @@ keeps the "Inlining joinN into query" decision line.
 **Source:** M-28; M-29; HISTORY.md "2026-11-01 inlining A/B tool vendored (M-28, M-29)";
 evidence `.handoff/evidence/inline-trial/report-null.txt` and `report-mutant.txt`; commit
 fb8bebb.
+**Update 2026-11-17 (M-73):** the vendored `inlining-budget-diff.sh` was replaced by the exact-pinned
+`@zakkster/lite-utils` 1.0.0; `bench/inline/run.sh` resolves it through `test/tools/lite-utils-run.mjs`.
 
 ### #2 -- Checked-plan construction moves out of joinN
 
@@ -103,6 +105,9 @@ guard and stale counts; r2 APPROVED. F2 later raised `PINS.joinN` 420 -> 435 ins
 ceiling through a reviewed unit (U4).
 **Source:** M-30; HISTORY.md "2026-11-04 bytecode-budget vendored (M-30)" and "F2 U4";
 commit 1498014.
+**Update 2026-11-17 (M-73):** the vendored `bytecode-budget.sh` was replaced by the exact-pinned
+`@zakkster/lite-utils` 1.0.0; the pins are unchanged (1.0.0 output is byte-identical on every gated line, evidence
+`.handoff/evidence/lite-utils/golden/`).
 
 ### #4 -- The joinN driver hint lives in a cold helper that reads r.reqMask itself
 
@@ -364,6 +369,17 @@ makes the peer required, and inline measured 2.4x faster scans at 1-10% and 2-5.
 bulk clear (PRELIMINARY, `.handoff/research/F2/RESEARCH.md`).
 **Source:** M-34; M-35; HISTORY.md "F-track planning" and "F2 research burst"; evidence
 `.handoff/research/F2/RESEARCH.md`.
+
+### #35 -- A cleanup row must not wait for the very thing it tests; a refusal row must fail for the stated reason
+
+**Tried / broke.** Review r1 of the lite-utils unit found two rows green for the wrong reason. The process-group
+cleanup row waited on `close`, which fires only after the orphan holding the pipes dies by itself, so its ESRCH
+check ran after the cleanup had happened anyway (survived mutants: child-only kill, no reap). A refusal row aimed at
+a nonexistent path (`../x`) was green because the path did not exist (survived: the bare-name guard deleted).
+**Mechanism.** A row proves nothing if the mutant it names still passes it.
+**Outcome.** The cleanup row waits on `exit` and spawns a TERM-ignoring grandchild, so only a group kill plus reap
+turns it green; the refusal row targets an existing path so only the guard can refuse it.
+**Source:** `.handoff/evidence/lite-utils/review-r1.txt` B-1, B-2 (r2 APPROVED, `test/lite-utils.test.js` 938638cf); M-73.
 
 ---
 

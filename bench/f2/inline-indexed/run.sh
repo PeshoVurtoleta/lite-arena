@@ -11,10 +11,13 @@
 #                  or --control-build FILE). The A/B must say DIFF: this prints CONTROL OK and exits 1
 #                  (the DIFF exit); anything else prints CONTROL FAILED and exits 2.
 # --runs N         runs per side per tier (default 3; run 1 vs runs 2..N is the null control).
-# --out DIR        artifact dir (default: a new mktemp -d $TMPDIR/arena-inline-ix-XXXXXX).
+# --out DIR        artifact dir (default: a new mktemp -d $TMPDIR/arena-inline-ix-XXXXXX). DIR/diff must be new or
+#                  empty: lite-utils 1.0.0 refuses a reused one (exit 2), so a rerun needs a fresh --out.
 #
 # Both sides run bench/f2/inline-indexed/workload.mjs (indexed word 0 + Hi arena, small hot user functions,
-# each target >= 10^5 calls) through bench/inlining-budget-diff.sh on the 16 targets below: the 14 F2
+# each target >= 10^5 calls) through inlining-budget-diff.sh of the exact-pinned devDependency
+# @zakkster/lite-utils 1.0.0 (M-73), located by `node test/tools/lite-utils-run.mjs --path inlining-budget-diff.sh`
+# (a missing, misnamed or non-1.0.0 copy exits 2), on the 16 targets below: the 14 F2
 # exact-pin names of test/bytecode-budget.test.js (IX_PINS) + joinN + pickFlagDriver. Before tracing, both
 # builds must return the same workload sink, else exit 2 (not an inlining comparison).
 # After the tool: a table of all 16 functions (AFTER bytecode length; Maglev single-inline < 100 B,
@@ -30,7 +33,6 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
-TOOL="$ROOT/bench/inlining-budget-diff.sh"
 FNS="ixSetFlags,ixClearFlags,ixSetFlagsHi,ixClearFlagsHi,ixDespawn,ixSet,ixUnset,ixWordFrom,nextFlagged,nextFlaggedHi,flagCount,flagCountHi,firstFlagged,firstFlaggedHi,joinN,pickFlagDriver"
 
 die() { printf 'inline-indexed/run.sh: %s\nVERDICT NO-VERDICT\n' "$1" >&2; exit 2; }
@@ -54,7 +56,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [[ ${#POS[@]} -ge 1 && ${#POS[@]} -le 2 ]] || die "need BEFORE_ARENA_JS [AFTER_ARENA_JS] (see --help)"
-[[ -x "$TOOL" ]] || die "missing $TOOL"
+# The tool: inlining-budget-diff.sh of the exact-pinned devDependency @zakkster/lite-utils (M-73), located by the
+# wrapper's fail-closed lookup (node_modules/@zakkster/lite-utils only; name and exact version checked; its why is on stderr).
+TOOL="$(node "$ROOT/test/tools/lite-utils-run.mjs" --path inlining-budget-diff.sh)" || die "cannot locate lite-utils inlining-budget-diff.sh (see above)"
+[[ -f "$TOOL" ]] || die "lite-utils inlining-budget-diff.sh is not a file: $TOOL"
+TOOL_VER="$(node -p 'require(process.argv[1]).version' "$(dirname "$TOOL")/package.json")" || die "cannot read the lite-utils version"
 
 BEFORE="${POS[0]}"; AFTER="${POS[1]:-$ROOT/Arena.js}"
 [[ -f "$BEFORE" ]] || die "no such file: $BEFORE"
@@ -98,10 +104,11 @@ printf 'inline-indexed/run.sh  before %s (sha256/8 %s)\n' "$BEFORE" "$(shasum -a
 printf '                       after  %s (sha256/8 %s)%s\n' "$AFTER" "$(shasum -a 256 "$AFTER" | cut -c1-8)" \
   "$([[ $CONTROL -eq 1 ]] && printf '  [CONTROL: padded-ix]')"
 printf '                       load   %s\n' "$(uptime | sed 's/.*load averages*: *//')"
+printf '                       lite-utils %s inlining-budget-diff.sh sha256/8 %s  %s\n' "$TOOL_VER" "$(shasum -a 256 "$TOOL" | cut -c1-8)" "$TOOL"
 printf '                       %s\n' "$SA"
 
 set +e
-"$TOOL" --fn "$FNS" --runs "$RUNS" --out "$OUT/diff" "$WORK/driver-before.mjs" "$WORK/driver-after.mjs"
+bash "$TOOL" --fn "$FNS" --runs "$RUNS" --out "$OUT/diff" "$WORK/driver-before.mjs" "$WORK/driver-after.mjs"
 RC=$?
 set -e
 case "$RC" in 0|1|2) ;; *) echo "inline-indexed/run.sh: tool exited $RC (not a verdict)"; RC=2 ;; esac

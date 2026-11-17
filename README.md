@@ -596,7 +596,7 @@ Four levels of verification, depending on how deep you want to go.
 npm test
 ```
 
-Runs **599 test cases** (597 pass, 2 skipped without `--expose-gc`, on node v26.8.2, 2026-11-17; other node versions also skip the 5 version-pinned bytecode rows) under `node --test`, covering:
+Runs **626 test cases** (624 pass, 2 skipped without `--expose-gc`, on node v26.8.2, 2026-11-17; other node versions also skip the 6 version-pinned bytecode rows) under `node --test`, covering:
 
 | Group | What's tested |
 |---|---|
@@ -619,10 +619,10 @@ Runs **599 test cases** (597 pass, 2 skipped without `--expose-gc`, on node v26.
 | `rebind()` atomicity | each supplied buffer is read once, so a getter cannot hand in a bad buffer after validation (`test/rebind-atomic.test.js`); a bad buffer in a multi-field rebind re-points nothing (`test/Arena.test.js:1861`); a buffer already used by another field of the set is rejected (M-61, `test/cold-paths-1121a.test.js`) |
 | Iteration patterns | dense scan covers every member exactly once |
 | Randomized churn | 1000 random ops vs. Set/Map oracle |
-| Tooling gates | the vendored V8 tools' `--self-test` + must-fail script mutants (`test/inlining-budget-diff.test.js`, `test/bytecode-budget.test.js`); hot-method bytecode-length pins on node v26.8.2 and the joinN <= 460 B ceiling |
+| Tooling gates | the sha256 pins + `--self-test` smoke of the exact-pinned `@zakkster/lite-utils` 1.0.0 scripts (`test/inlining-budget-diff.test.js`, `test/bytecode-budget.test.js`, `test/lite-utils.test.js`), the resolver / wrapper fail-closed rows (`test/lite-utils.test.js`); hot-method bytecode-length pins on node v26.8.2 and the joinN <= 460 B ceiling |
 | Zero-allocation guarantee | 100k spawn/despawn → < 1 MB heap (requires `--expose-gc`) |
 
-Two zero-allocation cases require `--expose-gc`; without it they skip (`npm test` (`node --test test/*.test.js`) -> `597 passed, 2 skipped`, or `599 passed` under `node --expose-gc --test test/*.test.js`, both on node v26.8.2, 2026-11-17; other node versions also skip the 5 version-pinned bytecode rows). Suitable for CI.
+Two zero-allocation cases require `--expose-gc`; without it they skip (`npm test` (`node --test test/*.test.js`) -> `624 passed, 2 skipped`, or `626 passed` under `node --expose-gc --test test/*.test.js`, both on node v26.8.2, 2026-11-17; other node versions also skip the 6 version-pinned bytecode rows). Suitable for CI.
 
 ### 2. Torture gate — "does zero-GC actually hold under stress?"
 
@@ -658,13 +658,14 @@ A 50,000-particle gravity simulation. Drag to move the gravity well; observe con
 
 | Command | What it does |
 |---|---|
-| `npm test` | Run the unit suite (599 cases: 597 pass, 2 skipped without `--expose-gc`; `npm test` on node v26.8.2, 2026-11-17) under `node --test` |
+| `npm test` | Run the unit suite (626 cases: 624 pass, 2 skipped without `--expose-gc`; `npm test` on node v26.8.2, 2026-11-17) under `node --test` |
 | `npm run test:watch` | Re-run on save |
 | `npm run torture` | Run the zero-GC torture gate (`node --expose-gc test/torture.mjs`) |
 | `npm run bench` | Run the Node benchmark, write `bench/bench-results.json` |
 | `npm run inline -- BEFORE.js` | TurboFan + Maglev inlining A/B of a frozen `Arena.js` vs the live one (`--control` = must-fail run); exit 0 SAME / 1 DIFF / 2 NO-VERDICT. A decision diff, not part of `npm test` |
-| `npm run inline-budget-diff` | The vendored V8 inlining-diff tool itself (`-- --self-test` is gated in `npm test`) |
-| `npm run bytecode-budget` | The vendored V8 bytecode-length report / gate tool; `npm test` gates its `--self-test` and pins the hot methods' bytecode lengths on node v26.8.2 (joinN <= 460 B) |
+| `npm run inline-budget-diff` | The V8 inlining-diff tool itself, from the exact-pinned devDependency `@zakkster/lite-utils` 1.0.0 via `test/tools/lite-utils-run.mjs` (`-- --self-test` is gated in `npm test`) |
+| `npm run bytecode-budget` | The V8 bytecode-length report / gate tool from `@zakkster/lite-utils` 1.0.0 (exact devDependency, via `test/tools/lite-utils-run.mjs`); `npm test` gates its `--self-test` and pins the hot methods' bytecode lengths on node v26.8.2 (joinN <= 460 B) |
+| `npm run deopt-diff` | The lite-utils 1.0.0 deopt-records diff of named functions, before vs after driver (`-- --self-test` is gated in `npm test`; no Arena runner yet) |
 | `npm run verify` | `npm test && npm run torture && npm run bench` — the full CI-style check |
 
 ---
